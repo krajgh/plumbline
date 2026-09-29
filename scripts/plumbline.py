@@ -609,22 +609,12 @@ def _check_row(label, row, stages, index, input_names, bad_reads, errors, notes)
 
     position = {sid: i for i, sid in enumerate(present)}
     for sid in present:
-        # A stage run by the main session reduces whatever the row produced, so a
-        # row that leaves out a stage it reads (a repo's row of just intake and
-        # reduce) is a note. For every other stage it is an error.
-        by_main = stages[index[sid]].get("role") == "main"
         for name, optional in _read_names(stages[index[sid]]):
             if optional or name in input_names or (sid, name) in bad_reads:
                 continue
             if name in position and position[name] < position[sid]:
                 continue
-            if by_main and name not in position:
-                notes.append(
-                    f"{where}: stage '{sid}' is run by the main session and reads '{name}', "
-                    "which this row does not include; it reduces what the row produced"
-                )
-            else:
-                errors.append(f"{where}: stage '{sid}' reads '{name}', which is neither an input nor an earlier stage of this row")
+            errors.append(f"{where}: stage '{sid}' reads '{name}', which is neither an input nor an earlier stage of this row")
         target = stages[index[sid]].get("on_fail")
         if target is not None and target != "main" and target not in position:
             notes.append(f"{where}: stage '{sid}' has on_fail '{target}', which this row does not include; it fails over to main")

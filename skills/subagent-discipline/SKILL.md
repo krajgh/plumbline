@@ -19,7 +19,7 @@ The builder's standing rule: do the work through subagents, each on the smallest
 - Say "once" when once is meant. Smaller models apply "in each of three places" literally.
 
 ## Shared files: map and reduce
-Subagents and worktrees are the maps; the main session, the one the builder talks to, is the reduce. Files the whole project shares (the planning-chat bridge's docs, the decision log, memory, and anything synced out of the repo) are written only by the main session.
+Subagents and worktrees are the maps; the main session, the one the builder talks to, is the reduce. Files the whole project shares (status documents, the decision log, memory, and anything synced out of the repository) are written only by the main session.
 - Workers never edit those files and never run the sync. Their briefs say so, and their reports carry what the files need: numbers, decisions made or proposed, open questions, status lines.
 - The main session consolidates the reports into those files. It resolves any conflict between workers deliberately and says how, and never lets the last writer win. It writes each file once and syncs once, at the end.
 

@@ -83,11 +83,10 @@ def test_an_override_row_replaces_the_pipelines_row(repo):
     assert project.pipeline["matrix"]["docs"] == {"stages": ["intake", "reduce"]}
 
 
-def test_the_voice_row_draws_notes_about_what_reduce_will_not_find(repo):
+def test_the_voice_row_draws_no_notes_because_reduce_reads_verify_and_review_optionally(repo):
     project = pl.load_project(adopt(repo))
     assert project.errors == []
-    voice = [n for n in project.notes if "row 'voice'" in n]
-    assert len(voice) == 2 and all("run by the main session" in n for n in voice)
+    assert [n for n in project.notes if "row 'voice'" in n] == []
 
 
 def test_an_override_precedence_replaces_the_pipelines(repo):

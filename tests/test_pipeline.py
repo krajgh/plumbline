@@ -125,33 +125,60 @@ def test_the_same_read_without_the_question_mark_is_an_error():
     assert any("row 'docs': stage 'review' reads 'plan'" in e for e in errors)
 
 
-def test_a_row_of_just_intake_and_reduce_validates_with_notes():
-    # the main session reduces whatever the row produced, so a row that leaves out
-    # verify and review (the reads of reduce) draws notes, not errors
+def test_reduce_reads_verify_and_review_only_when_the_row_has_them():
+    assert stage(default_pipeline(), "reduce")["reads"] == ["intake", "verify?", "review?"]
+
+
+def test_a_row_of_just_intake_and_reduce_validates_with_no_errors_and_no_read_notes():
+    # reduce reads verify? and review?, so it reduces whatever the row produced
     def mutate(d):
         d["matrix"]["docs"] = {"stages": ["intake", "reduce"], "note": "Handled by the repo's own evals."}
 
     errors, notes = check(mutate)
     assert errors == []
-    reduce_notes = [n for n in notes if "row 'docs'" in n]
-    assert len(reduce_notes) == 2
-    assert any("stage 'reduce' is run by the main session and reads 'verify', which this row does not include" in n for n in reduce_notes)
-    assert any("reads 'review'" in n for n in reduce_notes)
+    assert [n for n in notes if "row 'docs'" in n] == []
+    assert not any("reads" in n for n in notes)
 
 
-def test_a_main_session_stage_placed_before_what_it_reads_is_still_an_error():
-    # the leniency is for stages the row leaves out, not for a row that reorders them
+def test_a_row_that_places_reduce_before_the_stages_it_reads_is_an_error():
+    # reduce reads verify? and review? optionally, so only the ordering rule catches this
     errors, _ = check(lambda d: d["matrix"]["docs"].update(stages=["intake", "reduce", "verify", "review"]))
     assert any("definition order" in e for e in errors)
-    assert any("stage 'reduce' reads 'verify'" in e for e in errors)
 
 
-def test_only_stages_run_by_the_main_session_get_the_leniency():
-    # verify and review are not run by the main session: a row without what they read is an error
-    errors, _ = check(lambda d: d["matrix"]["docs"].update(stages=["intake", "review", "reduce"]))
-    assert any("stage 'review' reads 'verify'" in e for e in errors)
-    errors, _ = check(lambda d: d["matrix"]["code"]["S"].update(stages=["intake", "tests", "build", "verify", "review", "reduce"]))
-    assert any("row 'code.S': stage 'tests' reads 'plan'" in e for e in errors)
+def make_reduce_reads_required(d):
+    stage(d, "reduce")["reads"] = ["intake", "verify", "review"]
+    d["matrix"]["docs"].update(stages=["intake", "reduce"])
+
+
+def make_verify_read_tests(d):
+    stage(d, "verify")["reads"] = ["diff", "tests", "build?"]
+
+
+# (the stage that reads, a mutation that makes the row leave out what it reads, text of the error)
+LEFT_OUT_READS = [
+    ("plan", lambda d: d["matrix"]["code"]["S"].update(stages=["plan", "tests", "build", "verify", "review", "reduce"]), "row 'code.S': stage 'plan' reads 'intake'"),
+    ("tests", lambda d: d["matrix"]["code"]["S"].update(stages=["intake", "tests", "build", "verify", "review", "reduce"]), "row 'code.S': stage 'tests' reads 'plan'"),
+    ("build", lambda d: d["matrix"]["code"]["S"].update(stages=["intake", "build", "verify", "review", "reduce"]), "row 'code.S': stage 'build' reads 'plan'"),
+    ("verify", make_verify_read_tests, "row 'docs': stage 'verify' reads 'tests'"),
+    ("review", lambda d: d["matrix"]["docs"].update(stages=["intake", "review", "reduce"]), "row 'docs': stage 'review' reads 'verify'"),
+    ("reduce", lambda d: d["matrix"]["docs"].update(stages=["verify", "review", "reduce"]), "row 'docs': stage 'reduce' reads 'intake'"),
+    ("reduce", make_reduce_reads_required, "row 'docs': stage 'reduce' reads 'verify'"),
+    ("reduce", make_reduce_reads_required, "row 'docs': stage 'reduce' reads 'review'"),
+]
+
+
+@pytest.mark.parametrize("mutate,expected", [(m, e) for _, m, e in LEFT_OUT_READS], ids=[f"{s}-{i}" for i, (s, _, _) in enumerate(LEFT_OUT_READS)])
+def test_a_required_read_of_a_left_out_stage_is_an_error_for_every_role(mutate, expected):
+    errors, notes = check(mutate)
+    assert any(expected in e for e in errors), f"expected {expected!r} in {errors}"
+    assert not any("run by the main session" in n for n in notes)  # no role draws a note instead
+
+
+def test_the_left_out_read_cases_cover_every_role_and_the_review_kind():
+    default = default_pipeline()
+    readers = {stage(default, sid).get("role") or stage(default, sid)["kind"] for sid, _, _ in LEFT_OUT_READS}
+    assert readers == set(pl.KNOWN_ROLES) | {"review"}
 
 
 def test_the_first_stage_may_read_the_inputs():

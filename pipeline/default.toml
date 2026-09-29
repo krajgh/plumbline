@@ -85,7 +85,7 @@ max_rounds = 3
 [[stage]]
 id = "reduce"
 role = "main"
-reads = ["intake", "verify", "review"]
+reads = ["intake", "verify?", "review?"]   # reduces whatever the row produced
 record = "pass_record"
 gate = "all_gates_passed"
 
