@@ -58,7 +58,9 @@ def test_every_stage_carries_role_or_kind_gate_on_fail_max_rounds_and_lenses(run
     p = plan(run_cli, code_m)
     plan_stage = stage(p, "plan")
     assert (plan_stage["kind"], plan_stage["role"], plan_stage["gate"]) == ("agent", "planner", "spec_complete")
-    assert (plan_stage["on_fail"], plan_stage["max_rounds"], plan_stage["lenses"]) == (None, None, None)
+    assert (plan_stage["on_fail"], plan_stage["max_rounds"], plan_stage["lenses"]) == ("plan", 2, None)  # the planner runs again, twice at most
+    tests_stage = stage(p, "tests")
+    assert (tests_stage["gate"], tests_stage["on_fail"], tests_stage["max_rounds"]) == ("tests_fail_on_stub", "tests", 3)
     test_review = stage(p, "test-review")
     assert (test_review["kind"], test_review["role"]) == ("review", None)
     assert (test_review["on_fail"], test_review["max_rounds"], test_review["lenses"]) == ("tests", 2, ["tests"])

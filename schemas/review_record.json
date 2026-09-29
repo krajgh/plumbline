@@ -1,7 +1,7 @@
 {
   "description": "One round of a review unit: the prosecutors' findings, the defenders' verdicts, the findings that survive, and the gaps the detective names.",
   "type": "object",
-  "required": ["target", "round", "lenses", "findings", "defenses", "survivors", "gaps", "blockers_surviving", "diff_sha256"],
+  "required": ["target", "round", "lenses", "findings", "defenses", "survivors", "gaps", "blockers_surviving", "routes", "diff_sha256"],
   "additionalProperties": false,
   "properties": {
     "target": {
@@ -26,7 +26,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "lens", "file", "line", "claim", "failure_scenario", "rule", "evidence", "outside_code", "severity"],
+        "required": ["id", "lens", "file", "line", "claim", "failure_scenario", "rule", "evidence", "outside_code", "severity", "evidence_unverified"],
         "additionalProperties": false,
         "properties": {
           "id": {
@@ -71,6 +71,10 @@
           "severity": {
             "description": "Severity rubric. BLOCKING: breaks a stated acceptance criterion, loses or corrupts data, exposes a secret or personal data, or breaks the main path for most users. MAJOR: wrong behaviour on a realistic path, with limited reach or a workaround. MINOR: an edge case, a leak without near-term impact, or an inconsistency.",
             "enum": ["BLOCKING", "MAJOR", "MINOR"]
+          },
+          "evidence_unverified": {
+            "description": "True when `merge-review` did not find the finding's evidence in the change's diff or in the current content of the finding's file. Such a finding stays; the flag says its quote could not be checked.",
+            "type": "boolean"
           }
         }
       }
@@ -144,6 +148,28 @@
       "description": "How many surviving findings are BLOCKING. The gate no_surviving_blockers passes at 0.",
       "type": "integer",
       "minimum": 0
+    },
+    "routes": {
+      "description": "Where the surviving findings go next. `builder` lists the surviving findings about the change's own code; `test-writer` lists those of the tests lens and those about test files. The builder is given the text of the first list and never sees the second.",
+      "type": "object",
+      "required": ["builder", "test-writer"],
+      "additionalProperties": false,
+      "properties": {
+        "builder": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "test-writer": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
     },
     "diff_sha256": {
       "description": "The sha256 of the change this round covered: the diff from the run's merge base to the files as they were when `merge-review` built this record, untracked files included. For a review of the diff, `pass` refuses when the diff of HEAD hashes differently, so a change edited after its review fails.",

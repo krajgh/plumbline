@@ -51,7 +51,7 @@ BAD_FIXTURES = [
     ("agent-without-role", lambda d: stage(d, "build").pop("role"), "an agent stage needs a role"),
     ("agent-with-review-key", lambda d: stage(d, "build").update(lenses=["tests"]), "'lenses' only applies to review stages"),
     ("on-fail-forward", lambda d: stage(d, "plan").update(on_fail="build", max_rounds=1), "on_fail 'build' must be an earlier stage"),
-    ("on-fail-itself", lambda d: stage(d, "verify").update(on_fail="verify"), "on_fail 'verify' must be an earlier stage"),
+    ("on-fail-itself-for-a-review", lambda d: stage(d, "review").update(on_fail="review"), "a review stage cannot name itself in on_fail"),
     ("on-fail-unknown", lambda d: stage(d, "verify").update(on_fail="nowhere"), "on_fail names unknown stage 'nowhere'"),
     ("on-fail-review-stage", lambda d: stage(d, "build").update(on_fail="test-review", max_rounds=1), "is a review stage"),
     ("on-fail-without-max-rounds", lambda d: stage(d, "verify").pop("max_rounds"), "on_fail needs max_rounds"),
@@ -91,6 +91,23 @@ BAD_FIXTURES = [
 def test_bad_fixture_is_caught(mutate, expected):
     errors, _ = check(mutate)
     assert any(expected in e for e in errors), f"expected {expected!r} in {errors}"
+
+
+def test_an_agent_stage_may_name_itself_in_on_fail_to_run_its_agent_again():  # C-08
+    stages = {s["id"]: s for s in default_pipeline()["stage"]}
+    assert (stages["plan"]["on_fail"], stages["plan"]["max_rounds"]) == ("plan", 2)
+    assert (stages["tests"]["on_fail"], stages["tests"]["max_rounds"]) == ("tests", 3)
+    assert check(lambda d: stage(d, "verify").update(on_fail="verify"))[0] == []
+    def without_a_cap(d):
+        del stage(d, "verify")["max_rounds"]
+        stage(d, "verify")["on_fail"] = "verify"
+
+    assert any("on_fail needs max_rounds" in e for e in check(without_a_cap)[0])  # a retry is a round, so it needs its cap
+
+
+def test_a_later_stage_is_still_no_on_fail_target_and_the_message_names_the_retry():
+    errors, _ = check(lambda d: stage(d, "plan").update(on_fail="build", max_rounds=1))
+    assert any("on_fail 'build' must be an earlier stage (or this stage itself, to run its agent again, or 'main'), not a later one" in e for e in errors)
 
 
 def test_on_fail_target_outside_its_row_is_a_note_not_an_error():

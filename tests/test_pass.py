@@ -8,17 +8,21 @@ import pytest
 import plumbline as pl
 from helpers import commit_all, git, write
 from rundata import (
-    HAIKU, RUN, SONNET, adopt, agent_row, assistant_record, change_of, gate_stages, intake_record, ledger, put, read, review_record,
-    run_path, verify_record, write_code_s_run, write_docs_run, write_ledger, write_transcript,
+    CONTROLLED, HAIKU, RUN, SONNET, adopt, agent_row, assistant_record, begin, build_note_record, change_of, gate_stages, intake_record, ledger, put, read,
+    review_record, run_path, verify_record, write_code_s_run, write_docs_run, write_ledger, write_transcript,
 )
 
 
 @pytest.fixture
 def ready(repo):
-    """An adopted, committed repository holding a finished docs-row run, its tree clean."""
-    adopt(repo)
+    """An adopted, committed repository holding a finished docs-row run, its tree clean. It declares a test command, so `gate` can run."""
+    adopt(repo, commands={"test": CONTROLLED})
     write_docs_run(repo)
     return repo
+
+
+def covered_by(repo, sha):
+    return pl.coverage(repo, sha, pl.load_project(repo))
 
 
 def head(repo):
@@ -93,8 +97,8 @@ def test_pass_refuses_when_a_stage_has_no_record_even_without_a_gate(run_cli, re
 
 def test_pass_lists_every_problem(run_cli, ready):
     write(ready / "README.md", "changed\n")
-    put(ready, "verify", verify_record(green=False))
-    put(ready, "review", review_record(blockers=1))
+    put(ready, "verify", verify_record(green=False, diff=change_of(ready)))
+    put(ready, "review", review_record(blockers=1, diff=change_of(ready)))
     result = do_pass(run_cli, ready)
     assert "3 problems" in result.stdout
 
@@ -177,22 +181,24 @@ def test_the_pass_record_carries_the_tokens_of_the_runs_agents(run_cli, ready, t
 
 def test_rounds_come_from_the_review_record_and_from_the_agents_the_ledger_saw(run_cli, repo):
     adopt(repo)
-    write_code_s_run(repo)
+    write_code_s_run(repo)  # one stop of each agent
     put(repo, "review", review_record(blockers=0, round_no=2, diff=change_of(repo)))
-    write_ledger(repo, [agent_row("b1", stage="build"), agent_row("b2", stage="build"), agent_row("p1", stage="plan", agent_type="plumbline:planner")])
-    assert do_pass(run_cli, repo).returncode == 0
+    put(repo, "build", build_note_record())  # the builder ran a second time
+    result = do_pass(run_cli, repo)
+    assert result.returncode == 0, result.stdout
     rounds = {s["id"]: s["rounds"] for s in read(repo, "reduce")["stages"]}
     assert rounds == {"intake": 1, "plan": 1, "tests": 1, "build": 2, "verify": 1, "review": 2, "reduce": 1}
 
 
-def test_a_row_note_travels_into_the_pass_record(run_cli, repo):
-    write(repo / "plumbline.toml", 'schema = 1\n\n[matrix.docs]\nstages = ["intake", "reduce"]\nnote = "Handled by the repo\'s own evals."\n')
+def test_a_row_note_travels_into_the_pass_record_with_the_declared_and_the_measured_row(run_cli, repo):
+    # the adoption commit changes plumbline.toml and .gitignore, which are config files: the config row is overridden too
+    write(repo / "plumbline.toml", 'schema = 1\n\n[matrix.docs]\nstages = ["intake", "reduce"]\nnote = "Handled by the repo\'s own evals."\n\n[matrix.config]\nstages = ["intake", "reduce"]\n')
     write(repo / ".gitignore", ".plumbline/\n")
     commit_all(repo, "adopt")
-    put(repo, "intake", intake_record("docs"))
+    begin(repo, "docs")
     assert do_pass(run_cli, repo).returncode == 0
     record = read(repo, "reduce")
-    assert record["notes"] == ["Handled by the repo's own evals."]
+    assert record["notes"] == ["Handled by the repo's own evals.", "declared row docs, measured row config"]
     assert [s["id"] for s in record["stages"]] == ["intake", "reduce"]
 
 
@@ -304,10 +310,10 @@ def test_override_needs_an_adopted_repository_but_not_a_clean_tree(run_cli, repo
 
 def test_a_pass_record_covers_only_the_commit_it_names(run_cli, ready):
     do_pass(run_cli, ready)
-    assert pl.coverage(ready, head(ready))[0] == "pass"
+    assert covered_by(ready, head(ready))[0] == "pass"
     write(ready / "README.md", "next\n")
     commit_all(ready, "next")
-    assert pl.coverage(ready, head(ready))[0] is None
+    assert covered_by(ready, head(ready))[0] is None
 
 
 def test_a_pass_record_that_names_another_commit_or_says_fail_covers_nothing(run_cli, ready):
@@ -315,28 +321,28 @@ def test_a_pass_record_that_names_another_commit_or_says_fail_covers_nothing(run
     record = read(ready, "reduce")
     sha = head(ready)
     pass_file(ready).write_text(json.dumps({**record, "commit": "0" * 40}), encoding="utf-8")
-    assert pl.coverage(ready, sha) == (None, f".plumbline/pass/{sha}.json is for another commit")
+    assert covered_by(ready, sha) == (None, f".plumbline/pass/{sha}.json is for another commit")
     pass_file(ready).write_text(json.dumps({**record, "verdict": "fail"}), encoding="utf-8")
-    assert pl.coverage(ready, sha)[0] is None
+    assert covered_by(ready, sha)[0] is None
     pass_file(ready).write_text("{not json", encoding="utf-8")
-    assert pl.coverage(ready, sha)[0] is None
+    assert covered_by(ready, sha)[0] is None
     pass_file(ready).write_text(json.dumps({"commit": sha}), encoding="utf-8")
-    assert pl.coverage(ready, sha)[0] is None
+    assert covered_by(ready, sha)[0] is None
 
 
 def test_an_override_record_covers_its_commit_and_an_invalid_one_does_not(run_cli, ready):
     sha = head(ready)
     do_override(run_cli, ready)
-    assert pl.coverage(ready, sha) == ("override", REASON)
+    assert covered_by(ready, sha) == ("override", REASON)
     record = json.loads(override_file(ready).read_text(encoding="utf-8"))
     override_file(ready).write_text(json.dumps({**record, "reason": "short"}), encoding="utf-8")
-    assert pl.coverage(ready, sha)[0] is None
+    assert covered_by(ready, sha)[0] is None
     override_file(ready).write_text(json.dumps({**record, "commit": "1" * 40}), encoding="utf-8")
-    assert pl.coverage(ready, sha)[0] is None
+    assert covered_by(ready, sha)[0] is None
 
 
 def test_coverage_never_takes_a_path_from_something_that_is_not_a_commit_id(ready):
-    assert pl.coverage(ready, "../../etc/passwd")[0] is None
+    assert covered_by(ready, "../../etc/passwd")[0] is None
 
 
 # --- status

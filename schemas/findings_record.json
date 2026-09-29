@@ -1,7 +1,7 @@
 {
   "description": "One prosecutor's record: the lens it reviewed through and the findings it makes. A prosecutor runs one lens per run; `merge-review` combines the records of a round into the stage's review_record.",
   "type": "object",
-  "required": ["lens", "findings"],
+  "required": ["lens", "findings", "diff_sha256"],
   "additionalProperties": false,
   "properties": {
     "lens": {
@@ -61,6 +61,11 @@
           }
         }
       }
+    },
+    "diff_sha256": {
+      "description": "The sha256 of the change this record was made against: the value in your brief, as `plumbline.py check-diff --run RUN` prints it. `merge-review` refuses a record whose hash differs from the change as the files are now, so a change edited after you read it means you run again.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     }
   }
 }

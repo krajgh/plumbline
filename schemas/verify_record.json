@@ -23,7 +23,9 @@
             "type": "integer"
           },
           "summary": {
-            "type": "string"
+            "description": "One short line the runner printed, such as `13 passed` or `2 failed, 11 passed`: at most 80 characters, and only letters, digits, spaces and `, . : ; ( ) % / _ + -`. The characters of source code (quotes, brackets, `=`) are refused, so that no test's source or assertion travels in this record.",
+            "type": "string",
+            "pattern": "^[A-Za-z0-9 ,.:;()%/_+-]{0,80}$"
           }
         }
       }

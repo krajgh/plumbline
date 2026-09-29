@@ -1,5 +1,6 @@
 """Record schemas, the JSON Schema subset validator, check-record and render."""
 import json
+import re
 
 import pytest
 
@@ -78,19 +79,49 @@ def test_the_per_agent_review_records_use_the_review_records_item_shapes():
     # each is a piece of a review_record; the shapes are written out three times
     # because the schema subset has no references, so this is what keeps them equal
     review = pl.load_schema("review_record")["properties"]
-    assert pl.load_schema("findings_record")["properties"]["findings"]["items"] == review["findings"]["items"]
+    merged = json.loads(json.dumps(review["findings"]["items"]))  # the merged record's findings carry one more field: whether their evidence was found
+    merged["required"].remove("evidence_unverified")
+    del merged["properties"]["evidence_unverified"]
+    assert pl.load_schema("findings_record")["properties"]["findings"]["items"] == merged
     assert pl.load_schema("defense_record")["properties"]["defenses"]["items"] == review["defenses"]["items"]
     assert pl.load_schema("gaps_record")["properties"]["gaps"]["items"] == review["gaps"]["items"]
     assert pl.load_schema("findings_record")["properties"]["lens"]["enum"] == review["lenses"]["items"]["enum"]
 
 
 def test_a_findings_record_has_one_lens_and_a_defense_record_one_defender():
-    assert pl.load_schema("findings_record")["required"] == ["lens", "findings"]
-    assert pl.load_schema("defense_record")["required"] == ["defender", "defenses"]
-    assert pl.load_schema("gaps_record")["required"] == ["gaps"]
+    assert pl.load_schema("findings_record")["required"] == ["lens", "findings", "diff_sha256"]
+    assert pl.load_schema("defense_record")["required"] == ["defender", "defenses", "diff_sha256"]
+    assert pl.load_schema("gaps_record")["required"] == ["gaps", "diff_sha256"]
     assert_error(errors_after("findings_record", lambda r: r.update(lens=["security"])), "$.lens", "is not one of")
     assert_error(errors_after("findings_record", lambda r: r.update(lens="vibes")), "$.lens", "is not one of")
     assert_error(errors_after("defense_record", lambda r: r.update(defender="")), "$.defender", "at least 1 characters")
+
+
+@pytest.mark.parametrize("name", ["findings_record", "defense_record", "gaps_record"])
+def test_a_part_of_a_review_carries_the_hash_of_the_change_it_saw(name):  # C-09
+    record = sample(name)
+    assert re.fullmatch(r"[0-9a-f]{64}", record["diff_sha256"])
+    del record["diff_sha256"]
+    assert pl.check_record(name, record) == ["$.diff_sha256: missing required key"]
+    record["diff_sha256"] = "abc"
+    assert any("does not match ^[0-9a-f]{64}$" in e for e in pl.check_record(name, record))
+
+
+def test_a_finding_of_the_merged_review_says_whether_its_evidence_was_found_and_the_record_says_where_the_survivors_go():  # C-03, C-06
+    record = sample("review_record")
+    assert [f["evidence_unverified"] for f in record["findings"]] == [False, True]
+    assert set(record["routes"]) == {"builder", "test-writer"}
+    assert_error(errors_after("review_record", lambda r: r["findings"][0].pop("evidence_unverified")), "$.findings[0].evidence_unverified", "missing required key")
+    assert_error(errors_after("review_record", lambda r: r["findings"][0].update(evidence_unverified="no")), "$.findings[0].evidence_unverified")
+    assert_error(errors_after("review_record", lambda r: r["routes"].pop("test-writer")), "$.routes['test-writer']", "missing required key")
+    assert_error(errors_after("review_record", lambda r: r["routes"].update(everyone=[])), "$.routes.everyone", "unexpected key")
+
+
+def test_a_command_summary_cannot_carry_source_code():  # C-06
+    for good in ("13 passed", "2 failed, 11 passed", "clean", "no test command is configured", "1 failed, 12 passed in 0.32s", "", "x" * 80):
+        assert errors_after("verify_record", lambda r: r["commands"][0].update(summary=good)) == [], good
+    for bad in ('assert main() == 2, "the expected value"', "x" * 81, "line one\nline two", "a = [1, 2]", "print('x')", "`code`", "{'k': 1}"):
+        assert_error(errors_after("verify_record", lambda r: r["commands"][0].update(summary=bad)), "$.commands[0].summary", "does not match")
 
 
 def test_an_unknown_record_type_is_an_error_listing_the_known_ones():
@@ -518,6 +549,18 @@ def test_render_carries_the_records_content():
     assert defenses.startswith("# Defenses by defender-1") and "correctness-1, defender-1: conceded" in defenses
     gaps = pl.render_record("gaps_record", sample("gaps_record"))
     assert gaps.startswith("# Gaps") and "**G-1** (uncovered_ac, AC-2) No test covers AC-2." in gaps
+
+
+def test_render_shows_the_intent_and_the_hash_of_the_change():  # C-26
+    assert "- Intent: `feature`" in pl.render_record("change_class", sample("change_class"))
+    for name in ("verify_record", "review_record", "findings_record", "defense_record", "gaps_record"):
+        assert f"Change (diff_sha256): `{sample(name)['diff_sha256']}`" in pl.render_record(name, sample(name)), name
+
+
+def test_render_marks_unverified_evidence_and_lists_the_routes():
+    review = pl.render_record("review_record", sample("review_record"))
+    assert "The evidence was found in neither the change nor its file (unverified)." in review
+    assert "## Survivors for the builder" in review and "## Survivors for the test-writer" in review
 
 
 def test_render_escapes_pipes_in_table_cells():

@@ -34,13 +34,17 @@ role = "planner"
 reads = ["request", "intake"]
 record = "spec"
 gate = "spec_complete"
+on_fail = "plan"                # the planner runs again with the gate's problems
+max_rounds = 2
 
 [[stage]]
 id = "tests"
 role = "test-writer"
 reads = ["plan"]
 record = "tests_record"
-gate = "acs_covered"
+gate = "tests_fail_on_stub"     # measured: `gate` runs the repository's test command itself, which must fail on the stubs
+on_fail = "tests"               # the test-writer runs again with the gate's problems
+max_rounds = 3
 
 [[stage]]
 id = "test-review"
@@ -64,7 +68,7 @@ id = "verify"
 role = "verifier"
 reads = ["diff", "tests?", "build?"]
 record = "verify_record"
-gate = "verify_green"
+gate = "verify_green"           # measured: `gate` runs the repository's [commands] itself and compares the verifier's record with what happened
 on_fail = "build"
 max_rounds = 3
 

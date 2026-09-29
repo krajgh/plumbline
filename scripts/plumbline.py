@@ -20,13 +20,21 @@ Standard library only (Python 3.11 or newer).
 A run is the directory .plumbline/runs/<run-id>/: one <stage-id>.json per stage,
 the per-agent records of a review unit under <stage-id>/round-<n>/, and a
 ledger.jsonl that only ever grows. `plan --intent ID` starts a run: it writes the
-intake record (which carries the intent) and copies the record an intent
-supplies in place of a skipped stage.
+intake record (which carries the intent), copies the record an intent supplies in
+place of a skipped stage, and names the run in .plumbline/runs/ACTIVE.
+
+Gates measure and trace. A stage's record counts only with the ledger's entry for
+the agent that wrote it (written by the SubagentStop hook, with the record's
+sha256), and a review with the entry `merge-review` wrote. `gate` runs the
+repository's own [commands] for a verify stage and a tests stage, and enters what
+happened in the ledger. `pass` measures the change again and refuses a row that
+selects stages the run lacks.
 
 Exit status: 0 on success; 1 when what was checked is invalid, a gate fails, or
 a command refuses (init over an existing plumbline.toml, pass on a dirty tree);
 2 when the command could not run (bad arguments, not a git repository, an
-unreadable file, no such run).
+unreadable file, no such run); 3 when a gate cannot pass because its stage has
+used all its rounds.
 """
 from __future__ import annotations
 
@@ -36,6 +44,7 @@ if sys.version_info < (3, 11):  # tomllib arrived in 3.11
     raise SystemExit("plumbline needs Python 3.11 or newer (this is %d.%d)" % sys.version_info[:2])
 
 import argparse
+import contextlib
 import copy
 import datetime as dt
 import functools
@@ -43,10 +52,14 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import tomllib
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -59,6 +72,7 @@ DEFAULT_PIPELINE = "default"
 RUNS_DIR = ".plumbline/runs"
 PASS_DIR = ".plumbline/pass"
 LEDGER_FILE = "ledger.jsonl"
+ACTIVE_FILE = "ACTIVE"  # .plumbline/runs/ACTIVE: the run id and a newline; written by `plan --intent`, read by the hooks
 IGNORE_ENTRY = ".plumbline/"
 IGNORE_EQUIVALENTS = {".plumbline", ".plumbline/", "/.plumbline", "/.plumbline/"}
 
@@ -86,6 +100,14 @@ GATE_RECORDS = {
     "all_gates_passed": "pass_record",
 }
 REVIEW_ONLY_KEYS = ("target", "lenses", "defenders", "survive_if_unrefuted_by", "detective")
+# The gates that run the repository's own commands (see measure_stage): the verify stage's and the tests stage's.
+MEASURED_TESTS_GATES = ("tests_fail_on_stub", "reproduces_on_head")
+DEFAULT_COMMAND_TIMEOUT = 900  # seconds each declared command may run; `timeout` under [commands] changes it
+MIN_QUOTE = 6  # a defender's quote of fewer characters (whitespace-normalised) proves nothing
+TESTS_TYPE = "tests"  # the file type of test files
+TESTS_LENS = "tests"  # the lens that reviews tests
+SINGLE_AC_INTENTS = ("fix",)  # a fix reproduces one bug: its spec has exactly one acceptance criterion
+UNCHANGED_TESTS_INTENTS = ("refactor",)  # behaviour stays the same, so no test file changes
 
 # The plumbline agents (agent type `plumbline:<name>`) and the record each one
 # ends its work with; the SubagentStop hook validates against it.
@@ -116,6 +138,10 @@ PROBE_PATHS = ("a", ".a", "a.b", "a/b", "a/b/c.d", ".github/workflows/x.yml", "d
 
 class PlumblineError(Exception):
     """Something to tell the user, ending the command with exit status 2."""
+
+
+class NothingToClassify(PlumblineError):
+    """There is no change between the merge base and the working tree."""
 
 
 # ------------------------------------------------------------------ globs
@@ -159,6 +185,13 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
 
 def glob_match(pattern: str, path: str) -> bool:
     return glob_to_regex(pattern).fullmatch(path) is not None
+
+
+def file_type(pipeline: dict, path: str) -> str:
+    """The type of a repository-relative path: the first type of the pipeline (a repository's own types come first)
+    whose paths match, and the last type, which matches every path, when none does."""
+    types = [(t["id"], t["paths"]) for t in pipeline["type"]]
+    return next((tid for tid, patterns in types if any(glob_match(p, path) for p in patterns)), types[-1][0])
 
 
 def _pattern_problem(pattern: str) -> str | None:
@@ -430,7 +463,7 @@ PIPELINE_SHAPE = {
 }
 
 # [commands] in plumbline.toml: what the `test`, `lint`, `typecheck` and `build` command classes run,
-# each a command prefix, or a list of prefixes.
+# each a command prefix, or a list of prefixes; `timeout` is the seconds each may run under `gate`.
 _COMMAND_PREFIXES = {"type": ["string", "array"], "minLength": 1, "minItems": 1, "items": _TEXT}
 
 CONFIG_SHAPE = {
@@ -451,7 +484,7 @@ CONFIG_SHAPE = {
         "commands": {
             "type": "object",
             "additionalProperties": False,
-            "properties": {name: _COMMAND_PREFIXES for name in CONFIG_COMMANDS},
+            "properties": {**{name: _COMMAND_PREFIXES for name in CONFIG_COMMANDS}, "timeout": {"type": "integer", "minimum": 1}},
         },
     },
 }
@@ -588,8 +621,11 @@ def validate_pipeline(pl: dict) -> tuple[list[str], list[str]]:
             if target != "main":
                 if target not in index:
                     errors.append(f"{where}: on_fail names unknown stage {target!r}")
-                elif index[target] >= position:
-                    errors.append(f"{where}: on_fail {target!r} must be an earlier stage (or 'main'), not a later one")
+                elif target == sid:  # an agent stage may name itself: its agent runs again with the gate's problems
+                    if kind != "agent":
+                        errors.append(f"{where}: a review stage cannot name itself in on_fail; it names the agent stage to go back to, or 'main'")
+                elif index[target] > position:
+                    errors.append(f"{where}: on_fail {target!r} must be an earlier stage (or this stage itself, to run its agent again, or 'main'), not a later one")
                 elif stages[index[target]].get("kind", "agent") != "agent":
                     errors.append(f"{where}: on_fail {target!r} is a review stage; it must name an agent stage or 'main'")
             if "max_rounds" not in stage:
@@ -857,6 +893,13 @@ class Project:
         return found
 
     @property
+    def command_timeout(self) -> int:
+        """The seconds each declared command may run under `gate`: `timeout` under [commands], else 900."""
+        raw = (self.config or {}).get("commands")
+        value = raw.get("timeout") if isinstance(raw, dict) else None
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else DEFAULT_COMMAND_TIMEOUT
+
+    @property
     def roles(self) -> dict:
         """The role policies: the pipeline's own, or the shipped default's for a pipeline that has none."""
         roles = (self.pipeline or {}).get("roles")
@@ -937,9 +980,13 @@ def load_project(root: Path, base_file: Path | None = None) -> Project:
 # ------------------------------------------------------------------- git
 
 
-def _git(root: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+def _git(root: Path, *args: str, timeout: int = 120, index: Path | None = None) -> subprocess.CompletedProcess:
+    """Run git in `root` without optional locks, so that a read does not take the index lock a commit needs. With
+    `index`, git works on that copy of the index. `git diff` still refreshes and rewrites the index it reads
+    (--no-optional-locks does not reach it), so the commands that run `git diff` work on a copy."""
+    env = {**os.environ, "GIT_INDEX_FILE": str(index)} if index is not None else None
     try:
-        return subprocess.run(["git", "-C", str(root), *args], capture_output=True, timeout=timeout)
+        return subprocess.run(["git", "--no-optional-locks", "-C", str(root), *args], capture_output=True, timeout=timeout, env=env)
     except FileNotFoundError:
         raise PlumblineError("git was not found on PATH") from None
     except subprocess.TimeoutExpired:
@@ -958,7 +1005,7 @@ def git_toplevel(path: Path, timeout: int = 10) -> Path | None:
     """The top level of the git work tree containing `path`, or None. Never raises."""
     try:
         result = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            ["git", "--no-optional-locks", "-C", str(path), "rev-parse", "--show-toplevel"],
             capture_output=True, text=True, timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -1005,27 +1052,19 @@ HIDE_RUNS = ":(exclude).plumbline"
 
 
 def _git_index(root: Path, index: Path, *args: str, timeout: int = 120) -> str:
-    """Run git with GIT_INDEX_FILE pointing at `index`; stdout as text."""
-    env = {**os.environ, "GIT_INDEX_FILE": str(index)}
-    try:
-        result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, timeout=timeout, env=env)
-    except FileNotFoundError:
-        raise PlumblineError("git was not found on PATH") from None
-    except subprocess.TimeoutExpired:
-        raise PlumblineError(f"git {args[0]} timed out") from None
+    """Run git on the copy of the index at `index`; stdout as text."""
+    result = _git(root, *args, timeout=timeout, index=index)
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", "replace").strip() or f"exit status {result.returncode}"
         raise PlumblineError(f"git {' '.join(args[:2])} failed: {detail}")
     return result.stdout.decode("utf-8", "surrogateescape")
 
 
-def worktree_tree(root: Path) -> str:
-    """The tree a commit of everything would take: the tracked files as they are now, and the untracked
-    files that are not ignored. Nothing is staged: the work is done in a copy of the index. The copy keeps the
-    index's own timestamp (git's check for an edit made within the second of the last index write compares
-    it), and every tracked file is read again besides, so that no timestamp can hide an edit: a file of the
-    same size rewritten within that second looks unchanged to `git add` alone. Starting from the real index,
-    not an empty one, keeps the files that are tracked although .gitignore names them."""
+@contextlib.contextmanager
+def index_copy(root: Path):
+    """A private copy of the repository's index, as a path, gone when the block ends. The copy keeps the index's own
+    timestamp (git's check for an edit made within the second of the last index write compares it). Whatever git
+    refreshes or writes goes to the copy, so that measuring a change leaves the real index as it was."""
     named = _git_text(root, "rev-parse", "--git-path", "index").strip()
     source = Path(named) if os.path.isabs(named) else root / named
     with tempfile.TemporaryDirectory(prefix="plumbline-") as scratch:
@@ -1034,7 +1073,25 @@ def worktree_tree(root: Path) -> str:
             shutil.copy2(source, index)
         except FileNotFoundError:
             pass  # no index yet: start from an empty one
-        _git_index(root, index, "add", "-A")  # the untracked files, the deletions, and the edits that show in the stat data
+        yield index
+
+
+def nested_repositories(root: Path) -> list[str]:
+    """The untracked directories that are repositories of their own (git lists them with a trailing slash). They are
+    no part of the change: `classify` skips them, and so does the hash. `git add -A` would fail on one without a commit."""
+    listing = _git_text(root, "ls-files", "--others", "--exclude-standard", "-z")
+    return [name for name in listing.split("\0") if name.endswith("/")]
+
+
+def worktree_tree(root: Path) -> str:
+    """The tree a commit of everything would take: the tracked files as they are now, and the untracked
+    files that are not ignored (except nested repositories). Nothing is staged: the work is done in a copy of the
+    index. Every tracked file is read again besides, so that no timestamp can hide an edit: a file of the
+    same size rewritten within the second of the last index write looks unchanged to `git add` alone. Starting
+    from the real index, not an empty one, keeps the files that are tracked although .gitignore names them."""
+    skipped = [f":(exclude,literal){name}" for name in nested_repositories(root)]
+    with index_copy(root) as index:
+        _git_index(root, index, "add", "-A", *(["--", ".", *skipped] if skipped else []))  # the untracked files, the deletions, and the edits that show in the stat data
         _git_index(root, index, "add", "--renormalize", "-u")  # and every tracked file, read again
         _git_index(root, index, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", ".plumbline")  # never part of the change
         return _git_index(root, index, "write-tree").strip()
@@ -1053,6 +1110,26 @@ def change_hash(root: Path, merge_base: str, tree: str | None = None) -> str:
         detail = result.stderr.decode("utf-8", "replace").strip() or f"exit status {result.returncode}"
         raise PlumblineError(f"cannot hash the change from {merge_base[:12]}: {detail}")
     return hashlib.sha256(result.stdout).hexdigest()
+
+
+def change_diff_lines(root: Path, merge_base: str, tree: str) -> list[str]:
+    """The lines of the change from `merge_base` to `tree` as the diff shows them, without the diff's own
+    marks: the text of each added, removed and context line, and nothing of the headers. A quote that is in the change
+    is in this text."""
+    result = _git(root, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "-U3", merge_base, tree, "--", ".", HIDE_RUNS)
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip() or f"exit status {result.returncode}"
+        raise PlumblineError(f"cannot read the change from {merge_base[:12]}: {detail}")
+    lines: list[str] = []
+    in_hunk = False
+    for raw in result.stdout.decode("utf-8", "replace").split("\n"):  # not splitlines(): a form feed inside a source line is no line break here
+        if raw.startswith("diff --git "):
+            in_hunk = False
+        elif raw.startswith("@@"):
+            in_hunk = True
+        elif in_hunk and raw[:1] in ("+", "-", " "):
+            lines.append(raw[1:])
+    return lines
 
 
 def resolve_base(root: Path, base: str | None) -> tuple[str, str, list[str]]:
@@ -1115,7 +1192,7 @@ def row_labels(pipeline: dict) -> list[str]:
 #
 # The row selects stages; the intent then removes stages (`skip`), or supplies the
 # record a removed stage would have written (`supplies`), replaces the gate of a
-# stage (`gates`) and the lenses of the review of the diff (`lenses`).
+# stage (`gates`) and adds lenses to the review of the diff (`lenses`, unioned with the row's).
 
 
 def intent_ids(pipeline: dict) -> list[str]:
@@ -1152,12 +1229,14 @@ def effective_row(pipeline: dict, label: str, intent_id: str = DEFAULT_INTENT) -
         raise PlumblineError(f"{label!r} is not a row of this pipeline (the rows are {', '.join(row_labels(pipeline))})")
     row = find_row(pipeline, label)
     skip = set(intent.get("skip", []))
+    lenses = list(row.get("lenses") or [])  # the intent's lenses add to the row's: a refactor of a workflow file keeps the security lens
+    lenses += [lens for lens in intent.get("lenses") or [] if lens not in lenses]
     return EffectiveRow(
         label=label,
         intent=intent_id,
         stages=[sid for sid in row["stages"] if sid not in skip],
         supplied=list(intent.get("supplies", [])),
-        lenses=list(intent["lenses"]) if intent.get("lenses") else (list(row["lenses"]) if row.get("lenses") else None),
+        lenses=lenses or None,
         gates=dict(intent.get("gates", {})),
         note=row.get("note"),
     )
@@ -1188,7 +1267,10 @@ def classify(root: Path, pipeline: dict, base: str | None = None, intent: str = 
     base, merge_base, notes = resolve_base(root, base)
 
     entries: dict[str, dict] = {}
-    raw = _git_text(root, "diff", "--raw", "-z", "--no-renames", "--no-ext-diff", merge_base, "--").split("\0")
+    with index_copy(root) as index:  # `git diff` refreshes the index it reads: on a copy, the real one stays as it was
+        raw_text = _git_index(root, index, "diff", "--raw", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", merge_base, "--")
+        numstat = _git_index(root, index, "diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", merge_base, "--")
+    raw = raw_text.split("\0")
     position = 0
     while position < len(raw):
         token = raw[position]
@@ -1200,7 +1282,6 @@ def classify(root: Path, pipeline: dict, base: str | None = None, intent: str = 
             position += 1
 
     binary: list[str] = []
-    numstat = _git_text(root, "diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", merge_base, "--")
     for record in numstat.split("\0"):
         if not record:
             continue
@@ -1235,20 +1316,18 @@ def classify(root: Path, pipeline: dict, base: str | None = None, intent: str = 
         notes.append("binary files count as 0 lines: " + ", ".join(sorted(binary)))
 
     if not entries and row is None:
-        raise PlumblineError(
+        raise NothingToClassify(
             f"no changes between the merge base of '{base}' and the working tree; there is nothing to classify "
             "(a change that does not exist yet needs its row declared: --row ROW)"
         )
 
-    type_patterns = [(t["id"], t["paths"]) for t in pipeline["type"]]
     files = []
     for path in sorted(entries):
         entry = entries[path]
-        file_type = next((tid for tid, patterns in type_patterns if any(glob_match(p, path) for p in patterns)), type_patterns[-1][0])
         files.append(
             {
                 "path": path,
-                "type": file_type,
+                "type": file_type(pipeline, path),
                 "added": entry["added"],
                 "removed": entry["removed"],
                 "generated": any(glob_match(p, path) for p in pipeline["generated"]),
@@ -1383,13 +1462,15 @@ enabled = {enabled}
 # stages = ["intake", "reduce"]
 # note = "Voice and prompt changes go through this repository's own evals."
 #
-# The commands the verifier and the test-writer run (each a command prefix, or a list of prefixes).
-# The verifier needs `test`; without it the verify stage cannot run the tests.
+# The commands the verifier and the test-writer run, and that `plumbline.py gate` runs itself from the repository
+# root (each a command prefix, or a list of prefixes; `gate` runs the first). The verify stage needs `test`: without it
+# the gate has nothing to run. A pytest command also gets a junit report, which keeps the count of tests from shrinking.
 # [commands]
 # test = "python3 -m pytest"
 # lint = "ruff check"
 # typecheck = "mypy ."
 # build = "make build"
+# timeout = 900               # seconds each command may run under `gate`
 """
 
 
@@ -1474,6 +1555,11 @@ def _check(value) -> str:
     return "n/a" if value is None else ("pass" if value else "fail")
 
 
+def _change_line(d) -> list[str]:
+    """The change a record covers, as the hash `check-diff` prints."""
+    return ["", f"Change (diff_sha256): `{_s(_get(d, 'diff_sha256'))}`"]
+
+
 def _section(title: str, items, fmt=_s) -> list[str]:
     items = _list(items)
     return ["", f"## {title}", ""] + ([f"- {fmt(item)}" for item in items] if items else ["None."])
@@ -1490,7 +1576,7 @@ def _render_change_class(d) -> list[str]:
         f"Row `{_s(d.get('row'))}`: size {_s(d.get('size'))}, {_s(d.get('lines'))} changed lines. "
         f"Types: {', '.join(_s(t) for t in _list(d.get('types'))) or 'none'}."
     )
-    out += ["", f"- Base: `{_s(d.get('base'))}`, merge base `{_short(d.get('merge_base'))}`", f"- Head: `{_short(d.get('head'))}`"]
+    out += ["", f"- Intent: `{_s(d.get('intent'))}`", f"- Base: `{_s(d.get('base'))}`, merge base `{_short(d.get('merge_base'))}`", f"- Head: `{_short(d.get('head'))}`"]
     out += ["", "## Files", ""]
     files = _list(d.get("files"))
     if files:
@@ -1555,7 +1641,7 @@ def _render_build_note(d) -> list[str]:
 
 
 def _render_verify_record(d) -> list[str]:
-    out = [f"# Verify: {'green' if d.get('green') is True else 'not green'}", "", "## Commands", ""]
+    out = [f"# Verify: {'green' if d.get('green') is True else 'not green'}", *_change_line(d), "", "## Commands", ""]
     commands = _list(d.get("commands"))
     if commands:
         out += _table(
@@ -1590,6 +1676,8 @@ def _finding_lines(f) -> list[str]:
     ]
     if _get(f, "outside_code") is not None:
         lines.append(f"  - Outside the code: {_s(_get(f, 'outside_code'))}")
+    if _get(f, "evidence_unverified") is True:
+        lines.append("  - The evidence was found in neither the change nor its file (unverified).")
     return lines
 
 
@@ -1611,6 +1699,7 @@ def _render_review_record(d) -> list[str]:
         "",
         f"Lenses: {', '.join(_s(x) for x in _list(d.get('lenses'))) or 'none'}. "
         f"Blockers surviving: {_s(d.get('blockers_surviving'))}.",
+        *_change_line(d),
         "",
         "## Findings",
         "",
@@ -1622,12 +1711,15 @@ def _render_review_record(d) -> list[str]:
         out.append("None.")
     out += _section("Defenses", d.get("defenses"), _defense_text)
     out += _section("Survivors", d.get("survivors"))
+    routes = _get(d, "routes", {})
+    out += _section("Survivors for the builder", _get(routes, "builder"))
+    out += _section("Survivors for the test-writer", _get(routes, "test-writer"))
     out += _section("Gaps", d.get("gaps"), _gap_text)
     return out
 
 
 def _render_findings_record(d) -> list[str]:
-    out = [f"# Findings through the {_s(d.get('lens'))} lens", "", "## Findings", ""]
+    out = [f"# Findings through the {_s(d.get('lens'))} lens", *_change_line(d), "", "## Findings", ""]
     findings = _list(d.get("findings"))
     for f in findings:
         out += _finding_lines(f)
@@ -1637,11 +1729,11 @@ def _render_findings_record(d) -> list[str]:
 
 
 def _render_defense_record(d) -> list[str]:
-    return [f"# Defenses by {_s(d.get('defender'))}"] + _section("Defenses", d.get("defenses"), _defense_text)
+    return [f"# Defenses by {_s(d.get('defender'))}", *_change_line(d)] + _section("Defenses", d.get("defenses"), _defense_text)
 
 
 def _render_gaps_record(d) -> list[str]:
-    return ["# Gaps"] + _section("Gaps", d.get("gaps"), _gap_text)
+    return ["# Gaps", *_change_line(d)] + _section("Gaps", d.get("gaps"), _gap_text)
 
 
 def _render_pass_record(d) -> list[str]:
@@ -1728,6 +1820,8 @@ def utc_now() -> str:
 def check_run_id(run_id: str) -> str:
     if not RUN_ID_PATTERN.fullmatch(run_id):
         raise PlumblineError(f"run id {run_id!r} must be letters, digits, '.', '_' or '-', and start with a letter or digit")
+    if run_id.lower() == ACTIVE_FILE.lower():  # the file that names the active run sits beside the run directories
+        raise PlumblineError(f"run id {run_id!r} is taken by the file {RUNS_DIR}/{ACTIVE_FILE}; pick another --run-id")
     return run_id
 
 
@@ -1764,11 +1858,16 @@ def load_json_file(path: Path):
         return None, f"not valid JSON: {exc}"
 
 
+def json_text(data) -> str:
+    """`data` as the text a record file holds."""
+    return json.dumps(data, indent=2) + "\n"
+
+
 def write_json_atomic(path: Path, data) -> None:
     """Write `data` as JSON so that a reader sees the old file or the whole new one."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.tmp")
-    temp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    temp.write_text(json_text(data), encoding="utf-8")
     os.replace(temp, path)
 
 
@@ -1777,6 +1876,10 @@ def file_sha256(path: Path) -> str | None:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError:
         return None
+
+
+def text_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def ledger_path(root: Path, run_id: str) -> Path:
@@ -1812,6 +1915,14 @@ def read_ledger(root: Path, run_id: str) -> list[dict]:
     return entries
 
 
+def latest_entry(ledger: list[dict], kind: str, **fields) -> dict | None:
+    """The last entry of the ledger that has this kind and these fields."""
+    for entry in reversed(ledger):
+        if entry.get("kind") == kind and all(entry.get(key) == value for key, value in fields.items()):
+            return entry
+    return None
+
+
 def latest_run_id(root: Path) -> str | None:
     """The run touched most recently: the newest file in a run directory wins."""
     best: tuple[float, str] | None = None
@@ -1827,6 +1938,28 @@ def latest_run_id(root: Path) -> str | None:
         if best is None or (newest, directory.name) > best:
             best = (newest, directory.name)
     return best[1] if best else None
+
+
+def active_run_id(root: Path) -> str | None:
+    """The run in progress: the one .plumbline/runs/ACTIVE names (`plan --intent` writes it), when that run's directory
+    exists; otherwise the newest run. The hooks read the same file: the run id, and a newline."""
+    try:
+        named = (root / RUNS_DIR / ACTIVE_FILE).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        named = ""
+    if RUN_ID_PATTERN.fullmatch(named) and (root / RUNS_DIR / named).is_dir():
+        return named
+    return latest_run_id(root)
+
+
+def write_active(root: Path, run_id: str) -> Path:
+    """Name `run_id` as the run in progress."""
+    path = root / RUNS_DIR / ACTIVE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{ACTIVE_FILE}.tmp")
+    temp.write_text(run_id + "\n", encoding="utf-8")
+    os.replace(temp, path)
+    return path
 
 
 def head_sha(root: Path) -> str:
@@ -1875,11 +2008,20 @@ def intake_stage_of(pipeline: dict) -> dict:
 
 
 def load_run(project: Project, run_id: str) -> Run:
+    """The run as its intake record describes it. The intake record is what `plan --intent` wrote: the ledger holds
+    its hash, and a record edited since is refused, because it names the row, the intent and the merge base that
+    every later check measures from."""
     existing_run_dir(project.root, run_id)
     by_id = {s["id"]: s for s in project.pipeline["stage"]}
-    data, problems = read_stage_record(project.root, run_id, intake_stage_of(project.pipeline))
+    intake = intake_stage_of(project.pipeline)
+    data, problems = read_stage_record(project.root, run_id, intake)
     if data is None:
         raise PlumblineError(f"the run's intake record is not usable: {problems[0]}")
+    entry = latest_entry(read_ledger(project.root, run_id), "intake")
+    if entry is None:
+        raise PlumblineError("the run's intake record has no entry from `plan --intent` in the ledger; start the run with `plan --intent`")
+    if entry.get("record_sha256") != file_sha256(run_dir(project.root, run_id) / f"{intake['id']}.json"):
+        raise PlumblineError("the run's intake record changed after `plan --intent` wrote it (the ledger holds its hash from then); start a new run with `plan --intent`")
     try:
         effective = effective_row(project.pipeline, data["row"], data["intent"])
         stages = [effective_stage(by_id[sid], effective) for sid in effective.stages]
@@ -1893,8 +2035,13 @@ def load_run(project: Project, run_id: str) -> Run:
 
 # ------------------------------------------------------------------ gates
 #
-# A gate is a mechanical check of a stage's record; no model is asked. Every
-# gate first requires the record to exist and validate against its schema.
+# A gate is a mechanical check of a stage's record; no model is asked. Every gate
+# first requires the record to exist and validate against its schema, and the
+# ledger to trace it: an agent stage's record counts only with the entry of the
+# agent that wrote it (the SubagentStop hook writes it, with the record's hash),
+# and a review only with the entry `merge-review` wrote. The gates of the verify
+# stage and of the tests stage also run the repository's own commands (see
+# measure_stage), so that they rest on what happened and not on what an agent typed.
 
 
 @dataclass
@@ -1908,59 +2055,344 @@ class GateOutcome:
     data: dict | None = None  # the record itself, when it exists and validates
 
 
-def _gate_spec_complete(spec: dict, _load_spec) -> list[str]:
-    criteria = spec["acceptance_criteria"]
-    planned = {entry["ac"] for entry in spec["test_plan"]}
-    problems = [] if criteria else ["the spec has no acceptance criteria"]
-    problems += [f"{ac['id']} has no test_plan entry" for ac in criteria if ac["id"] not in planned]
-    return problems
+@dataclass
+class GateContext:
+    """What a gate check may look at besides the record it checks."""
+
+    project: Project
+    run_id: str
+    stage: dict
+    run: Run | None  # None when the run has no usable intake record
+    ledger: list[dict]
+    measuring: bool  # this evaluation ran the repository's commands just now
+
+    @property
+    def root(self) -> Path:
+        return self.project.root
+
+    def spec(self) -> tuple[dict | None, list[str]]:
+        """The spec this stage reads, as (record, problems)."""
+        for name, _optional in _read_names(self.stage):
+            source = next((s for s in self.project.pipeline["stage"] if s["id"] == name), None)
+            if source is not None and source["record"] == "spec":
+                return read_stage_record(self.root, self.run_id, source)
+        return None, [f"stage '{self.stage['id']}' reads no spec, so {self.stage['gate']} has nothing to compare against"]
+
+    def run_entry(self) -> dict | None:
+        """The latest measured run of this stage's commands (see measure_stage)."""
+        return latest_entry(self.ledger, "run", stage=self.stage["id"])
 
 
-def _gate_acs_covered(tests: dict, load_spec) -> list[str]:
-    spec, problems = load_spec()
-    if spec is None:
-        return problems
-    covered = {ac for test in tests["tests"] for ac in test["ac_ids"]}
-    return [f"{ac['id']} is covered by no test" for ac in spec["acceptance_criteria"] if ac["id"] not in covered]
+# ---- the spec
 
-
-def _gate_tests_fail_on_stub(tests: dict, _load_spec) -> list[str]:
-    stub = tests["stub_check"]
-    if not stub["ran"]:
-        return ["the stub check did not run"]
-    if not stub["all_failed_on_assertions"]:
-        return ["not every test failed on an assertion against the stubs"]
+def single_ac_problems(intent: str | None, spec: dict) -> list[str]:
+    count = len(spec["acceptance_criteria"])
+    if intent in SINGLE_AC_INTENTS and count > 1:
+        return [f"the intent '{intent}' reproduces one bug, so its spec has exactly one acceptance criterion (this one has {count})"]
     return []
 
 
-def _gate_reproduces_on_head(tests: dict, load_spec) -> list[str]:
-    """The gate of a fix's tests, in place of `acs_covered`: the new tests must fail on today's code, and on
-    an assertion. The stub check records that run (the code is HEAD's own, so there are no stubs). It keeps
-    the coverage rule of the gate it replaces: every acceptance criterion has a test."""
-    problems = _gate_acs_covered(tests, load_spec)
-    stub = tests["stub_check"]
-    if not tests["tests"]:
-        problems.append("there are no tests")
-    if not stub["ran"]:
-        problems.append("the new tests were not run against today's code")
-    elif not stub["all_failed_on_assertions"]:
-        problems.append("not every new test fails on an assertion against today's code (one that passes there, or fails on an import or syntax error, reproduces nothing)")
+def _gate_spec_complete(spec: dict, ctx: GateContext | None) -> list[str]:
+    criteria = spec["acceptance_criteria"]
+    ids = [ac["id"] for ac in criteria]
+    planned = [entry["ac"] for entry in spec["test_plan"]]
+    problems = [] if criteria else ["the spec has no acceptance criteria"]
+    problems += [f"{ac} is defined more than once" for ac in dict.fromkeys(ids) if ids.count(ac) > 1]
+    problems += [f"{ac} has no test_plan entry" for ac in dict.fromkeys(ids) if ac not in planned]
+    problems += [f"the test_plan has an entry for {ac}, which the spec does not define" for ac in dict.fromkeys(planned) if ac not in ids]
+    if ctx is not None and ctx.run is not None:
+        problems += single_ac_problems(ctx.run.intent, spec)
     return problems
 
 
-def _gate_verify_green(verify: dict, _load_spec) -> list[str]:
-    if verify["green"]:
-        return []
+# ---- the tests
+
+def _test_names(name: str) -> list[str]:
+    """The strings a test's name may appear as in its file: as given, without a parametrised suffix, and its last `::` part."""
+    plain = re.sub(r"\[[^\]]*\]$", "", name)
+    return list(dict.fromkeys([name, plain, plain.rsplit("::", 1)[-1]]))
+
+
+def _test_file_problem(project: Project, test: dict) -> str | None:
+    """Why the file a test entry names is no test of this repository, or None: it must exist inside the repository,
+    be of the tests type, and hold the test's name."""
+    root = project.root
+    name = test["file"]
+    where = f"test {test['id']}"
+    relative = os.path.normpath(name)
+    if os.path.isabs(name) or relative == ".." or relative.startswith(".." + os.sep):
+        return f"{where}: the file {name} is outside the repository"
+    path = root / relative
+    try:
+        inside = path.resolve().is_relative_to(root.resolve())
+    except OSError:
+        inside = False
+    if not inside:
+        return f"{where}: the file {name} is outside the repository"
+    if not path.is_file():
+        return f"{where}: the file {name} does not exist"
+    kind = file_type(project.pipeline, Path(relative).as_posix())
+    if kind != TESTS_TYPE:
+        return f"{where}: the file {name} is a {kind} file, not a {TESTS_TYPE} file"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"{where}: the file {name} cannot be read ({exc})"
+    if not any(candidate in text for candidate in _test_names(test["name"])):
+        return f"{where}: the file {name} has no test named '{test['name']}'"
+    return None
+
+
+def _acs_covered_problems(tests: dict, ctx: GateContext) -> list[str]:
+    """Every test's file exists, is of the tests type and holds the test's name; every criterion a test claims is one of
+    the spec's; every criterion of the spec is covered by such a test."""
+    spec, problems = ctx.spec()
+    if spec is None:
+        return problems
+    known = [ac["id"] for ac in spec["acceptance_criteria"]]
+    covered: set[str] = set()
+    for test in tests["tests"]:
+        problem = _test_file_problem(ctx.project, test)
+        if problem:
+            problems.append(problem)
+        problems += [f"test {test['id']} claims {ac}, which the spec does not have" for ac in test["ac_ids"] if ac not in known]
+        if problem is None:
+            covered.update(test["ac_ids"])
+    problems += [f"{ac} is covered by no test" for ac in dict.fromkeys(known) if ac not in covered]
+    return problems
+
+
+def _gate_acs_covered(tests: dict, ctx: GateContext) -> list[str]:
+    return _acs_covered_problems(tests, ctx)
+
+
+def is_pytest(command: str) -> bool:
+    """Does the command run pytest: a `pytest` program, `python -m pytest`, `uv run ... pytest`?"""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    return any(os.path.basename(word) in ("pytest", "py.test") or (word == "-m" and words[i + 1 : i + 2] == ["pytest"]) for i, word in enumerate(words))
+
+
+def _junit_of(entry: dict | None) -> dict | None:
+    """The junit counts {tests, failures, errors, skipped} of a measured run, when its test command was pytest."""
+    for command in (entry or {}).get("commands", []):
+        if isinstance(command.get("junit"), dict):
+            return command["junit"]
+    return None
+
+
+def _run_entry_problems(entry: dict) -> list[str]:
+    """What a measured run shows apart from the commands' exit codes: a command that timed out, and any guarded file
+    that changed while the commands ran."""
+    problems = [
+        f"the {c['name']} command timed out after {entry.get('timeout', DEFAULT_COMMAND_TIMEOUT)} s ({c['cmd']}); `timeout` under [commands] in plumbline.toml allows more"
+        for c in entry.get("commands", [])
+        if c.get("timed_out")
+    ]
+    before, after = entry.get("guarded_before") or {}, entry.get("guarded_after") or {}
+    problems += [f"the test run changed {name}" for name in sorted({*before, *after}) if before.get(name) != after.get(name)]
+    return problems
+
+
+def tests_revision(run: Run | None, stage_id: str, ledger: list[dict]) -> bool:
+    """Is the tests stage being run again after the build began, having passed its gate before it? Then the code exists,
+    so the tests are not expected to fail: the run is recorded, and the tests must still cover the spec and hold the
+    inventory. A tests stage that never passed before the build gets no such allowance."""
+    if run is None:
+        return False
+    builders = {s["id"] for s in run.stages if s.get("role") == "builder"}
+    passed_before = False
+    for entry in ledger:
+        if entry.get("kind") == "gate" and entry.get("stage") == stage_id and entry.get("passed") is True:
+            passed_before = True
+        elif entry.get("kind") == "agent" and entry.get("stage") in builders:
+            return passed_before
+    return False
+
+
+def _measured_tests_problems(ctx: GateContext, revision: bool) -> list[str]:
+    """The tests stage's own run of the repository's test command: before the code exists it must fail. A pytest
+    command fails with exit status 1; 2 is a collection or usage error, and 5 collected no tests: neither is a test that
+    fails. Another command fails with any status but 0, apart from 126 and 127, which say it did not run at all."""
+    entry = ctx.run_entry()
+    if entry is None:
+        return [f"the test command has not been run: `plumbline.py gate {ctx.run_id} {ctx.stage['id']}` runs the repository's test command itself"]
+    problems = _run_entry_problems(entry)
+    if revision:
+        return problems
+    test = next((c for c in entry["commands"] if c["name"] == "test"), None)
+    if test is None:
+        return problems + ["the measured run has no test command"]
+    code, command = test["exit_code"], test["cmd"]
+    if test.get("timed_out"):
+        return problems
+    if code in (126, 127):
+        problems.append(f"the test command could not run (exit status {code}): check `{command}` under [commands] in plumbline.toml")
+    elif is_pytest(command):
+        if code == 0:
+            problems.append("the test command exited 0: every test passed, so none of them fails without the change it tests")
+        elif code == 2:
+            problems.append("the test command exited 2: pytest could not collect the tests (an import or syntax error), and a test that cannot run reproduces nothing")
+        elif code == 5:
+            problems.append("the test command exited 5: pytest collected no tests")
+        elif code != 1:
+            problems.append(f"the test command exited {code}: pytest did not report failing tests (a failing test exits 1)")
+    elif code == 0:
+        problems.append("the test command exited 0: every test passed, so none of them fails without the change it tests")
+    return problems
+
+
+def _stub_problems(tests: dict, ctx: GateContext, on_stubs: bool) -> list[str]:
+    """The tests stage's checks in one place: coverage, at least one test, what the test-writer says its run showed, and
+    what the measured run showed. The tests run against stubs, or (for a fix) against today's code."""
+    problems = _acs_covered_problems(tests, ctx)
+    if not tests["tests"]:
+        problems.append("there are no tests")
+    revision = tests_revision(ctx.run, ctx.stage["id"], ctx.ledger)
+    stub = tests["stub_check"]
+    if not revision:  # once the code exists, the test-writer's own stub check is about a run that is over
+        if not stub["ran"]:
+            problems.append("the stub check did not run" if on_stubs else "the new tests were not run against today's code")
+        elif not stub["all_failed_on_assertions"]:
+            problems.append(
+                "not every test failed on an assertion against the stubs"
+                if on_stubs
+                else "not every new test fails on an assertion against today's code (one that passes there, or fails on an import or syntax error, reproduces nothing)"
+            )
+    return problems + _measured_tests_problems(ctx, revision)
+
+
+def _gate_tests_fail_on_stub(tests: dict, ctx: GateContext) -> list[str]:
+    """The gate of the tests stage: the tests cover the spec, and the repository's test command, run by `gate`, fails on
+    the stubs. The test-writer's typed stub check must agree."""
+    return _stub_problems(tests, ctx, True)
+
+
+def _gate_reproduces_on_head(tests: dict, ctx: GateContext) -> list[str]:
+    """The gate of a fix's tests, in place of `tests_fail_on_stub`: the new tests must fail on today's code, and on an
+    assertion. The code is HEAD's own, so there are no stubs. It measures the same run and keeps the coverage rule."""
+    return _stub_problems(tests, ctx, False)
+
+
+# ---- the change is verified
+
+def _typed_verify_problems(verify: dict) -> list[str]:
+    """What the verifier's record says about itself: green must be what its commands, checks and tests add up to, and when it
+    is not green, every reason is listed."""
     failing = [entry["ac"] for entry in verify["failing_acs"]]
-    return ["the verify record is not green" + (f" (failing: {', '.join(failing)})" if failing else "")]
+    bad_commands = [c for c in verify["commands"] if c["exit_code"] != 0]
+    bad_checks = [name for name, value in verify["checks"].items() if value is False]
+    failed = verify["tests"]["failed"]
+    if not verify["green"]:
+        problems = ["the verify record is not green" + (f" (failing: {', '.join(failing)})" if failing else "")]
+        problems += [f"the record's {c['name']} command exited {c['exit_code']}" for c in bad_commands]
+        problems += [f"the record's check {name} is false" for name in bad_checks]
+        if failed:
+            problems.append(f"the record shows {failed} failed test{'' if failed == 1 else 's'}")
+        return problems
+    problems = []
+    if not verify["commands"]:
+        problems.append("the verify record lists no commands, so nothing shows it verified anything")
+    if failing:
+        problems.append(f"green is true, but failing_acs lists {', '.join(failing)}")
+    if failed:
+        problems.append(f"green is true, but tests.failed is {failed}")
+    problems += [f"green is true, but the {c['name']} command's exit_code is {c['exit_code']}" for c in bad_commands]
+    problems += [f"green is true, but checks.{name} is false" for name in bad_checks]
+    return problems
 
 
-def _gate_no_surviving_blockers(review: dict, _load_spec) -> list[str]:
-    if review["blockers_surviving"] == 0:
+def changed_files(project: Project, run: Run) -> tuple[dict | None, list[str]]:
+    """The change from the run's merge base to the files as they are, classified: (the change_class record, problems).
+    The record is None when nothing changed."""
+    try:
+        return classify(project.root, project.pipeline, run.merge_base, run.intent), []
+    except NothingToClassify:
+        return None, []
+    except PlumblineError as exc:
+        return None, [str(exc)]
+
+
+def tests_touched_problems(project: Project, run: Run | None, measured: dict | None = None) -> list[str]:
+    """Under an intent that leaves the tests as they are (a refactor), the change touches no test file."""
+    if run is None or run.intent not in UNCHANGED_TESTS_INTENTS:
         return []
+    record, problems = (measured, []) if measured is not None else changed_files(project, run)
+    if record is None:
+        return problems
+    files = [f["path"] for f in record["files"] if f["type"] == TESTS_TYPE]
+    if files:
+        problems.append(f"the intent {run.intent} leaves the tests as they are, but the change touches {', '.join(files)}")
+    return problems
+
+
+def _inventory_problems(ctx: GateContext, entry: dict) -> list[str]:
+    """The tests the verify run ran must be at least those the tests stage's run ran, and no more of them skipped: the build
+    cannot make a failing test go away by deleting it or marking it skipped. Only pytest commands report an inventory."""
+    tests_stage = next((s for s in ctx.run.stages if s.get("gate") in MEASURED_TESTS_GATES), None) if ctx.run is not None else None
+    if tests_stage is None:
+        return []
+    before, now = _junit_of(latest_entry(ctx.ledger, "run", stage=tests_stage["id"])), _junit_of(entry)
+    if before is None or now is None:
+        return []
+    problems = []
+    if now["tests"] < before["tests"]:
+        problems.append(f"the verify run ran {now['tests']} tests, fewer than the {before['tests']} the tests stage's run ran: a test went missing")
+    if now["skipped"] > before["skipped"]:
+        problems.append(f"the verify run skipped {now['skipped']} tests, more than the {before['skipped']} the tests stage's run skipped: a test was marked skipped")
+    return problems
+
+
+def _measured_verify_problems(verify: dict, ctx: GateContext) -> list[str]:
+    entry = ctx.run_entry()
+    if entry is None:
+        return [f"the repository's commands have not been run: `plumbline.py gate {ctx.run_id} {ctx.stage['id']}` runs them itself"]
+    problems = _run_entry_problems(entry)
+    commands = entry["commands"]
+    if not commands:
+        problems.append("the measured run ran no commands")
+    problems += [f"the {c['name']} command exited {c['exit_code']} ({c['cmd']})" for c in commands if c["exit_code"] != 0 and not c.get("timed_out")]
+    if entry.get("diff_sha256") != verify["diff_sha256"]:
+        problems.append(
+            f"the record covers the change {verify['diff_sha256'][:12]}, but the commands ran on the change {str(entry.get('diff_sha256'))[:12]}; "
+            "the change was edited after the verifier's record, so run the verifier again"
+        )
+    for name in CONFIG_COMMANDS:
+        declared = ctx.project.commands.get(name)
+        if declared and not any(c["name"] == name and c["cmd"] == declared[0] for c in commands):
+            problems.append(f"the {name} command is declared as `{declared[0]}`, but the measured run did not run it: evaluate the gate again")
+    return problems + _inventory_problems(ctx, entry)
+
+
+def _gate_verify_green(verify: dict, ctx: GateContext) -> list[str]:
+    """The verifier's record says green and agrees with itself; the repository's own commands, run by `gate`, all exited 0 on
+    the change the record covers; no guarded file changed while they ran; the inventory of tests did not shrink."""
+    return _typed_verify_problems(verify) + _measured_verify_problems(verify, ctx) + tests_touched_problems(ctx.project, ctx.run)
+
+
+# ---- the review
+
+def _gate_no_surviving_blockers(review: dict, ctx: GateContext) -> list[str]:
+    """The count of standing blockers is recomputed from the findings and the survivors, not taken from the record."""
+    ids = {f["id"] for f in review["findings"]}
+    survivors = list(dict.fromkeys(review["survivors"]))
     blocking = {f["id"] for f in review["findings"] if f["severity"] == "BLOCKING"}
-    ids = [fid for fid in review["survivors"] if fid in blocking]
-    return [f"{review['blockers_surviving']} blocker(s) survive" + (f": {', '.join(ids)}" if ids else "")]
+    standing = [fid for fid in survivors if fid in blocking]
+    problems = [f"survivors names '{fid}', which is no finding of this round" for fid in survivors if fid not in ids]
+    if review["blockers_surviving"] != len(standing):
+        problems.append(f"blockers_surviving says {review['blockers_surviving']}, but the findings and survivors give {len(standing)}")
+    if standing:
+        problems.append(f"{len(standing)} blocker(s) survive: {', '.join(standing)}")
+    if ctx.measuring and ctx.run is not None and _is_diff_review(ctx.stage):
+        current = change_hash(ctx.root, ctx.run.merge_base)
+        if review["diff_sha256"] != current:
+            problems.append(
+                f"the record covers the change {review['diff_sha256'][:12]}, but the change hashes to {current[:12]} now; "
+                "the change was edited after this review, so run the review again"
+            )
+    return problems
 
 
 GATE_CHECKS = {
@@ -1973,13 +2405,223 @@ GATE_CHECKS = {
 }
 
 
+# ---- provenance: the ledger shows who wrote a record
+
+PART_ROLES = {AGENT_RECORDS[role]: role for role in ("prosecutor", "defender", "detective")}  # findings_record -> prosecutor, ...
+
+
+def _agent_entry_problems(entry: dict | None, role: str, sha: str | None, what: str) -> list[str]:
+    """Does this ledger entry show that plumbline:<role> stopped with a valid record whose hash is `sha`?"""
+    expected = AGENT_PREFIX + role
+    if entry is None:
+        return [f"{what} has no entry from {expected}; run the {role}"]
+    if entry.get("agent_type") != expected:
+        return [f"the latest entry for {what} is from {entry.get('agent_type')}, not {expected}; run the {role}"]
+    if entry.get("valid") is not True:
+        return [f"{expected}'s last stop left {what} invalid; run the {role} again"]
+    if entry.get("record_sha256") != sha:
+        return [f"{what} changed after {expected} stopped; run the {role} again"]
+    return []
+
+
+def _agent_provenance(root: Path, run_id: str, stage: dict, ledger: list[dict]) -> list[str]:
+    entry = latest_entry(ledger, "agent", stage=stage["id"])
+    sha = file_sha256(run_dir(root, run_id) / f"{stage['id']}.json")
+    return _agent_entry_problems(entry, stage["role"], sha, "its record")
+
+
+def _merge_provenance(root: Path, run_id: str, stage: dict, ledger: list[dict]) -> list[str]:
+    """A review's record is what `merge-review` wrote (its ledger entry holds the record's hash), and each part it was
+    built from is what its agent left (the agent's entry holds the part's hash)."""
+    sid = stage["id"]
+    entry = latest_entry(ledger, "merge", stage=sid)
+    if entry is None:
+        return [f"its record has no entry from merge-review; run `plumbline.py merge-review {run_id} {sid}`"]
+    if entry.get("record_sha256") != file_sha256(run_dir(root, run_id) / f"{sid}.json"):
+        return [f"its record changed after merge-review wrote it; run `plumbline.py merge-review {run_id} {sid}` again"]
+    problems = []
+    for part in entry.get("parts") if isinstance(entry.get("parts"), list) else []:
+        path, sha = part.get("path"), part.get("sha256")
+        if not isinstance(path, str) or file_sha256(root / path) != sha:
+            problems.append(f"{path} changed after merge-review read it; run the agent and merge-review again")
+            continue
+        data, problem = load_json_file(root / path)
+        role = PART_ROLES.get(_part_type(data)) if problem is None else None
+        if role is None:
+            problems.append(f"{path} is no findings, defense or gaps record")
+            continue
+        problems += _agent_entry_problems(latest_entry(ledger, "agent", record=path), role, sha, path)
+    return problems
+
+
+def _supplied_provenance(root: Path, run_id: str, stage: dict, ledger: list[dict]) -> list[str]:
+    entry = latest_entry(ledger, "supplied", stage=stage["id"])
+    if entry is None:
+        return ["its record has no entry from `plan --intent`, which supplies it; start the run with `plan --intent`"]
+    if entry.get("record_sha256") != file_sha256(run_dir(root, run_id) / f"{stage['id']}.json"):
+        return ["its record changed after `plan --intent` supplied it; start a new run with the record you mean"]
+    return []
+
+
+def provenance_problems(root: Path, run_id: str, stage: dict, run: Run | None, ledger: list[dict]) -> list[str]:
+    """What is missing from the ledger for this stage's record to count: the agent that wrote it, the merge that built it,
+    or the intent that supplied it. The main session's own stages (intake, reduce) are traced elsewhere."""
+    if run is not None and any(s["id"] == stage["id"] for s in run.supplied):
+        return _supplied_provenance(root, run_id, stage, ledger)
+    if stage.get("kind", "agent") == "review":
+        return _merge_provenance(root, run_id, stage, ledger)
+    if stage.get("role") in (None, "main"):
+        return []
+    return _agent_provenance(root, run_id, stage, ledger)
+
+
+# ---- measured runs: `gate` runs the repository's commands
+
+GUARDED_FILES = (".gitattributes", ".claude/settings.json", ".claude/settings.local.json", ".mcp.json", "CLAUDE.md", "AGENTS.md", CONFIG_FILE)
+
+
+def _git_path(root: Path, name: str) -> Path:
+    named = _git_text(root, "rev-parse", "--git-path", name).strip()
+    return Path(named) if os.path.isabs(named) else root / named
+
+
+def guarded_snapshot(project: Project) -> dict[str, str | None]:
+    """The hash (None for a file that is not there) of every file a test run must leave alone: git's config and hooks, the
+    files that steer git and the agents, the settings of Claude Code, and the pipeline's own configuration."""
+    root = project.root
+    snapshot: dict[str, str | None] = {name: file_sha256(root / name) for name in GUARDED_FILES}
+    value = (project.config or {}).get("pipeline")
+    if isinstance(value, str) and not re.fullmatch(r"[A-Za-z0-9_-]+", value):  # a pipeline file of the repository's own
+        with contextlib.suppress(PlumblineError):
+            pipeline_file = resolve_pipeline_path(value, root)
+            snapshot[rel_path(root, pipeline_file)] = file_sha256(pipeline_file)
+    snapshot[".git/config"] = file_sha256(_git_path(root, "config"))
+    hooks = _git_path(root, "hooks")
+    if hooks.is_dir():
+        for path in sorted(p for p in hooks.rglob("*") if p.is_file()):
+            snapshot[f".git/hooks/{path.relative_to(hooks).as_posix()}"] = file_sha256(path)
+    return snapshot
+
+
+def read_junit(path: Path) -> dict | None:
+    """{tests, failures, errors, skipped} summed over the test suites of a junit file, or None when it cannot be read."""
+    try:
+        if path.stat().st_size > 8 << 20:
+            return None
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    suites = [s for s in root.iter("testsuite") if s.find(".//testsuite") is None]  # the innermost suites: no test counted twice
+    if not suites:
+        return None
+    try:
+        return {key: sum(int(s.get(key) or 0) for s in suites) for key in ("tests", "failures", "errors", "skipped")}
+    except ValueError:
+        return None
+
+
+def run_declared_command(root: Path, command: str, timeout: int, junit: Path | None = None) -> dict:
+    """Run one declared command from the repository root, as `sh -c`, with no input and its output discarded: what plumbline
+    keeps is that it ran, how it ended, and how long it took. Past `timeout` seconds it is killed with everything it started.
+    With `junit`, a pytest command also writes its results there."""
+    full = command
+    if junit is not None:
+        junit.unlink(missing_ok=True)
+        full = f"{command} --junitxml={shlex.quote(str(junit))}"
+    started = time.monotonic()
+    result: dict = {"cmd": command}
+    try:
+        process = subprocess.Popen(
+            ["sh", "-c", full], cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True
+        )
+    except OSError:
+        return {**result, "exit_code": 127, "seconds": 0.0}
+
+    def kill_group() -> None:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+
+    def interrupted(signum, _frame) -> None:  # the command is a session of its own: ending `gate` ends it too
+        kill_group()
+        raise SystemExit(128 + signum)
+
+    previous = {}
+    for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+        with contextlib.suppress(ValueError, OSError):  # only the main thread may set a handler
+            previous[getattr(signal, name)] = signal.signal(getattr(signal, name), interrupted)
+    try:
+        code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_group()
+        process.wait()
+        code, result["timed_out"] = 124, True
+    finally:
+        for number, handler in previous.items():
+            if handler is not None:  # None: a handler that was not set from Python
+                signal.signal(number, handler)
+    result.update(exit_code=code, seconds=round(time.monotonic() - started, 2))
+    if junit is not None:
+        counts = read_junit(junit)
+        if counts is not None:
+            result["junit"] = counts
+    return result
+
+
+def measure_stage(project: Project, run: Run | None, run_id: str, stage: dict) -> tuple[dict | None, list[str]]:
+    """Run the repository's declared commands for a stage whose gate measures: a verify stage runs its test command and its
+    lint, typecheck and build commands where it declares them; a tests stage runs the test command. Enter the run in the
+    ledger: {kind: "run", stage, commands: [{name, cmd, exit_code, seconds}], diff_sha256, guarded_before, guarded_after}.
+    Returns (that entry, the problems that kept the commands from running)."""
+    root = project.root
+    declared = project.commands
+    if not declared.get("test"):
+        return None, ["no test command is declared: add `test = \"...\"` under [commands] in plumbline.toml and commit it, then evaluate the gate again"]
+    names = [name for name in CONFIG_COMMANDS if declared.get(name)] if stage["gate"] == "verify_green" else ["test"]
+    digest = change_hash(root, run.merge_base) if run is not None else None  # the change as it is before the commands run
+    before = guarded_snapshot(project)
+    commands = []
+    for name in names:
+        junit = run_dir(root, run_id) / f"junit-{stage['id']}.xml" if name == "test" and is_pytest(declared[name][0]) else None
+        commands.append({"name": name, **run_declared_command(root, declared[name][0], project.command_timeout, junit)})
+    after = guarded_snapshot(project)
+    entry = {
+        "kind": "run", "stage": stage["id"], "gate": stage["gate"], "commands": commands, "diff_sha256": digest,
+        "guarded_before": before, "guarded_after": after, "timeout": project.command_timeout,
+    }
+    append_ledger(root, run_id, entry)
+    return entry, []
+
+
+# ---- rounds
+
+def stage_round(stage: dict, data: dict | None, ledger: list[dict]) -> tuple[int, int | None]:
+    """(the round this stage is in, its max_rounds). A review stage is in the round its record says. An agent stage is in the
+    round of its agents that stopped since its gate last passed: a stage that passed and is run again (the review sent the
+    run back to build) starts counting again."""
+    limit = stage.get("max_rounds")
+    if stage.get("kind", "agent") == "review":
+        return (data["round"] if data is not None else 0), limit
+    count = 0
+    for entry in ledger:
+        if entry.get("stage") != stage["id"]:
+            continue
+        if entry.get("kind") == "agent":
+            count += 1
+        elif entry.get("kind") == "gate" and entry.get("passed") is True:
+            count = 0
+    return count, limit
+
+
+# ---- evaluating a stage
+
 def check_all_gates_passed(project: Project, run_id: str, own_stage: dict) -> list[str]:
-    """Every other stage of the run's row has a valid record and, where it has a
-    gate, passed it at its last evaluation in the ledger, with its record unchanged since."""
+    """Every other stage of the run's row has a valid record, traced in the ledger (see provenance_problems) and, where it has a
+    gate, passed it at its last evaluation, with its record unchanged since."""
     root = project.root
     run = load_run(project, run_id)
+    ledger = read_ledger(root, run_id)
     latest: dict[str, dict] = {}
-    for entry in read_ledger(root, run_id):
+    for entry in ledger:
         if entry.get("kind") == "gate" and isinstance(entry.get("stage"), str):
             latest[entry["stage"]] = entry
     problems = []
@@ -1989,6 +2631,10 @@ def check_all_gates_passed(project: Project, run_id: str, own_stage: dict) -> li
         _data, record_problems = read_stage_record(root, run_id, stage)
         if record_problems:
             problems.append(f"stage '{stage['id']}': {record_problems[0]}")
+            continue
+        untraced = provenance_problems(root, run_id, stage, run, ledger)
+        if untraced:
+            problems += [f"stage '{stage['id']}': {p}" for p in untraced]
             continue
         gate = stage.get("gate")
         if gate is None:
@@ -2003,24 +2649,39 @@ def check_all_gates_passed(project: Project, run_id: str, own_stage: dict) -> li
     return problems
 
 
-def evaluate_stage(project: Project, run_id: str, stage: dict) -> GateOutcome:
-    """The stage's record must exist and validate; then its gate, if it has one, must pass."""
+MEASURED_GATES = ("verify_green", *MEASURED_TESTS_GATES)
+
+
+def evaluate_stage(
+    project: Project, run_id: str, stage: dict, measure: bool = False, run: Run | None = None, run_problem: str | None = None
+) -> GateOutcome:
+    """The stage's record must exist and validate, and the ledger must trace it; then its gate, if it has one, must pass.
+    With `measure`, a gate that measures (verify_green, tests_fail_on_stub, reproduces_on_head) first runs the repository's
+    commands and enters the run in the ledger; without it, such a gate reads the latest run the ledger holds."""
     root = project.root
     path = run_dir(root, run_id) / f"{stage['id']}.json"
     gate = stage.get("gate")
     data, problems = read_stage_record(root, run_id, stage)
+    if run is None and run_problem is None:
+        try:
+            run = load_run(project, run_id)
+        except PlumblineError as exc:
+            run_problem = str(exc)
     if gate == "all_gates_passed":
         problems = check_all_gates_passed(project, run_id, stage)
-    elif data is not None and gate is not None:
-
-        def load_spec():
-            for name, _optional in _read_names(stage):
-                source = next((s for s in project.pipeline["stage"] if s["id"] == name), None)
-                if source is not None and source["record"] == "spec":
-                    return read_stage_record(root, run_id, source)
-            return None, [f"stage '{stage['id']}' reads no spec, so {gate} has nothing to compare against"]
-
-        problems = GATE_CHECKS[gate](data, load_spec)
+    elif data is not None:
+        ledger = read_ledger(root, run_id)
+        untraced = provenance_problems(root, run_id, stage, run, ledger)
+        if untraced:
+            problems = untraced
+        elif gate is not None:
+            if measure and gate in MEASURED_GATES:
+                if run is None and gate == "verify_green":
+                    raise PlumblineError(f"{run_problem}: the change cannot be measured")
+                _entry, problems = measure_stage(project, run, run_id, stage)
+                ledger = read_ledger(root, run_id)  # with the run that was just entered
+            if not problems:
+                problems = GATE_CHECKS[gate](data, GateContext(project, run_id, stage, run, ledger, measure))
     return GateOutcome(stage["id"], gate, not problems, problems, rel_path(root, path), file_sha256(path), data)
 
 
@@ -2067,15 +2728,64 @@ def _majority(count: int) -> int:
     return count // 2 + 1
 
 
-def merge_review(project: Project, run_id: str, stage_id: str, round_no: int | None = None) -> tuple[dict | None, list[str], list[str]]:
-    """The review_record of a review stage's round, built from the per-agent
-    records, as (record, problems, warnings). The record is None when there are problems.
+def normalise_quote(text: str) -> str:
+    """Whitespace collapsed to single spaces: a quote is compared with the code by its words, not by its line breaks."""
+    return " ".join(text.split())
 
-    A finding survives when at least `survive_if_unrefuted_by` of the stage's
-    `defenders` did not refute it (the majority when the stage sets none). A
-    defender refutes a finding by a verdict of `refuted` with a quote; a defender
-    that is silent on a finding, concedes it, or refutes without a quote did not
-    refute it. A stage without defenders lets every finding survive."""
+
+class Evidence:
+    """Checks a quote against the change: it counts when, whitespace-normalised, it occurs in the change's diff (from the
+    merge base to the files as they are) or in the current content of the file the finding names."""
+
+    def __init__(self, root: Path, diff_lines: list[str]) -> None:
+        self.root = root
+        self.diff = normalise_quote("\n".join(diff_lines))
+        self._files: dict[str, str] = {}
+
+    def file_text(self, name: str) -> str:
+        if name not in self._files:
+            text = ""
+            relative = os.path.normpath(name)
+            path = self.root / relative
+            try:
+                inside = not os.path.isabs(name) and path.resolve().is_relative_to(self.root.resolve())
+                if inside and path.is_file() and path.stat().st_size <= 8 << 20:
+                    text = normalise_quote(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+            self._files[name] = text
+        return self._files[name]
+
+    def holds(self, quote: str, name: str, at_least: int = 1) -> bool:
+        wanted = normalise_quote(quote)
+        return len(wanted) >= at_least and (wanted in self.diff or wanted in self.file_text(name))
+
+
+def route_of(pipeline: dict, finding: dict) -> str:
+    """Who a surviving finding goes to: the test-writer for the tests lens and for a finding about a test file (the
+    builder works without the tests), the builder for the rest."""
+    return "test-writer" if finding["lens"] == TESTS_LENS or file_type(pipeline, os.path.normpath(finding["file"]).replace(os.sep, "/")) == TESTS_TYPE else "builder"
+
+
+@dataclass
+class MergeResult:
+    record: dict | None
+    problems: list[str]
+    warnings: list[str]
+    parts: list[dict] = field(default_factory=list)  # [{path, sha256}] of the agents' records the review record was built from
+    unverified: list[str] = field(default_factory=list)  # the findings whose evidence is in neither the diff nor the file, as `id (file:line)`
+
+
+def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | None = None) -> MergeResult:
+    """The review_record of a review stage's round, built from the per-agent records: the record (None when there are problems)
+    with its problems and warnings, and what the ledger needs to trace it.
+
+    Each part must be what its agent left (the ledger holds the part's hash from the agent's stop) and carry the hash of the
+    change as the files are now. A finding survives when at least `survive_if_unrefuted_by` of the stage's `defenders` did
+    not refute it (the majority when the stage sets none). A defender refutes a finding by a verdict of `refuted` with a
+    quote that occurs in the change's diff or in the finding's file; a defender that is silent on a finding, concedes it,
+    or refutes without such a quote did not refute it. A finding whose own evidence is in neither place stays, and is
+    marked evidence_unverified. A stage without defenders lets every finding survive."""
     root = project.root
     stage = next((s for s in project.pipeline["stage"] if s["id"] == stage_id), None)
     if stage is None:
@@ -2095,6 +2805,10 @@ def merge_review(project: Project, run_id: str, stage_id: str, round_no: int | N
         round_no = rounds[-1]
     if round_no < 1:
         raise PlumblineError("the round must be 1 or more")
+    if stage.get("max_rounds") and round_no > stage["max_rounds"]:
+        raise PlumblineError(
+            f"round {round_no} is past the {stage['max_rounds']} rounds stage '{stage_id}' has: stop, and bring the findings and the failing criteria to the builder"
+        )
     round_dir = unit / f"round-{round_no}"
     if not round_dir.is_dir():
         raise PlumblineError(f"there is no {rel_path(root, round_dir)}/")
@@ -2117,6 +2831,28 @@ def merge_review(project: Project, run_id: str, stage_id: str, round_no: int | N
             problems.append(f"{where}: not a valid {guess}: {errors[0]}" + (f" (and {len(errors) - 1} more)" if len(errors) > 1 else ""))
             continue
         {"findings_record": findings_records, "defense_record": defense_records, "gaps_record": gaps_records}[kind].append((where, data))
+
+    defenders = stage.get("defenders", 0)
+    used = [
+        *((where, data, "prosecutor") for where, data in findings_records),
+        *((where, data, "defender") for where, data in (defense_records if defenders else [])),
+        *((where, data, "detective") for where, data in gaps_records),
+    ]
+
+    # each part is what its agent left, and was made against the change as it is now
+    ledger = read_ledger(root, run_id)
+    tree = worktree_tree(root)
+    current = change_hash(root, run.merge_base, tree)
+    parts = []
+    for where, data, role in used:
+        sha = file_sha256(root / where)
+        parts.append({"path": where, "sha256": sha})
+        problems += _agent_entry_problems(latest_entry(ledger, "agent", record=where), role, sha, where)
+        if data["diff_sha256"] != current:
+            problems.append(
+                f"{where}: it covers the change {data['diff_sha256'][:12]}, but the files now hash to {current[:12]}; "
+                "the change was edited after this agent read it, so run the agent again"
+            )
 
     by_lens: dict[str, str] = {}
     for where, data in findings_records:
@@ -2147,7 +2883,6 @@ def merge_review(project: Project, run_id: str, stage_id: str, round_no: int | N
                     owner[finding["id"]] = where
                     findings.append(finding)
 
-    defenders = stage.get("defenders", 0)
     threshold = stage.get("survive_if_unrefuted_by", _majority(defenders)) if defenders else 0
     names = sorted({data["defender"] for _, data in defense_records}) if defenders else []
     seen_pairs: set[tuple[str, str]] = set()
@@ -2171,35 +2906,56 @@ def merge_review(project: Project, run_id: str, stage_id: str, round_no: int | N
     if defenders and findings and len(names) < defenders:
         warnings.append(f"only {len(names)} of {defenders} defenders reported; a missing defender did not refute anything")
     if problems:
-        return None, problems, warnings
+        return MergeResult(None, problems, warnings)
 
+    evidence = Evidence(root, change_diff_lines(root, run.merge_base, tree))
+    file_of = {finding["id"]: finding["file"] for finding in findings}
     position = {finding["id"]: index for index, finding in enumerate(findings)}
     refuted_by: dict[str, set[str]] = {}
     for defense in defenses:
         if defense["verdict"] != "refuted":
             continue
-        if not defense["quote"].strip():
-            warnings.append(f"defender '{defense['defender']}' refuted '{defense['finding_id']}' without quoting code, which does not count")
-            continue
-        refuted_by.setdefault(defense["finding_id"], set()).add(defense["defender"])
+        who, fid, quote = defense["defender"], defense["finding_id"], defense["quote"]
+        if not quote.strip():
+            warnings.append(f"defender '{who}' refuted '{fid}' without quoting code, which does not count")
+        elif len(normalise_quote(quote)) < MIN_QUOTE:
+            warnings.append(f"defender '{who}' refuted '{fid}' with a quote of fewer than {MIN_QUOTE} characters, which does not count")
+        elif not evidence.holds(quote, file_of[fid], MIN_QUOTE):
+            warnings.append(f"defender '{who}' refuted '{fid}' with a quote that is in neither the change nor {file_of[fid]}, which does not count")
+        else:
+            refuted_by.setdefault(fid, set()).add(who)
     survivors = [f["id"] for f in findings if defenders - len(refuted_by.get(f["id"], ())) >= threshold]
     severity = {f["id"]: f["severity"] for f in findings}
+    unverified = [f for f in findings if not evidence.holds(f["evidence"], f["file"])]
+    unverified_ids = {f["id"] for f in unverified}
+    marked = [{**f, "evidence_unverified": f["id"] in unverified_ids} for f in findings]
+    by_id = {f["id"]: f for f in findings}
+    routes: dict[str, list[str]] = {"builder": [], "test-writer": []}
+    for fid in survivors:
+        routes[route_of(project.pipeline, by_id[fid])].append(fid)
     defenses.sort(key=lambda d: (position[d["finding_id"]], d["defender"]))
     record = {
         "target": stage["target"],
         "round": round_no,
         "lenses": expected,
-        "findings": findings,
+        "findings": marked,
         "defenses": defenses,
         "survivors": survivors,
         "gaps": gaps_records[0][1]["gaps"] if gaps_records else [],
         "blockers_surviving": sum(1 for fid in survivors if severity[fid] == "BLOCKING"),
-        "diff_sha256": change_hash(root, run.merge_base),
+        "routes": routes,
+        "diff_sha256": current,
     }
     errors = check_record("review_record", record)
     if errors:
         raise PlumblineError("internal error: the merged review_record does not validate: " + "; ".join(errors[:3]))
-    return record, [], warnings
+    return MergeResult(record, [], warnings, parts, [f"{f['id']} ({f['file']}:{f['line']})" for f in unverified])
+
+
+def merge_review(project: Project, run_id: str, stage_id: str, round_no: int | None = None) -> tuple[dict | None, list[str], list[str]]:
+    """merge_round's record, problems and warnings."""
+    result = merge_round(project, run_id, stage_id, round_no)
+    return result.record, result.problems, result.warnings
 
 
 # ------------------------------------------------------------------ tokens
@@ -2296,11 +3052,11 @@ def dirty_paths(root: Path) -> list[str]:
     return [p for p in paths if not p.startswith(IGNORE_ENTRY)]
 
 
-def coverage(root: Path, head: str, project: Project | None = None) -> tuple[str | None, str]:
+def coverage(root: Path, head: str, project: Project) -> tuple[str | None, str]:
     """How HEAD is covered: ("pass" or "override", detail), or (None, why not).
     The record must validate and name this very commit; a pass record must say pass.
-    With a `project`, a pass record is not trusted on its own: its run is evaluated
-    again (see verify_pass), which is what the push gate and `status` do."""
+    A pass record is not trusted on its own: its run is evaluated again (see
+    verify_pass), which is what the push gate and `status` do."""
     if not re.fullmatch(r"[0-9a-f]{40,64}", head):
         return None, "HEAD is not a commit id"
     pass_file = root / PASS_DIR / f"{head}.json"
@@ -2314,7 +3070,7 @@ def coverage(root: Path, head: str, project: Project | None = None) -> tuple[str
         elif data["verdict"] != "pass":
             reason = f"{rel_path(root, pass_file)} says {data['verdict']}, not pass"
         else:
-            doubts = verify_pass(project, head, data) if project is not None else []
+            doubts = verify_pass(project, head, data)
             if not doubts:
                 return "pass", f"run {data['run_id']}"
             reason = f"{rel_path(root, pass_file)} does not hold up: " + "; ".join(doubts[:3]) + (f"; and {len(doubts) - 3} more" if len(doubts) > 3 else "")
@@ -2360,13 +3116,55 @@ def stale_change_problems(project: Project, run: Run) -> list[str]:
     return problems
 
 
+def measure_row(project: Project, run: Run) -> tuple[dict | None, list[str]]:
+    """Measure the change again, from the run's merge base to the files as they are: (its change_class record, problems).
+    The record is None when nothing has changed, or when the change could not be measured (the problems say so). The
+    row a run was declared with is an estimate; this is what the change measures as."""
+    try:
+        return classify(project.root, project.pipeline, run.merge_base, run.intent), []
+    except NothingToClassify:
+        return None, []
+    except PlumblineError as exc:
+        return None, [f"the change could not be measured again: {exc}"]
+
+
+def missing_stages(project: Project, run: Run, measured: dict | None) -> list[str]:
+    """The stages the measured row selects (the intent applied) that the run does not have."""
+    if measured is None:
+        return []
+    have = {s["id"] for s in run.stages}
+    return [sid for sid in effective_row(project.pipeline, measured["row"], run.intent).stages if sid not in have]
+
+
+def row_problems(project: Project, run: Run, measured: dict | None) -> list[str]:
+    """What the measured row asks for that the run does not have. The row selects stages once the intent is applied: a change
+    that measures larger than it was declared selects stages the run lacks, and a change of a size that ends before reduce
+    (nothing is built at size L) cannot be passed at all."""
+    if measured is None:
+        return []
+    by_id = {s["id"]: s for s in project.pipeline["stage"]}
+    label = measured["row"]
+    stages = effective_row(project.pipeline, label, run.intent).stages
+    problems = []
+    if not any(by_id[sid]["record"] == "pass_record" for sid in stages):
+        problems.append(f"this row ends before reduce: split the change (it measures as {label}, {measured['lines']} changed lines, and nothing is built at that size)")
+    missing = missing_stages(project, run, measured)
+    if missing:
+        problems.append(
+            f"the change measures as {label}, which selects {', '.join(missing)}; run '{run.run_id}' (row {run.row}) has no such stage"
+            f"{'' if len(missing) == 1 else 's'}: start a new run for this row (`plan --intent {run.intent} --row {label}`)"
+        )
+    return problems
+
+
 def make_pass_record(project: Project, run_id: str) -> tuple[dict | None, list[str], Path]:
     """The pass_record for HEAD, as (record, problems, the run's copy of it). It
-    needs a clean working tree (apart from .plumbline/) and every gate of the
-    run's row to pass, each gate being evaluated afresh and entered in the ledger.
-    Once they pass, the verify record and the review of the diff must also cover
-    the change HEAD holds (see stale_change_problems). What the run's intent
-    supplies is evaluated like any stage, with rounds 0."""
+    needs a clean working tree (apart from .plumbline/), a row that reaches reduce,
+    and every gate of the run's row to pass, each gate being evaluated afresh and
+    entered in the ledger. The change is measured again: its row must not select
+    a stage the run lacks. Once the gates pass, the verify record and the review of
+    the diff must also cover the change HEAD holds (see stale_change_problems).
+    What the run's intent supplies is evaluated like any stage, with rounds 0."""
     root = project.root
     head = head_sha(root)
     run = load_run(project, run_id)
@@ -2377,6 +3175,10 @@ def make_pass_record(project: Project, run_id: str) -> tuple[dict | None, list[s
         problems.append(f"the working tree is not clean apart from {IGNORE_ENTRY}: {listed} (commit the change, then run pass)")
 
     reduce_stage = next((s for s in run.stages if s["record"] == "pass_record"), None)
+    if reduce_stage is None:
+        problems.append(f"this row ends before reduce: split the change (row {run.row} has no reduce stage, so there is nothing to pass at this size)")
+    measured, measure_problems = measure_row(project, run)
+    problems += measure_problems + row_problems(project, run, measured)
     ledger = read_ledger(root, run_id)
     order = {s["id"]: position for position, s in enumerate(project.pipeline["stage"])}
     entries: list[dict] = []
@@ -2384,7 +3186,7 @@ def make_pass_record(project: Project, run_id: str) -> tuple[dict | None, list[s
     for stage in [*run.supplied, *run.stages]:
         if stage is reduce_stage:
             continue
-        outcome = evaluate_stage(project, run_id, stage)
+        outcome = evaluate_stage(project, run_id, stage, run=run)
         if outcome.gate is not None:
             append_ledger(root, run_id, ledger_gate_entry(outcome))
         if not outcome.passed:
@@ -2404,6 +3206,7 @@ def make_pass_record(project: Project, run_id: str) -> tuple[dict | None, list[s
         entries.append({"id": reduce_id, "record": rel_path(root, reduce_path), "gate": reduce_stage.get("gate"), "passed": True, "rounds": 1})
     entries.sort(key=lambda entry: order.get(entry["id"], len(order)))
     tokens, notes = tokens_for_run(root, run_id)
+    notes.insert(0, f"declared row {run.row}, measured row {measured['row'] if measured is not None else 'none (nothing has changed)'}")
     if run.note:
         notes.insert(0, run.note)
     if run.supplied:
@@ -2488,7 +3291,7 @@ def make_override(project: Project, reason: str, run_id: str | None) -> dict:
     if run_id is not None:
         existing_run_dir(root, run_id)  # a run that was named must exist
     else:
-        run_id = latest_run_id(root)
+        run_id = active_run_id(root)
     skipped = None
     if run_id is not None:
         try:
@@ -2589,7 +3392,7 @@ def supplied_records(effective: EffectiveRow, spec_file: str | None) -> tuple[st
         raise PlumblineError(f"{source}: {problem}")
     problems = [f"{source}: {error}" for error in check_record("spec", data)]
     if not problems:
-        problems = [f"{source}: {problem}" for problem in _gate_spec_complete(data, None)]
+        problems = [f"{source}: {problem}" for problem in [*_gate_spec_complete(data, None), *single_ac_problems(effective.intent, data)]]
     return source, (None if problems else data), problems
 
 
@@ -2603,20 +3406,29 @@ def start_run(project: Project, run_id: str, record: dict, effective: EffectiveR
     if intake_path.exists():
         return [f"run '{run_id}' has begun ({rel_path(root, intake_path)} exists); a run is never restarted, so pick another --run-id"]
     by_id = {s["id"]: s for s in project.pipeline["stage"]}
-    for sid in effective.supplied:
-        path = run_dir(root, run_id) / f"{sid}.json"
+    run = Run(  # the run as it will be, judged before its intake record exists
+        root, run_id, record["row"], [effective_stage(by_id[sid], effective) for sid in effective.stages], effective.lenses, effective.note,
+        record["intent"], [effective_stage(by_id[sid], effective) for sid in effective.supplied], record["base"], record["merge_base"],
+    )
+    for stage in run.supplied:
+        path = run_dir(root, run_id) / f"{stage['id']}.json"
         write_json_atomic(path, supplied)
-        append_ledger(root, run_id, {"kind": "supplied", "stage": sid, "record": rel_path(root, path), "source": source, "record_sha256": file_sha256(path)})
-        outcome = evaluate_stage(project, run_id, effective_stage(by_id[sid], effective))
+        append_ledger(root, run_id, {"kind": "supplied", "stage": stage["id"], "record": rel_path(root, path), "source": source, "record_sha256": file_sha256(path)})
+        outcome = evaluate_stage(project, run_id, stage, run=run)
         if outcome.gate is not None:
             append_ledger(root, run_id, ledger_gate_entry(outcome))
+    text = json_text(record)  # the ledger holds the intake record's hash, entered before the file exists: a start that stops between the two can be redone
+    append_ledger(
+        root, run_id,
+        {"kind": "intake", "stage": intake_stage["id"], "record": rel_path(root, intake_path), "record_sha256": text_sha256(text), "intent": record["intent"], "row": record["row"], "merge_base": record["merge_base"]},
+    )
     write_json_atomic(intake_path, record)
     return []
 
 
 def cmd_plan(args) -> int:
-    project = _ready_project(args.project)
-    starting = args.intent is not None  # `--intent` starts the run: it writes its intake record
+    starting = args.intent is not None  # `--intent` starts the run: it writes its intake record, so it needs a repository that has adopted plumbline
+    project = _adopted_project(args.project) if starting else _ready_project(args.project)
     if args.spec and not starting:
         raise PlumblineError("--spec goes with --intent (the intent that supplies the spec)")
     intent = args.intent or DEFAULT_INTENT
@@ -2636,6 +3448,7 @@ def cmd_plan(args) -> int:
             for reason in refused:
                 print(f"plumbline: {reason}. Nothing was changed.", file=sys.stderr)
             return 1
+        write_active(project.root, run_id)  # the hooks read this file to know which run is in progress
         for entry in plan["supplied"]:
             entry["source"] = source
     sys.stdout.write(json.dumps(plan, indent=2) + "\n")
@@ -2699,49 +3512,97 @@ def cmd_init(args) -> int:
     return 0
 
 
+def _one_line(text) -> str:
+    return " ".join(str(text).split())
+
+
+def route_lines(record: dict) -> list[str]:
+    """The surviving findings of a merged review, kept apart by who they go to: the text of each (no quote of code, no path
+    of a review file), so that the builder can be briefed with the first list alone and never sees the second."""
+    by_id = {f["id"]: f for f in record["findings"]}
+    lines = []
+    for who, note in (
+        ("builder", "give the builder this text and nothing else"),
+        ("test-writer", "the tests lens, and findings about test files: the builder never sees these"),
+    ):
+        ids = record["routes"][who]
+        if not ids:
+            continue
+        lines.append(f"surviving findings for the {who} ({note}):")
+        for fid in ids:
+            f = by_id[fid]
+            lines.append(
+                f"  - {fid} [{f['severity']}] {f['file']}:{f['line']}: {_one_line(f['claim'])} "
+                f"Failure: {_one_line(f['failure_scenario'])} Rule: {_one_line(f['rule'])}"
+            )
+    return lines
+
+
 def cmd_merge_review(args) -> int:
     project = _ready_project(args.project)
-    record, problems, warnings = merge_review(project, args.run_id, args.stage, args.round)
-    for warning in warnings:
+    result = merge_round(project, args.run_id, args.stage, args.round)
+    for warning in result.warnings:
         print(f"warning: {warning}", file=sys.stderr)
+    record = result.record
     if record is None:
-        for problem in problems:
+        for problem in result.problems:
             print(f"error: {problem}")
-        print(f"merge-review: stage '{args.stage}' cannot be merged ({_plural(len(problems), 'problem')})")
+        print(f"merge-review: stage '{args.stage}' cannot be merged ({_plural(len(result.problems), 'problem')})")
         return 1
     path = run_dir(project.root, args.run_id) / f"{args.stage}.json"
     write_json_atomic(path, record)
+    append_ledger(
+        project.root, args.run_id,
+        {"kind": "merge", "stage": args.stage, "round": record["round"], "record": rel_path(project.root, path), "record_sha256": file_sha256(path), "parts": result.parts},
+    )
     print(
         f"wrote {rel_path(project.root, path)}: round {record['round']}, {_plural(len(record['findings']), 'finding')}, "
         f"{len(record['survivors'])} surviving ({record['blockers_surviving']} blocking), {_plural(len(record['gaps']), 'gap')}"
     )
+    for line in route_lines(record):
+        print(line)
+    if result.unverified:
+        print(f"evidence found in neither the change nor its file (the findings stay, marked evidence_unverified): {', '.join(result.unverified)}")
     return 0
 
 
 def cmd_gate(args) -> int:
+    """Evaluate a stage's gate: exit 0 when it passes, 1 when it fails, 3 when it fails (or would pass) past the stage's
+    max_rounds, because the stage has used its rounds. The gates of a verify stage and of a tests stage run the repository's
+    commands themselves and enter what happened in the ledger."""
     project = _ready_project(args.project)
     existing_run_dir(project.root, args.run_id)
     stage = next((s for s in project.pipeline["stage"] if s["id"] == args.stage), None)
     if stage is None:
         raise PlumblineError(f"the pipeline has no stage '{args.stage}'")
+    run, run_problem = None, "the run has no usable intake record"
     try:
         run = load_run(project, args.run_id)
-    except PlumblineError:
-        run = None  # a run without a usable intake record has no intent, so the stage's own gate applies
+    except PlumblineError as exc:
+        run_problem = str(exc)  # a run without a usable intake record has no intent, so the stage's own gate applies
     if run is not None:
         stage = next((s for s in [*run.supplied, *run.stages] if s["id"] == stage["id"]), stage)  # the intent may have replaced its gate
     if stage.get("gate") is None:
         print(f"stage '{args.stage}' has no gate; nothing to evaluate")
         return 0
-    outcome = evaluate_stage(project, args.run_id, stage)
+    outcome = evaluate_stage(project, args.run_id, stage, measure=True, run=run, run_problem=run_problem)
+    round_no, limit = stage_round(stage, outcome.data, read_ledger(project.root, args.run_id))
+    exhausted = False
+    if limit is not None and outcome.gate != "all_gates_passed":
+        if round_no > limit:
+            outcome.problems.append(f"round {round_no} is past the {limit} rounds stage '{stage['id']}' has")
+        exhausted = round_no > limit or (round_no == limit and bool(outcome.problems))
+        outcome.passed = not outcome.problems
     append_ledger(project.root, args.run_id, ledger_gate_entry(outcome))
-    if outcome.passed:
-        print(f"gate {outcome.gate} for stage '{stage['id']}': pass")
-        return 0
-    print(f"gate {outcome.gate} for stage '{stage['id']}': FAIL")
+    verdict = "pass" if outcome.passed else "FAIL"
+    print(f"gate {outcome.gate} for stage '{stage['id']}': {verdict}")
     for problem in outcome.problems:
         print(f"  - {problem}")
-    return 1
+    if limit is not None and outcome.gate != "all_gates_passed":
+        print(f"  round {round_no} of {limit}")
+    if exhausted and not outcome.passed:
+        print(f"  stage '{stage['id']}' has used its rounds: stop, and bring these problems and the surviving findings to the builder")
+    return 0 if outcome.passed else (3 if exhausted else 1)
 
 
 def cmd_tokens(args) -> int:
@@ -2799,20 +3660,45 @@ def cmd_override(args) -> int:
     return 0
 
 
+class _OnIndexCopy:
+    """This module, with its git commands working on a copy of the index: `git diff` refreshes and rewrites the index it reads,
+    so the commit checks (which live in the hook and take the module as an argument) run on a copy."""
+
+    def __init__(self, index: Path) -> None:
+        self._index = index
+
+    def _git(self, root: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+        return _git(root, *args, timeout=timeout, index=self._index)
+
+    def __getattr__(self, name: str):
+        return getattr(sys.modules[__name__], name)
+
+
 def cmd_check_diff(args) -> int:
     root = resolve_root(args.project, require_git=True)
+    project = run = None
     if args.run_id:
-        merge_base = load_run(_ready_project(args.project), args.run_id).merge_base  # the change is measured from where the run began
+        project = _ready_project(args.project)
+        run = load_run(project, args.run_id)
+        merge_base = run.merge_base  # the change is measured from where the run began
     else:
         _base, merge_base, _notes = resolve_base(root, args.base)
     digest = change_hash(root, merge_base)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import pre_tool_use  # the commit checks live with the hook that applies them at commit time
 
-    problems = pre_tool_use.commit_problems(sys.modules[__name__], root, "all", base=merge_base)
+    with index_copy(root) as index:
+        problems = pre_tool_use.commit_problems(_OnIndexCopy(index), root, "all", base=merge_base)
     kinds = {"symlinks": "adds a symlink", "abs_paths": "adds an absolute home path", "secrets": "adds a key-shaped secret"}
     checks = {name: not any(problem.startswith(prefix) for problem in problems) for name, prefix in kinds.items()}
-    print(json.dumps({"merge_base": merge_base, "diff_sha256": digest, "checks": checks, "problems": problems}, indent=2))
+    report = {"merge_base": merge_base, "diff_sha256": digest, "checks": checks, "problems": problems}
+    if run is not None:  # the change is measured again: its row against the row the run was declared with, and the tests of a refactor
+        measured, measure_problems = measure_row(project, run)
+        report["row"] = {"declared": run.row, "measured": measured["row"] if measured else None, "missing_stages": missing_stages(project, run, measured)}
+        if not any(s["record"] == "pass_record" for s in run.stages):
+            problems.append(f"this row ends before reduce: split the change (row {run.row} has no reduce stage)")
+        problems += measure_problems + row_problems(project, run, measured) + tests_touched_problems(project, run, measured)
+    print(json.dumps(report, indent=2))
     return 1 if problems else 0
 
 
@@ -2848,7 +3734,7 @@ def cmd_status(args) -> int:
             print(f"HEAD {head[:7]}: covered by an override ({detail})")
         else:
             print(f"HEAD {head[:7]}: NOT covered ({detail})")
-    run_id = check_run_id(args.run_id) if args.run_id else latest_run_id(root)
+    run_id = check_run_id(args.run_id) if args.run_id else active_run_id(root)
     if run_id is None:
         print("latest run: none")
         return 0
@@ -2871,15 +3757,15 @@ def cmd_status(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="plumbline", description="The plumbline pipeline CLI.")
+    parser = argparse.ArgumentParser(prog="plumbline", description="The plumbline pipeline CLI.", allow_abbrev=False)
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
-    p = sub.add_parser("validate-pipeline", help="validate the default pipeline, or FILE, merged with the repo's plumbline.toml")
+    p = sub.add_parser("validate-pipeline", allow_abbrev=False, help="validate the default pipeline, or FILE, merged with the repo's plumbline.toml")
     p.add_argument("file", nargs="?", help="a pipeline file (default: the plugin's pipeline/default.toml)")
     p.add_argument("--project", metavar="PATH", help="a repository whose plumbline.toml is merged in")
     p.set_defaults(run=cmd_validate_pipeline)
 
-    p = sub.add_parser("classify", help="write the change_class record for the current change")
+    p = sub.add_parser("classify", allow_abbrev=False, help="write the change_class record for the current change")
     p.add_argument("--project", metavar="PATH")
     p.add_argument("--base", metavar="REF", help="default: the remote's default branch, else origin/main, else main")
     p.add_argument("--intent", metavar="ID", default=DEFAULT_INTENT, help="why the change is made; the record carries it (default: feature)")
@@ -2887,7 +3773,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", metavar="FILE", help="write the record here instead of to stdout")
     p.set_defaults(run=cmd_classify)
 
-    p = sub.add_parser("plan", help="print the stages to run for the current change, as JSON; with --intent, start the run")
+    p = sub.add_parser("plan", allow_abbrev=False, help="print the stages to run for the current change, as JSON; with --intent, start the run (in an adopted repository) and name it in .plumbline/runs/ACTIVE")
     p.add_argument("--project", metavar="PATH")
     p.add_argument("--base", metavar="REF")
     p.add_argument("--run-id", metavar="ID", help="default: <short HEAD sha>-<UTC timestamp>")
@@ -2896,56 +3782,56 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--row", metavar="ROW", help="declare the row (for example code.M) instead of measuring it: needed when nothing has changed yet")
     p.set_defaults(run=cmd_plan)
 
-    p = sub.add_parser("check-record", help="validate a record file against its schema")
+    p = sub.add_parser("check-record", allow_abbrev=False, help="validate a record file against its schema")
     p.add_argument("type", help="a record type: one of the files in schemas/")
     p.add_argument("file")
     p.set_defaults(run=cmd_check_record)
 
-    p = sub.add_parser("render", help="print a record as markdown")
+    p = sub.add_parser("render", allow_abbrev=False, help="print a record as markdown")
     p.add_argument("file")
     p.add_argument("--type", help="the record type (default: inferred from the record's keys)")
     p.set_defaults(run=cmd_render)
 
-    p = sub.add_parser("init", help="adopt plumbline in a repository: write plumbline.toml, ignore .plumbline/")
+    p = sub.add_parser("init", allow_abbrev=False, help="adopt plumbline in a repository: write plumbline.toml, ignore .plumbline/")
     p.add_argument("--project", metavar="PATH")
     p.add_argument("--graft", action="store_true", help="record graft as enabled")
     p.set_defaults(run=cmd_init)
 
-    p = sub.add_parser("merge-review", help="build a review stage's record from its per-agent records, applying the survival rule")
+    p = sub.add_parser("merge-review", allow_abbrev=False, help="build a review stage's record from its per-agent records, applying the survival rule and checking quotes against the change")
     p.add_argument("run_id", metavar="RUN")
     p.add_argument("stage")
     p.add_argument("--round", type=int, metavar="N", help="default: the latest round directory")
     p.add_argument("--project", metavar="PATH")
     p.set_defaults(run=cmd_merge_review)
 
-    p = sub.add_parser("gate", help="evaluate a stage's gate mechanically: exit 0 if it passes, 1 if not")
+    p = sub.add_parser("gate", allow_abbrev=False, help="evaluate a stage's gate: exit 0 if it passes, 1 if not, 3 when the stage has used its rounds (a verify or tests stage runs the repository's [commands] itself)")
     p.add_argument("run_id", metavar="RUN")
     p.add_argument("stage")
     p.add_argument("--project", metavar="PATH")
     p.set_defaults(run=cmd_gate)
 
-    p = sub.add_parser("tokens", help="print the token usage of a run's agents, per model, as JSON")
+    p = sub.add_parser("tokens", allow_abbrev=False, help="print the token usage of a run's agents, per model, as JSON")
     p.add_argument("run_id", metavar="RUN")
     p.add_argument("--project", metavar="PATH")
     p.set_defaults(run=cmd_tokens)
 
-    p = sub.add_parser("pass", help="write the pass record for HEAD, if the tree is clean and every gate of the run passed")
+    p = sub.add_parser("pass", allow_abbrev=False, help="write the pass record for HEAD, if the tree is clean, the change measures as no larger a row than the run has, and every gate of the run passed")
     p.add_argument("run_id", metavar="RUN")
     p.add_argument("--project", metavar="PATH")
     p.set_defaults(run=cmd_pass)
 
-    p = sub.add_parser("override", help="record an override for HEAD, so that it can be pushed without a pass (only when the builder asks)")
+    p = sub.add_parser("override", allow_abbrev=False, help="record an override for HEAD, so that it can be pushed without a pass (only when the builder asks)")
     p.add_argument("--reason", required=True, metavar="TEXT", help="why the pipeline is bypassed: at least 20 characters (`-` reads it from stdin)")
     p.add_argument("--run", dest="run_id", metavar="RUN", help="the run whose unfinished stages are listed (default: the latest)")
     p.add_argument("--project", metavar="PATH")
     p.set_defaults(run=cmd_override)
 
-    p = sub.add_parser("status", help="show the latest run, its stages and gates, and whether HEAD is covered")
+    p = sub.add_parser("status", allow_abbrev=False, help="show the latest run, its stages and gates, and whether HEAD is covered")
     p.add_argument("--run", dest="run_id", metavar="RUN", help="default: the latest run")
     p.add_argument("--project", metavar="PATH")
     p.set_defaults(run=cmd_status)
 
-    p = sub.add_parser("check-diff", help="run the commit checks on the whole change and print its hash, as JSON: exit 1 when a check fails")
+    p = sub.add_parser("check-diff", allow_abbrev=False, help="run the commit checks on the whole change and print its hash, as JSON (with --run, the row it measures as too): exit 1 when a check fails")
     p.add_argument("--run", dest="run_id", metavar="RUN", help="measure the change from where this run began (default: from the merge base with the base)")
     p.add_argument("--base", metavar="REF", help="default: the remote's default branch, else origin/main, else main")
     p.add_argument("--project", metavar="PATH")

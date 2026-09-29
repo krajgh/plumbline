@@ -4,7 +4,7 @@ import re
 import pytest
 
 import plumbline as pl
-from helpers import REPO
+from helpers import PROHIBITION, REPO, prose_lines
 from test_manifests import frontmatter
 
 AGENTS = REPO / "agents"
@@ -171,15 +171,53 @@ def test_the_planner_writes_at_size_l_a_split_proposal():
     assert "split_proposal" in agent("planner")[1]
 
 
+@pytest.mark.parametrize("name", ["prosecutor", "defender", "detective"])
+def test_a_review_agent_copies_the_hash_of_the_change_from_its_brief_into_its_record(name):  # C-09
+    body = agent(name)[1]
+    assert "diff_sha256" in pl.load_schema(pl.AGENT_RECORDS[name])["required"]
+    assert "`diff_sha256`" in body and '"diff_sha256": "<the hash in your brief>"' in body
+    assert "`merge-review` refuses a record made against another change" in body
+
+
+def test_the_prosecutor_knows_its_evidence_is_checked_against_the_change_and_the_file():  # C-03
+    body = agent("prosecutor")[1]
+    assert "`merge-review` looks for the quote in the change's diff and in the file" in body
+
+
+def test_the_defender_knows_a_quote_counts_when_the_change_or_the_file_holds_it():  # C-03
+    body = agent("defender")[1]
+    assert "A quote counts when it occurs in the change's diff or in the current content of the file the finding names" in body
+
+
+def test_the_verifier_knows_the_gate_runs_the_same_commands_and_bounds_its_summaries():  # C-04, C-06
+    body = agent("verifier")[1]
+    assert "the main session runs `plumbline.py gate`, which runs the same commands itself" in body
+    assert "at most 80 characters, made of letters, digits, spaces and the marks `, . : ; ( ) % / _ + -`" in body
+    assert "`failing_acs` is empty and `tests.failed` is 0" in body
+    pattern = pl.load_schema("verify_record")["properties"]["commands"]["items"]["properties"]["summary"]["pattern"]
+    assert pattern == "^[A-Za-z0-9 ,.:;()%/_+-]{0,80}$"
+
+
+def test_the_builders_brief_carries_the_text_of_findings_and_no_path_of_a_review_record():  # C-06
+    fields, body = agent("builder")
+    assert "never" not in fields["description"].lower() and "leaving the tests to the test-writer" in fields["description"]
+    assert "the text of the review's surviving findings about the code" in body
+    assert "with the paths of those records" not in body
+
+
+def test_the_test_writer_names_tests_as_they_appear_in_their_file_because_the_gate_opens_it():  # C-05
+    body = agent("test-writer")[1]
+    assert "with `name` as the test appears in its file" in body and "the gate opens `file` and looks for it" in body
+    assert "the main session runs `plumbline.py gate`, which runs the repository's test command itself" in body
+    assert "as it appears in its file" in pl.load_schema("tests_record")["properties"]["tests"]["items"]["properties"]["name"]["description"]
+
+
 # Rules are stated as what to do: what a hook enforces is not repeated as a prohibition, and what only judgement can apply is
 # still phrased as an instruction. A prohibition word in a prompt is a sign that a rule is left to prose.
-PROHIBITION = re.compile(r"\b(never|don't|do not|must not|cannot|can't|won't|shouldn't|forbidden|prohibited|not allowed)\b", re.I)
-
-
 @pytest.mark.parametrize("name", NAMES)
 def test_the_prompts_state_rules_as_what_to_do(name):
-    body = agent(name)[1]
-    found = [m.group(0) for line in body.splitlines() if not line.startswith("```") for m in PROHIBITION.finditer(line)]
+    fields, body = agent(name)
+    found = [m.group(0) for line in [fields["description"], *prose_lines(body)] for m in PROHIBITION.finditer(line)]
     assert found == [], f"{name}: {found}"
 
 

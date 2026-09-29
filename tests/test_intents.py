@@ -5,10 +5,10 @@ import json
 import pytest
 
 import plumbline as pl
-from helpers import DEFAULT_TOML, default_pipeline, git, numbered, write
+from helpers import DEFAULT_TOML, commit_all, default_pipeline, git, numbered, write
 from rundata import (
-    RUN, adopt, build_note_record, change_of, put, put_part, read, review_record, run_path, spec_record, verify_record,
-    written_tests_record,
+    CONTROLLED, RUN, adopt, adopt_base, build_note_record, change_of, put, put_part, read, review_record, run_entry, run_path, set_exit_code,
+    spec_record, verify_record, write_test_file, written_tests_record,
 )
 
 INTENTS = ("feature", "spec-supplied", "fix", "refactor", "review-only")
@@ -126,8 +126,8 @@ def test_the_effective_row_applies_skip_supplies_gates_and_lenses():
     assert (fix.supplied, fix.gates, fix.lenses) == (["plan"], {"tests": "reproduces_on_head"}, None)
     refactor = pl.effective_row(pipeline, "code.M", "refactor")
     assert refactor.stages == ["intake", "build", "verify", "review", "reduce"]
-    assert refactor.lenses == ["correctness", "boundaries"]  # the intent's lenses replace the row's, or the stage's own
-    assert pl.effective_row(pipeline, "code.S", "refactor").lenses == ["correctness", "boundaries"]  # code.S has its own lenses
+    assert refactor.lenses == ["correctness", "boundaries"]  # code.M sets no lenses of its own: the intent's stand alone
+    assert pl.effective_row(pipeline, "code.S", "refactor").lenses == ["correctness", "tests", "boundaries"]  # code.S has its own: the intent's are added
     assert pl.effective_row(pipeline, "code.S", "feature").lenses == ["correctness", "tests"]
     assert pl.effective_row(pipeline, "code.M", "feature").stages == pipeline["matrix"]["code"]["M"]["stages"]
     with pytest.raises(pl.PlumblineError, match="unknown intent 'nope'; the intents are feature, spec-supplied, fix, refactor, review-only"):
@@ -136,11 +136,33 @@ def test_the_effective_row_applies_skip_supplies_gates_and_lenses():
         pl.effective_row(pipeline, "code", "feature")
 
 
+@pytest.mark.parametrize(
+    "row,lenses",
+    [
+        ("config", ["security", "boundaries", "correctness"]),  # a refactor of a workflow file keeps the security lens
+        ("docs", ["docs", "correctness", "boundaries"]),
+        ("tests", ["tests", "correctness", "boundaries"]),
+        ("code.S", ["correctness", "tests", "boundaries"]),
+        ("code.M", ["correctness", "boundaries"]),
+    ],
+)
+def test_an_intents_lenses_are_added_to_the_rows_not_put_in_their_place(row, lenses):  # C-13
+    assert pl.effective_row(default_pipeline(), row, "refactor").lenses == lenses
+
+
+def test_an_intent_without_lenses_leaves_the_rows_alone():
+    pipeline = default_pipeline()
+    assert pl.effective_row(pipeline, "config", "feature").lenses == ["security", "boundaries"]
+    assert pl.effective_row(pipeline, "code.M", "feature").lenses is None
+
+
 # --- plan --intent
 
 
 @pytest.fixture
 def code_m(repo):
+    """An adopted repository (a run starts only in one; the base branch has plumbline.toml) with a 100-line change: row code.M."""
+    adopt_base(repo)
     write(repo / "src" / "new_module.py", numbered(100))
     return repo
 
@@ -234,7 +256,7 @@ def test_review_only_skips_everything_that_builds_and_supplies_nothing(run_cli, 
     plan = started(run_cli, code_m, "--intent", "review-only")
     assert stage_ids(plan) == ["intake", "verify", "review", "reduce"]
     assert plan["supplied"] == []
-    assert sorted(p.name for p in run_path(code_m, RUN).iterdir()) == ["intake.json"]
+    assert sorted(p.name for p in run_path(code_m, RUN).iterdir()) == ["intake.json", "ledger.jsonl"]  # the ledger holds the intake record's hash
     verify = next(s for s in plan["stages"] if s["id"] == "verify")
     assert verify["on_fail"] == "main"  # its build stage is not in the run: it fails over to main
     assert [r["name"] for r in verify["reads"] if r["path"]] == []
@@ -280,6 +302,37 @@ def test_a_spec_that_is_not_json_is_refused_and_one_that_is_missing_could_not_be
     write(code_m / ".plumbline" / "list.json", "[]")
     result = start(run_cli, code_m, "--intent", "fix", "--spec", ".plumbline/list.json")
     assert result.returncode == 1 and "expected object, got array" in result.stdout
+
+
+def test_a_fix_takes_a_spec_of_exactly_one_acceptance_criterion(run_cli, code_m):  # C-15
+    result = start(run_cli, code_m, "--intent", "fix", "--spec", spec_file(code_m, spec_record()))  # two criteria
+    assert result.returncode == 1
+    assert f"error: {SPEC}: the intent 'fix' reproduces one bug, so its spec has exactly one acceptance criterion (this one has 2)" in result.stdout
+    assert "the spec for intent 'fix' does not hold (1 problem); nothing was written" in result.stdout
+    assert not run_path(code_m, RUN).exists()
+    many = spec_record()
+    many["acceptance_criteria"] = many["acceptance_criteria"] * 3
+    many["test_plan"] = many["test_plan"] * 3
+    result = start(run_cli, code_m, "--intent", "fix", "--spec", spec_file(code_m, many))
+    assert result.returncode == 1 and "(this one has 6)" in result.stdout and "defined more than once" in result.stdout
+    assert start(run_cli, code_m, "--intent", "fix", "--spec", spec_file(code_m, fix_spec())).returncode == 0
+
+
+def test_a_spec_supplied_run_may_have_any_number_of_criteria(run_cli, code_m):
+    assert start(run_cli, code_m, "--intent", "spec-supplied", "--spec", spec_file(code_m, spec_record())).returncode == 0
+
+
+def test_the_spec_gate_of_a_fix_run_holds_the_spec_to_one_criterion_too(run_cli, adopted):  # C-15
+    started(run_cli, adopted, "--intent", "fix", "--spec", spec_file(adopted, fix_spec()), "--row", "code.S")
+    put(adopted, "plan", spec_record(), agent=False)  # a two-criterion spec put in place of the supplied one
+    result = run_cli("gate", RUN, "plan", cwd=adopted)
+    assert result.returncode == 1 and "its record changed after `plan --intent` supplied it" in result.stdout
+    assert pl._gate_spec_complete(spec_record(), None) == []  # without a run there is no intent to hold it to
+    run = pl.load_run(pl.load_project(adopted), RUN)
+    assert pl._gate_spec_complete(spec_record(), pl.GateContext(pl.load_project(adopted), RUN, {"id": "plan", "gate": "spec_complete"}, run, [], False)) == [
+        "the intent 'fix' reproduces one bug, so its spec has exactly one acceptance criterion (this one has 2)"
+    ]
+    assert pl.single_ac_problems("feature", spec_record()) == [] and pl.single_ac_problems("fix", fix_spec()) == []
 
 
 @pytest.mark.parametrize("intent", ["spec-supplied", "fix"])
@@ -332,20 +385,31 @@ def test_a_start_that_failed_before_the_intake_record_can_be_redone(run_cli, cod
 def test_the_supplied_record_is_entered_in_the_ledger_and_its_gate_evaluated(run_cli, code_m):
     started(run_cli, code_m, "--intent", "spec-supplied", "--spec", spec_file(code_m))
     rows = pl.read_ledger(code_m, RUN)
-    assert [(r["kind"], r["stage"]) for r in rows] == [("supplied", "plan"), ("gate", "plan")]
+    assert [(r["kind"], r["stage"]) for r in rows] == [("supplied", "plan"), ("gate", "plan"), ("intake", "intake")]
     assert rows[0]["source"] == SPEC and rows[0]["record_sha256"] == pl.file_sha256(run_path(code_m, RUN, "plan.json"))
     assert (rows[1]["gate"], rows[1]["passed"]) == ("spec_complete", True)
+    assert rows[2]["record_sha256"] == pl.file_sha256(run_path(code_m, RUN, "intake.json")) and rows[2]["merge_base"] == read(code_m, "intake")["merge_base"]
 
 
 # --- a change that does not exist yet, and --row
 
 
+def test_plan_with_an_intent_starts_a_run_only_in_a_repository_that_has_adopted_plumbline(run_cli, repo):  # C-16
+    result = start(run_cli, repo, "--intent", "feature", "--row", "code.S")
+    assert result.returncode == 2 and "has not adopted plumbline" in result.stderr and "/plumbline:init adopts it" in result.stderr
+    assert not (repo / ".plumbline").exists()  # nothing was left behind, un-ignored and untracked
+    assert start(run_cli, repo, "--row", "code.S").returncode == 0  # a plan that starts nothing needs no adoption
+    assert not (repo / ".plumbline").exists()
+
+
 def test_nothing_to_classify_says_how_to_declare_the_row(run_cli, repo):
+    adopt_base(repo)
     result = start(run_cli, repo, "--intent", "feature")
     assert result.returncode == 2 and "nothing to classify" in result.stderr and "--row ROW" in result.stderr
 
 
 def test_a_declared_row_stands_in_for_a_change_that_does_not_exist_yet(run_cli, repo):
+    adopt_base(repo)
     plan = started(run_cli, repo, "--intent", "feature", "--row", "code.M")
     assert (plan["row"], plan["size"], plan["lines"], plan["types"]) == ("code.M", "M", 0, ["code"])
     assert stage_ids(plan) == ["intake", "plan", "tests", "test-review", "build", "verify", "review", "reduce"]
@@ -355,6 +419,7 @@ def test_a_declared_row_stands_in_for_a_change_that_does_not_exist_yet(run_cli, 
 
 
 def test_a_flat_row_is_declared_by_its_type_and_a_split_row_needs_its_size(run_cli, repo):
+    adopt_base(repo)
     plan = started(run_cli, repo, "--intent", "review-only", "--row", "docs")
     assert (plan["row"], plan["size"], stage_ids(plan)) == ("docs", "S", ["intake", "verify", "review", "reduce"])
     result = run_cli("classify", "--base", "main", "--row", "code", cwd=repo)
@@ -391,12 +456,14 @@ def test_the_intake_record_must_carry_a_well_formed_intent():
 
 @pytest.fixture
 def adopted(repo):
-    adopt(repo)
+    adopt(repo, commands={"test": CONTROLLED})
     return repo
 
 
 def test_the_fix_gate_needs_the_new_tests_to_fail_on_an_assertion_against_todays_code(run_cli, adopted):
     started(run_cli, adopted, "--intent", "fix", "--spec", spec_file(adopted, fix_spec()), "--row", "code.S")
+    write_test_file(adopted, covering=("AC-1",))
+    set_exit_code(adopted, 1)  # the test command fails on today's code
     put(adopted, "tests", written_tests_record(covering=("AC-1",), ran=True, all_failed=True))
     ok = run_cli("gate", RUN, "tests", cwd=adopted)
     assert ok.returncode == 0 and "gate reproduces_on_head for stage 'tests': pass" in ok.stdout
@@ -407,16 +474,30 @@ def test_the_fix_gate_needs_the_new_tests_to_fail_on_an_assertion_against_todays
     put(adopted, "tests", written_tests_record(covering=("AC-1",), ran=False, all_failed=False))
     assert "were not run against today's code" in run_cli("gate", RUN, "tests", cwd=adopted).stdout
     put(adopted, "tests", written_tests_record(covering=(), ran=True, all_failed=True))
-    assert "AC-1 is covered by no test" in run_cli("gate", RUN, "tests", cwd=adopted).stdout  # it keeps the gate it replaces
+    out = run_cli("gate", RUN, "tests", cwd=adopted).stdout
+    assert "AC-1 is covered by no test" in out and "there are no tests" in out  # it keeps the gate it replaces
     ledger = [r for r in pl.read_ledger(adopted, RUN) if r["kind"] == "gate" and r["stage"] == "tests"]
     assert {r["gate"] for r in ledger} == {"reproduces_on_head"}  # the ledger names the gate that was evaluated
 
 
-def test_a_feature_run_still_gates_its_tests_with_acs_covered(run_cli, adopted):
+def test_the_fix_gate_measures_the_same_run_and_a_test_command_that_passes_reproduces_nothing(run_cli, adopted):
+    started(run_cli, adopted, "--intent", "fix", "--spec", spec_file(adopted, fix_spec()), "--row", "code.S")
+    write_test_file(adopted, covering=("AC-1",))
+    put(adopted, "tests", written_tests_record(covering=("AC-1",), ran=True, all_failed=True))  # the record says it fails; the command says it does not
+    set_exit_code(adopted, 0)
+    out = run_cli("gate", RUN, "tests", cwd=adopted)
+    assert out.returncode == 1 and "the test command exited 0: every test passed, so none of them fails without the change it tests" in out.stdout
+
+
+def test_a_feature_run_gates_its_tests_with_tests_fail_on_stub_which_measures_the_test_command(run_cli, adopted):
     started(run_cli, adopted, "--intent", "feature", "--row", "code.S")
     put(adopted, "plan", spec_record())
-    put(adopted, "tests", written_tests_record(ran=False, all_failed=False))  # the stub check is not this gate's business
-    assert run_cli("gate", RUN, "tests", cwd=adopted).returncode == 0
+    write_test_file(adopted)
+    put(adopted, "tests", written_tests_record())
+    set_exit_code(adopted, 1)
+    assert "gate tests_fail_on_stub for stage 'tests': pass" in run_cli("gate", RUN, "tests", cwd=adopted).stdout
+    set_exit_code(adopted, 0)
+    assert run_cli("gate", RUN, "tests", cwd=adopted).returncode == 1
 
 
 def test_the_gate_of_a_stage_outside_the_runs_row_is_not_replaced_by_a_guess(run_cli, adopted):
@@ -424,7 +505,7 @@ def test_the_gate_of_a_stage_outside_the_runs_row_is_not_replaced_by_a_guess(run
     put(adopted, "plan", spec_record())
     put(adopted, "tests", written_tests_record(covering=("AC-1",)))  # AC-2 is not covered
     result = run_cli("gate", RUN, "tests", cwd=adopted)  # tests is not in the run; the pipeline's own gate applies
-    assert result.returncode == 1 and "gate acs_covered" in result.stdout
+    assert result.returncode == 1 and "gate tests_fail_on_stub" in result.stdout
 
 
 def review_lenses(record):
@@ -451,6 +532,7 @@ def test_a_refactor_passes_with_its_supplied_plan_listed_at_zero_rounds(run_cli,
     diff = change_of(adopted)
     put(adopted, "build", build_note_record())
     put(adopted, "verify", verify_record(diff=diff))
+    run_entry(adopted, "verify", diff)
     put(adopted, "review", review_record(diff=diff))
     result = run_cli("pass", RUN, cwd=adopted)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -467,19 +549,24 @@ def test_a_refactor_passes_with_its_supplied_plan_listed_at_zero_rounds(run_cli,
     assert record["row"] == "code.M"
 
 
-def test_pass_needs_the_supplied_record_to_still_hold(run_cli, adopted):
+def test_pass_needs_the_supplied_record_to_still_be_the_one_that_was_supplied(run_cli, adopted):
     started(run_cli, adopted, "--intent", "spec-supplied", "--spec", spec_file(adopted), "--row", "code.S")
+    write_test_file(adopted)
+    commit_all(adopted, "the tests")
     diff = change_of(adopted)
     put(adopted, "tests", written_tests_record())
+    run_entry(adopted, "tests", None, exit_code=1)
     put(adopted, "build", build_note_record())
     put(adopted, "verify", verify_record(diff=diff))
+    run_entry(adopted, "verify", diff)
     put(adopted, "review", review_record(diff=diff))
+    plan_file = run_path(adopted, RUN, "plan.json")
     hollow = spec_record()
     hollow["acceptance_criteria"], hollow["test_plan"] = [], []
-    put(adopted, "plan", hollow)  # the supplied record was gutted after it was accepted
+    put(adopted, "plan", hollow, agent=False)  # the supplied record was gutted after it was accepted
     result = run_cli("pass", RUN, cwd=adopted)
-    assert result.returncode == 1 and "stage 'plan' (gate spec_complete): the spec has no acceptance criteria" in result.stdout
-    put(adopted, "plan", spec_record())
+    assert result.returncode == 1 and "stage 'plan' (gate spec_complete): its record changed after `plan --intent` supplied it" in result.stdout
+    pl.write_json_atomic(plan_file, spec_record())  # put back as it was supplied
     assert run_cli("pass", RUN, cwd=adopted).returncode == 0
 
 
@@ -500,6 +587,7 @@ def test_a_review_only_run_needs_no_planner_tests_or_builder_records(run_cli, ad
     started(run_cli, adopted, "--intent", "review-only", "--row", "docs")
     diff = change_of(adopted)
     put(adopted, "verify", verify_record(diff=diff))
+    run_entry(adopted, "verify", diff)
     put(adopted, "review", review_record(diff=diff))
     assert run_cli("pass", RUN, cwd=adopted).returncode == 0
     assert [s["id"] for s in read(adopted, "reduce")["stages"]] == ["intake", "verify", "review", "reduce"]

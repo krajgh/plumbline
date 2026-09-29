@@ -15,6 +15,8 @@ Adoption is the builder's decision. This skill runs only when the builder types 
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/plumbline.py" init
    ```
 
-2. Report what the command printed exactly as it is. If it refuses because `plumbline.toml` already exists, say so and stop: it never overwrites, and you must not delete or edit the existing file to get around it.
+2. Report what the command printed exactly as it is. If it refuses because `plumbline.toml` already exists, say so and stop: `init` leaves an existing file as it is, and so do you. The builder edits that file if it should change.
 
-3. Remind the builder to commit the two files, `plumbline.toml` and `.gitignore` (only `plumbline.toml` if the repository already ignored `.plumbline/`). Do not commit them yourself: the builder decides when, and plumbline commits nothing.
+3. Remind the builder to commit the two files, `plumbline.toml` and `.gitignore` (only `plumbline.toml` if the repository already ignored `.plumbline/`). The builder decides when to commit, and plumbline commits nothing itself.
+
+4. Tell the builder that `plumbline.toml` holds a commented `[commands]` table. The verify stage and the tests stage need `test = "..."` there, because `plumbline.py gate` runs the repository's test command itself; `lint`, `typecheck` and `build` join the verify run where the repository has them.

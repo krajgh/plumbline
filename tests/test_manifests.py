@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 import plumbline as pl
-from helpers import REPO, clean_env
+from helpers import PROHIBITION, REPO, clean_env, prose_lines
 from hookdata import bash_payload, stop_payload
 from rundata import adopt, put
 
@@ -43,7 +43,7 @@ def frontmatter(path):
 def test_plugin_json_says_what_the_task_specified():
     plugin = load(PLUGIN)
     assert plugin["name"] == "plumbline"
-    assert plugin["version"] == "0.3.0"
+    assert plugin["version"] == "0.4.0"
     assert plugin["author"] == {"name": "krajgh", "url": "https://github.com/krajgh"}
     assert plugin["homepage"] == "https://github.com/krajgh/plumbline"
     assert plugin["repository"] == "https://github.com/krajgh/plumbline"
@@ -240,6 +240,110 @@ def test_the_discipline_skill_keeps_the_wording_it_moved_with():
     for heading in ("# Appropriately sized subagents, always", "## Sizing", "## Briefs", "## Shared files: map and reduce", "## Running them"):
         assert heading in body
     assert "smaller models substitute their own model name" in body
+
+
+@pytest.mark.parametrize("directory", skill_dirs(), ids=lambda d: d.name)
+def test_the_skills_state_rules_as_what_to_do(directory):  # C-23
+    fields, body = frontmatter(directory / "SKILL.md")
+    found = [m.group(0) for line in [fields["description"], *prose_lines(body)] for m in PROHIBITION.finditer(line)]
+    assert found == [], f"{directory.name}: {found}"
+
+
+def run_skill():
+    return frontmatter(REPO / "skills" / "run" / "SKILL.md")[1]
+
+
+def between(text, start, end):
+    return text[text.index(start) : text.index(end)]
+
+
+def test_the_run_skill_briefs_the_defender_with_the_merge_base_and_the_hash():  # C-24
+    body = run_skill()
+    defenders = between(body, "2. **Defenders.**", "3. `PLUMBLINE merge-review")
+    assert "the merge base" in defenders and "diff_sha256" in defenders and "the paths of the findings records" in defenders
+    prompt = (REPO / "agents" / "defender.md").read_text(encoding="utf-8")
+    assert "the merge base" in prompt and "`diff_sha256`" in prompt  # what the prompt expects, the brief gives
+
+
+def test_the_run_skill_briefs_the_detective_with_the_merge_base_the_spec_and_the_tests_record():  # C-24
+    body = run_skill()
+    detective = between(body, "4. **Detective.**", "5. `PLUMBLINE gate")
+    for needed in ("the merge base", "the path of the spec", "of the tests record", "diff_sha256", "the merged record's path", "its record path"):
+        assert needed in detective, needed
+    prompt = (REPO / "agents" / "detective.md").read_text(encoding="utf-8")
+    assert "the merge base" in prompt and "the paths of the spec and of the tests record" in prompt
+
+
+def test_the_run_skill_gives_every_review_agent_the_hash_of_the_change_from_check_diff():  # C-09
+    body = run_skill()
+    assert "PLUMBLINE check-diff --run <run_id>" in body and "`merge_base` and the `diff_sha256`" in body
+    for start, end in (("1. **Prosecutors.**", "2. **Defenders.**"), ("2. **Defenders.**", "3. `PLUMBLINE merge-review"), ("4. **Detective.**", "5. `PLUMBLINE gate")):
+        assert "`diff_sha256`" in between(body, start, end), start
+    for agent in ("prosecutor", "defender", "detective"):
+        prompt = (REPO / "agents" / f"{agent}.md").read_text(encoding="utf-8")
+        assert prompt.count("diff_sha256") >= 2, agent  # in what the brief gives, and in the record
+
+
+def test_the_run_skill_routes_tests_lens_findings_to_the_test_writer_and_gives_the_builder_text_only():  # C-06, C-07
+    body = run_skill()
+    failing = between(body, "## 6. When a gate fails", "## 7. Reduce")
+    assert "The surviving findings under \"for the test-writer\" go to the test-writer" in failing
+    assert "\"for the builder\" text of the surviving findings" in failing
+    brief = between(body, "- builder: the plan record.", "- verifier:")
+    assert "verbatim" in brief and "no test file, test name, assertion or tests-lens finding, and no path of a review file" in brief
+    assert "review-file" not in brief and "by path" not in brief  # the old brief handed the builder the review record by its path
+
+
+def test_the_run_skill_says_how_a_run_in_progress_is_resumed():  # C-30
+    body = run_skill()
+    resume = between(body, "**A run may be in progress already**", "## 1. The intent")
+    assert ".plumbline/runs/ACTIVE" in resume and "PLUMBLINE status" in resume
+    assert "continue that run" in resume and "from the first one that is not `pass`, `supplied` or `recorded`" in resume
+    status = frontmatter(REPO / "skills" / "status" / "SKILL.md")[1]
+    assert "`/plumbline:run` continues it" in status
+
+
+def test_the_run_skill_says_what_the_rounds_and_exit_3_mean_and_where_plan_and_tests_go_back_to():  # C-08
+    failing = between(run_skill(), "## 6. When a gate fails", "## 7. Reduce")
+    assert '"round k of N"' in failing and "exits 3 when the stage has used its rounds" in failing
+    assert "`plan` and `tests` go back to their own agent" in failing
+
+
+def test_the_run_skill_names_the_active_file_and_the_measured_row():
+    body = run_skill()
+    assert "names the run in `.plumbline/runs/ACTIVE`" in body
+    assert "plumbline measures the change again" in body and "`pass` refuses a run whose row lacks a stage the measured row selects" in body
+
+
+def plumbline_mentions():
+    """Every `plumbline.py` subcommand a skill or an agent prompt names, with the options written on the same line."""
+    found = []
+    for path in [*(REPO / "skills").glob("*/SKILL.md"), *(REPO / "agents").glob("*.md")]:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            for match in re.finditer(r"(?:PLUMBLINE|plumbline\.py\"?) ([a-z][a-z-]+)((?: [^\s`]+)*)", line):
+                words = match.group(2).split()
+                found.append((path.name if path.name != "SKILL.md" else path.parent.name, match.group(1), [w for w in words if w.startswith("--")]))
+    return found
+
+
+def test_every_command_and_option_the_skills_and_agents_name_is_one_of_the_cli():
+    commands = next(a for a in pl.build_parser()._actions if getattr(a, "choices", None)).choices
+    mentions = plumbline_mentions()
+    assert len(mentions) > 20
+    for source, command, options in mentions:
+        assert command in commands, f"{source}: plumbline.py {command}"
+        known = {opt for action in commands[command]._actions for opt in action.option_strings}
+        for option in options:
+            assert option.split("=")[0] in known, f"{source}: plumbline.py {command} {option}"
+
+
+def test_the_skills_allowed_tools_still_reach_only_the_commands_they_run():
+    # `Bash(python3 *)` is as narrow as it gets: the plugin's install path differs from one user to the next, and only the bodies of a skill
+    # are known to get ${CLAUDE_PLUGIN_ROOT} substituted, so no pattern naming the script's path can be shown to match its quoted form
+    for name in ("init", "override", "run", "status"):
+        fields, body = frontmatter(REPO / "skills" / name / "SKILL.md")
+        assert fields["allowed-tools"].startswith("Bash(python3 *)")
+        assert "python3 " in body
 
 
 # --- licence and notice

@@ -4,15 +4,18 @@ import json
 import pytest
 
 import plumbline as pl
+from helpers import write
 from rundata import RUN, adopt, intake_record, put, put_part, read, run_path
 from samples import sample
 
 
 @pytest.fixture
 def unit(repo):
-    """An adopted repository with a run of row code.S: its review stage has the lenses correctness and tests, 3 defenders, a survival threshold of 2."""
+    """An adopted repository with a run of row code.S: its review stage has the lenses correctness and tests, 3 defenders, a survival threshold of 2.
+    src/app.py holds the line the defenders quote, `return retry(url)`: a quote counts only when the change or the finding's file has it."""
     adopt(repo)
     put(repo, "intake", intake_record("code.S", repo))
+    write(repo / "src" / "app.py", "def main():\n    return retry(url)\n")
     return repo
 
 
@@ -228,8 +231,8 @@ def test_a_round_that_does_not_exist_and_a_unit_without_records_could_not_be_mer
     no_records = merge(run_cli, unit)
     assert no_records.returncode == 2 and "no per-agent records for stage 'review'" in no_records.stderr
     blank_prosecutors(unit)
-    no_round = merge(run_cli, unit, "--round", "5")
-    assert no_round.returncode == 2 and "round-5" in no_round.stderr
+    no_round = merge(run_cli, unit, "--round", "3")
+    assert no_round.returncode == 2 and "round-3" in no_round.stderr
 
 
 # --- what makes a merge impossible

@@ -1,7 +1,7 @@
 {
   "description": "One defender's record: a verdict on each finding of the round. A defender refutes a finding only by quoting the code that shows it is wrong; a refutation without a quote does not count.",
   "type": "object",
-  "required": ["defender", "defenses"],
+  "required": ["defender", "defenses", "diff_sha256"],
   "additionalProperties": false,
   "properties": {
     "defender": {
@@ -38,6 +38,11 @@
           }
         }
       }
+    },
+    "diff_sha256": {
+      "description": "The sha256 of the change this record was made against: the value in your brief, as `plumbline.py check-diff --run RUN` prints it. `merge-review` refuses a record whose hash differs from the change as the files are now, so a change edited after you read it means you run again.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     }
   }
 }

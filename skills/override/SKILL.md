@@ -1,6 +1,6 @@
 ---
 name: override
-description: Record an override for HEAD, so that it can be pushed without a passing pipeline run. Typed by the builder with a reason of at least 20 characters; Claude cannot invoke it.
+description: Record an override for HEAD, so that it can be pushed without a passing pipeline run. Typed by the builder with a reason of at least 20 characters; only the builder invokes it.
 disable-model-invocation: true
 argument-hint: why the pipeline is skipped (at least 20 characters)
 allowed-tools: Bash(python3 *)

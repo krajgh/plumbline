@@ -81,6 +81,7 @@ _SAMPLES = {
                 "evidence": "except OSError: continue",
                 "outside_code": None,
                 "severity": "BLOCKING",
+                "evidence_unverified": False,
             },
             {
                 "id": "F-2",
@@ -93,6 +94,7 @@ _SAMPLES = {
                 "evidence": "log.info(url)",
                 "outside_code": "The log is shipped to a third party.",
                 "severity": "MAJOR",
+                "evidence_unverified": True,
             },
         ],
         "defenses": [
@@ -105,6 +107,7 @@ _SAMPLES = {
             {"id": "G-2", "kind": "edge_case", "detail": "retries=0 is not handled.", "ac": None},
         ],
         "blockers_surviving": 1,
+        "routes": {"builder": ["F-1"], "test-writer": []},
         "diff_sha256": DIFF_HASH,
     },
     "findings_record": {
@@ -135,6 +138,7 @@ _SAMPLES = {
                 "severity": "MINOR",
             },
         ],
+        "diff_sha256": DIFF_HASH,
     },
     "defense_record": {
         "defender": "defender-1",
@@ -142,12 +146,14 @@ _SAMPLES = {
             {"finding_id": "correctness-1", "defender": "defender-1", "verdict": "conceded", "quote": "continue", "reason": "The loop never raises."},
             {"finding_id": "correctness-2", "defender": "defender-1", "verdict": "refuted", "quote": "retries: int = 3", "reason": "The default is 3, and 0 is documented as no retries."},
         ],
+        "diff_sha256": DIFF_HASH,
     },
     "gaps_record": {
         "gaps": [
             {"id": "G-1", "kind": "uncovered_ac", "detail": "No test covers AC-2.", "ac": "AC-2"},
             {"id": "G-2", "kind": "edge_case", "detail": "retries=0 is not handled.", "ac": None},
         ],
+        "diff_sha256": DIFF_HASH,
     },
     "pass_record": {
         "commit": SHA_A,

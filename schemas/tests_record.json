@@ -20,7 +20,7 @@
             "minLength": 1
           },
           "name": {
-            "description": "The test's name as the test runner reports it.",
+            "description": "The test's name as it appears in its file (for example test_fetch_retries): the gate opens `file` and looks for it.",
             "type": "string",
             "minLength": 1
           },

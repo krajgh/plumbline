@@ -13,7 +13,8 @@ from helpers import SESSION_START, clean_env, write
 DISCIPLINE = "plumbline:subagent-discipline skill."
 ADOPTED = "plumbline: adopted in this repository (pipeline 'default', graft off). Changes go through the pipeline before they are pushed: /plumbline:run."
 NOT_ADOPTED = "plumbline: not adopted in this repository; /plumbline:init adopts it."
-MATCHER = "^plumbline:(planner|test-writer|builder)$"
+MATCHER = "^(?!plumbline:)|^plumbline:(planner|test-writer|builder)$"  # what session start recommends: ponytail stays on for every subagent that is no plumbline agent
+ANCHORED = "^plumbline:(planner|test-writer|builder)$"  # the value 0.3.0 recommended: right for plumbline's agents, and it switches ponytail off for all others
 PONYTAIL = (
     "ponytail is not enabled, and plumbline requires it: claude plugin marketplace add "
     "DietrichGebert/ponytail, then claude plugin install ponytail@ponytail."
@@ -41,6 +42,13 @@ def plain(tmp_path):
     directory = tmp_path / "plain"
     directory.mkdir()
     return directory
+
+
+@pytest.fixture
+def adopted(repo, run_cli):
+    """A repository that has adopted plumbline: the matcher line is shown only in one."""
+    assert run_cli("init", cwd=repo).returncode == 0
+    return repo
 
 
 @pytest.fixture
@@ -311,60 +319,60 @@ def matcher_line(ctx):
     return lines[0] if lines else None
 
 
-def test_the_matcher_line_says_what_to_add_once_when_the_matcher_is_unset(hook, repo, home):
+def test_the_matcher_line_says_what_to_add_once_when_the_matcher_is_unset(hook, adopted, home):
     enable_ponytail(home / ".claude" / "settings.json")
-    line = matcher_line(context(hook(repo)))
+    line = matcher_line(context(hook(adopted)))
     assert line == (
         "ponytail reaches every subagent, plumbline's reviewers included. Scope it to the agents that make the change, once: "
-        f'add "env": {{"{ENV_VAR}": "{MATCHER}"}} to ~/.claude/settings.json (plumbline changes none of your settings).'
+        f'add "env": {{"{ENV_VAR}": "{MATCHER}"}} to ~/.claude/settings.json (plumbline changes none of your settings). '
+        "That value keeps ponytail on for every subagent that is not a plumbline agent."
     )
     assert "\n" not in line
 
 
-def test_the_matcher_line_comes_after_the_adoption_line_and_replaces_the_ponytail_warning(hook, repo, run_cli, home):
-    run_cli("init", cwd=repo)
+def test_the_matcher_line_comes_after_the_adoption_line_and_replaces_the_ponytail_warning(hook, adopted, home):
     enable_ponytail(home / ".claude" / "settings.json")
-    parts = context(hook(repo)).split("\n\n")
+    parts = context(hook(adopted)).split("\n\n")
     assert parts[1] == ADOPTED and parts[2].startswith("ponytail reaches every subagent") and len(parts) == 3
     assert PONYTAIL not in parts
 
 
-def test_no_matcher_line_while_ponytail_itself_is_not_enabled(hook, repo, home):
-    ctx = context(hook(repo))
+def test_no_matcher_line_while_ponytail_itself_is_not_enabled(hook, adopted, home):
+    ctx = context(hook(adopted))
     assert PONYTAIL in ctx and matcher_line(ctx) is None
     settings_with(home / ".claude" / "settings.json", MATCHER, enabled=False)
-    ctx = context(hook(repo))
+    ctx = context(hook(adopted))
     assert PONYTAIL in ctx and matcher_line(ctx) is None
 
 
-def test_the_right_matcher_in_the_user_settings_silences_the_line(hook, repo, home):
+def test_the_right_matcher_in_the_user_settings_silences_the_line(hook, adopted, home):
     settings_with(home / ".claude" / "settings.json", MATCHER)
-    assert matcher_line(context(hook(repo))) is None
+    assert matcher_line(context(hook(adopted))) is None
 
 
-def test_the_right_matcher_in_the_project_settings_or_the_local_ones_silences_it_too(hook, repo, home):
+def test_the_right_matcher_in_the_project_settings_or_the_local_ones_silences_it_too(hook, adopted, home):
     enable_ponytail(home / ".claude" / "settings.json")
-    write(repo / ".claude" / "settings.json", json.dumps({"env": {ENV_VAR: MATCHER}}))
-    assert matcher_line(context(hook(repo))) is None
-    (repo / ".claude" / "settings.json").unlink()
-    write(repo / ".claude" / "settings.local.json", json.dumps({"env": {ENV_VAR: MATCHER}}))
-    assert matcher_line(context(hook(repo))) is None
+    write(adopted / ".claude" / "settings.json", json.dumps({"env": {ENV_VAR: MATCHER}}))
+    assert matcher_line(context(hook(adopted))) is None
+    (adopted / ".claude" / "settings.json").unlink()
+    write(adopted / ".claude" / "settings.local.json", json.dumps({"env": {ENV_VAR: MATCHER}}))
+    assert matcher_line(context(hook(adopted))) is None
 
 
-def test_the_process_environment_counts_first_because_it_is_what_ponytails_hook_will_see(hook, repo, home):
+def test_the_process_environment_counts_first_because_it_is_what_ponytails_hook_will_see(hook, adopted, home):
     enable_ponytail(home / ".claude" / "settings.json")
-    assert matcher_line(context(hook(repo, **{ENV_VAR: MATCHER}))) is None
-    assert "reaches every subagent" not in context(hook(repo, **{ENV_VAR: MATCHER}))
-    wrong = matcher_line(context(hook(repo, **{ENV_VAR: "builder"})))
+    assert matcher_line(context(hook(adopted, **{ENV_VAR: MATCHER}))) is None
+    assert "reaches every subagent" not in context(hook(adopted, **{ENV_VAR: MATCHER}))
+    wrong = matcher_line(context(hook(adopted, **{ENV_VAR: "builder"})))
     assert wrong and '("builder")' in wrong
 
 
-def test_the_local_settings_win_over_the_project_settings_and_those_over_the_users(hook, repo, home):
+def test_the_local_settings_win_over_the_project_settings_and_those_over_the_users(hook, adopted, home):
     settings_with(home / ".claude" / "settings.json", MATCHER)
-    write(repo / ".claude" / "settings.json", json.dumps({"env": {ENV_VAR: "planner"}}))
-    assert '("planner")' in matcher_line(context(hook(repo)))
-    write(repo / ".claude" / "settings.local.json", json.dumps({"env": {ENV_VAR: MATCHER}}))
-    assert matcher_line(context(hook(repo))) is None
+    write(adopted / ".claude" / "settings.json", json.dumps({"env": {ENV_VAR: "planner"}}))
+    assert '("planner")' in matcher_line(context(hook(adopted)))
+    write(adopted / ".claude" / "settings.local.json", json.dumps({"env": {ENV_VAR: MATCHER}}))
+    assert matcher_line(context(hook(adopted))) is None
 
 
 @pytest.mark.parametrize(
@@ -381,9 +389,9 @@ def test_the_local_settings_win_over_the_project_settings_and_those_over_the_use
         ("^nothing-like-that$", "it misses planner, test-writer, builder"),
     ],
 )
-def test_a_matcher_that_does_not_reach_exactly_the_making_agents_is_named_with_what_it_gets_wrong(hook, repo, home, value, said):
+def test_a_matcher_that_does_not_reach_exactly_the_making_agents_is_named_with_what_it_gets_wrong(hook, adopted, home, value, said):
     settings_with(home / ".claude" / "settings.json", value)
-    line = matcher_line(context(hook(repo)))
+    line = matcher_line(context(hook(adopted)))
     assert line == f'{ENV_VAR} ("{value}") should reach exactly plumbline\'s planner, test-writer and builder: {said}. Set it to "{MATCHER}".'
 
 
@@ -391,63 +399,162 @@ def test_a_matcher_that_does_not_reach_exactly_the_making_agents_is_named_with_w
     "value",
     [
         MATCHER,
-        "^plumbline:(planner|test-writer|builder)$".upper(),  # case-insensitive, as ponytail's
+        ANCHORED,  # the value 0.3.0 recommended: exact among plumbline's agents
+        ANCHORED.upper(),  # case-insensitive, as ponytail's
         "plumbline:(planner|test-writer|builder)",  # unanchored is fine: no other plumbline agent has those names
         "(planner|test-writer|builder)",
         "builder|planner|test-writer",
         "^plumbline:(?:planner|test-writer|builder)$",
     ],
 )
-def test_any_matcher_that_reaches_exactly_the_making_agents_is_accepted(hook, repo, home, value):
+def test_any_matcher_that_reaches_exactly_the_making_agents_is_accepted(hook, adopted, home, value):
     settings_with(home / ".claude" / "settings.json", value)
-    assert matcher_line(context(hook(repo))) is None
+    assert matcher_line(context(hook(adopted))) is None
 
 
-def test_a_matcher_that_is_not_a_regular_expression_is_named(hook, repo, home):
+def test_a_matcher_that_is_not_a_regular_expression_is_named(hook, adopted, home):
     settings_with(home / ".claude" / "settings.json", "(planner")
-    line = matcher_line(context(hook(repo)))
+    line = matcher_line(context(hook(adopted)))
     assert line == f'{ENV_VAR} ("(planner") is not a valid regular expression, so ponytail reaches every subagent. Set it to "{MATCHER}".'
 
 
 @pytest.mark.parametrize("value", ["", None, 5, True, ["planner"], {"a": 1}])
-def test_an_empty_or_odd_matcher_value_counts_as_unset(hook, repo, home, value):
+def test_an_empty_or_odd_matcher_value_counts_as_unset(hook, adopted, home, value):
     write(home / ".claude" / "settings.json", json.dumps({"enabledPlugins": {"ponytail@ponytail": True}, "env": {ENV_VAR: value}}))
-    assert matcher_line(context(hook(repo))).startswith("ponytail reaches every subagent")
+    assert matcher_line(context(hook(adopted))).startswith("ponytail reaches every subagent")
 
 
 @pytest.mark.parametrize("text", ["{not json", "[]", '{"enabledPlugins": {"ponytail@ponytail": true}, "env": []}', '{"enabledPlugins": {"ponytail@ponytail": true}, "env": null}'])
-def test_unreadable_or_odd_settings_do_not_crash_the_matcher_check(hook, repo, home, text):
+def test_unreadable_or_odd_settings_do_not_crash_the_matcher_check(hook, adopted, home, text):
     write(home / ".claude" / "settings.json", '{"enabledPlugins": {"ponytail@ponytail": true}}')
-    write(repo / ".claude" / "settings.json", text)
+    write(adopted / ".claude" / "settings.json", text)
+    assert matcher_line(context(hook(adopted))).startswith("ponytail reaches every subagent")
+
+
+def test_the_matcher_line_shows_only_in_a_repository_that_has_adopted_plumbline(hook, repo, plain, home, adopted):  # C-12
+    enable_ponytail(home / ".claude" / "settings.json")
+    assert matcher_line(context(hook(adopted))).startswith("ponytail reaches every subagent")
+    other = adopted.parent / "other"  # a repository that has not adopted plumbline
+    other.mkdir()
+    for command in (["git", "init", "-q", "-b", "main", str(other)],):
+        assert subprocess.run(command, capture_output=True).returncode == 0
+    for where in (other, plain):
+        ctx = context(hook(where))
+        assert matcher_line(ctx) is None and "ponytail reaches every subagent" not in ctx and PONYTAIL not in ctx
+    ctx = context(hook(other))
+    assert NOT_ADOPTED in ctx  # the hint stays; the matcher line does not
+
+
+def test_an_invalid_config_still_counts_as_adopted_for_the_matcher_line(hook, repo, home):
+    write(repo / "plumbline.toml", "schema = = 1\n")
+    enable_ponytail(home / ".claude" / "settings.json")
     assert matcher_line(context(hook(repo))).startswith("ponytail reaches every subagent")
 
 
-def test_the_matcher_line_shows_outside_a_git_repository_too(hook, plain, home):
-    enable_ponytail(home / ".claude" / "settings.json")
-    assert matcher_line(context(hook(plain))).startswith("ponytail reaches every subagent")
+def test_the_ponytail_warning_is_still_shown_where_plumbline_is_not_adopted(hook, repo, plain):
+    assert PONYTAIL in context(hook(repo)) and PONYTAIL in context(hook(plain))
 
 
-def test_plumbline_writes_no_settings_and_nothing_else_under_the_home(hook, repo, home):
+def test_plumbline_writes_no_settings_and_nothing_else_under_the_home(hook, adopted, home):
     enable_ponytail(home / ".claude" / "settings.json")
     before = {p: p.read_bytes() for p in home.rglob("*") if p.is_file()}
-    context(hook(repo))
+    context(hook(adopted))
     assert {p: p.read_bytes() for p in home.rglob("*") if p.is_file()} == before
 
 
-def test_the_recommended_matcher_reaches_exactly_the_making_agents_under_javascript_regular_expressions_too():
-    # ponytail tests it with `new RegExp(value, 'i').test(agent_type)` (hooks/ponytail-subagent.js), not with Python's re
+def node_or_skip():
     import shutil
-    import subprocess
 
     if shutil.which("node") is None:
         pytest.skip("node is not installed")
+
+
+def test_the_recommended_matcher_keeps_ponytail_on_for_other_subagents_and_reaches_exactly_the_making_agents_among_plumbline_s():  # C-12
+    # ponytail tests it with `new RegExp(value, 'i').test(agent_type)` (hooks/ponytail-subagent.js), not with Python's re
+    import subprocess
+
+    node_or_skip()
     script = "const re = new RegExp(process.argv[1], 'i'); console.log(JSON.stringify(process.argv.slice(2).map(t => re.test(t))))"
-    types = [f"plumbline:{name}" for name in AGENTS] + ["Explore", "general-purpose", "probe:builder", "planner"]
+    others = ["Explore", "general-purpose", "probe:builder", "planner", "other-plugin:verifier"]
+    types = [f"plumbline:{name}" for name in AGENTS] + others
     result = subprocess.run(["node", "-e", script, MATCHER, *types], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     reached = json.loads(result.stdout)
-    assert [t for t, hit in zip(types, reached) if hit] == [f"plumbline:{name}" for name in MAKING]
+    assert [t for t, hit in zip(types, reached) if hit] == [f"plumbline:{name}" for name in MAKING] + others  # every subagent that is no plumbline agent, too
     assert session_start.MATCHER_EXAMPLE == MATCHER and session_start.MAKING_AGENTS == MAKING and session_start.ALL_AGENTS == AGENTS
+
+
+def test_the_anchored_value_of_0_3_0_would_switch_ponytail_off_for_every_other_subagent():
+    import subprocess
+
+    node_or_skip()
+    script = "const re = new RegExp(process.argv[1], 'i'); console.log(JSON.stringify(process.argv.slice(2).map(t => re.test(t))))"
+    result = subprocess.run(["node", "-e", script, ANCHORED, "Explore", "general-purpose"], capture_output=True, text=True)
+    assert json.loads(result.stdout) == [False, False]
+
+
+# --- the matcher is checked the way ponytail uses it: with node where it is installed
+
+PYTHON_ONLY = "^plumbline:(?P<r>planner|test-writer|builder)$"  # a named group, Python's spelling
+JS_ONLY = "^plumbline:(?<r>planner|test-writer|builder)$"  # a named group, Javascript's spelling
+
+
+def without_node(tmp_path):
+    """A PATH with git and nothing else: no node."""
+    import shutil
+
+    bin_dir = tmp_path / "bin-without-node"
+    bin_dir.mkdir(exist_ok=True)
+    if not (bin_dir / "git").exists():
+        (bin_dir / "git").symlink_to(shutil.which("git"))
+    return str(bin_dir)
+
+
+def test_a_matcher_only_python_accepts_is_named_because_ponytails_javascript_rejects_it(hook, adopted, home):  # C-11
+    node_or_skip()
+    settings_with(home / ".claude" / "settings.json", PYTHON_ONLY)
+    line = matcher_line(context(hook(adopted)))
+    assert line == f'{ENV_VAR} ("{PYTHON_ONLY}") is not a valid regular expression, so ponytail reaches every subagent. Set it to "{MATCHER}".'
+
+
+def test_a_matcher_only_javascript_accepts_is_accepted_when_node_is_there(hook, adopted, home):  # C-11
+    node_or_skip()
+    settings_with(home / ".claude" / "settings.json", JS_ONLY)
+    assert matcher_line(context(hook(adopted))) is None
+
+
+def test_without_node_the_check_falls_back_to_pythons_regular_expressions(hook, adopted, home, tmp_path):
+    settings_with(home / ".claude" / "settings.json", PYTHON_ONLY)
+    assert matcher_line(context(hook(adopted, PATH=without_node(tmp_path)))) is None
+    settings_with(home / ".claude" / "settings.json", JS_ONLY)
+    assert "is not a valid regular expression" in matcher_line(context(hook(adopted, PATH=without_node(tmp_path))))
+
+
+def test_the_recommended_value_passes_the_check_with_and_without_node(hook, adopted, home, tmp_path):
+    settings_with(home / ".claude" / "settings.json", MATCHER)
+    assert matcher_line(context(hook(adopted, PATH=without_node(tmp_path)))) is None
+    if __import__("shutil").which("node"):
+        assert matcher_line(context(hook(adopted))) is None
+
+
+def test_matcher_reach_answers_from_node_when_it_is_installed_and_from_python_otherwise(monkeypatch):
+    node_or_skip()
+    assert session_start.matcher_reach(MATCHER) == (True, list(MAKING))
+    assert session_start.matcher_reach(PYTHON_ONLY) == (False, [])
+    assert session_start.matcher_reach(JS_ONLY) == (True, list(MAKING))
+    assert session_start.matcher_reach("-not-an-option") == (True, [])  # a value that looks like an option is a pattern, not a node flag
+    monkeypatch.setattr(session_start.shutil, "which", lambda name: None)
+    assert session_start.matcher_reach(MATCHER) == (True, list(MAKING))
+    assert session_start.matcher_reach(PYTHON_ONLY) == (True, list(MAKING))
+    assert session_start.matcher_reach(JS_ONLY) == (False, [])
+
+
+def test_a_node_that_cannot_answer_is_no_reason_to_fail_the_check(monkeypatch, tmp_path):
+    broken = tmp_path / "node"
+    broken.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+    broken.chmod(0o755)
+    monkeypatch.setattr(session_start.shutil, "which", lambda name: str(broken))
+    assert session_start.matcher_reach(MATCHER) == (True, list(MAKING))  # Python answers instead
 
 
 def test_the_session_start_agent_names_are_the_pipelines():
@@ -459,16 +566,15 @@ def test_the_session_start_agent_names_are_the_pipelines():
 PROHIBITION = re.compile(r"\b(never|don't|do not|must not|cannot|can't|won't|shouldn't|forbidden|prohibited|not allowed)\b", re.I)
 
 
-def test_the_always_on_notes_state_rules_as_what_to_do(hook, repo, run_cli, home):
+def test_the_always_on_notes_state_rules_as_what_to_do(hook, adopted, home):
     # a prohibition belongs in a hook wherever one can enforce it; prose keeps what only judgement can apply
-    run_cli("init", cwd=repo)
     enable_ponytail(home / ".claude" / "settings.json")
-    unset = context(hook(repo))
+    unset = context(hook(adopted))
     settings_with(home / ".claude" / "settings.json", "(planner")
-    invalid = context(hook(repo))
+    invalid = context(hook(adopted))
     settings_with(home / ".claude" / "settings.json", "builder")
-    wrong = context(hook(repo))
+    wrong = context(hook(adopted))
     (home / ".claude" / "settings.json").unlink()
-    warned = context(hook(repo))
+    warned = context(hook(adopted))
     for text in (unset, invalid, wrong, warned, session_start.DISCIPLINE_NOTE, session_start.NOT_ADOPTED, session_start.PONYTAIL_WARNING):
         assert PROHIBITION.findall(text) == [], text

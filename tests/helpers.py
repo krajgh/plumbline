@@ -1,5 +1,6 @@
 """Plain helpers shared by the tests (fixtures live in conftest.py)."""
 import os
+import re
 import subprocess
 import sys
 import tomllib
@@ -74,3 +75,39 @@ def run_script(script: Path, args, cwd: Path, home: Path, stdin: str | None = No
         env=clean_env(home, **env_extra),
         input=stdin,
     )
+
+
+# Rules are stated as what to do: a prohibition word in a prompt or a skill is a sign that a rule is left to prose. What a hook
+# enforces is not repeated as a prohibition, and what only judgement can apply is still phrased as an instruction.
+PROHIBITION = re.compile(r"\b(never|don't|do not|must not|cannot|can't|won't|shouldn't|forbidden|prohibited|not allowed)\b", re.I)
+
+
+def prose_lines(text: str):
+    """The lines of a markdown text outside its fenced code blocks."""
+    fenced = False
+    for line in text.splitlines():
+        if line.startswith("```"):
+            fenced = not fenced
+        elif not fenced:
+            yield line
+
+
+def process_gone(pid: int, wait: float = 3.0) -> bool:
+    """Has the process ended? A zombie that nobody has reaped yet counts as ended (a container may have no init to reap it)."""
+    import time
+
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except (OSError, IndexError):
+            state = ""
+        if state == "Z":
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)

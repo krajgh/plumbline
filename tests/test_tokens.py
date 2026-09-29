@@ -88,7 +88,7 @@ def test_a_transcript_that_cannot_be_read_is_skipped(tmp_path):
 @pytest.fixture
 def adopted(repo):
     adopt(repo)
-    put(repo, "verify", {})  # the run directory
+    put(repo, "verify", {}, agent=False)  # the run directory
     return repo
 
 

@@ -11,8 +11,8 @@ import plumbline as pl
 from helpers import commit_all, git, numbered, write
 from hookdata import bash_payload, denial
 from rundata import (
-    RUN, adopt, build_note_record, change_of, genuine_pass, intake_record, ledger, put, put_part, read, review_record, run_path,
-    verify_record, write_docs_run,
+    FAILING, RUN, adopt, begin, build_note_record, change_of, genuine_pass, intake_record, ledger, put, put_part, read, review_record,
+    run_entry, run_path, spec_record, verify_record, write_docs_run, write_test_file, written_tests_record,
 )
 from samples import sample
 
@@ -242,11 +242,11 @@ def test_check_diff_with_an_unknown_base_could_not_run(run_cli, repo):
 
 def test_merge_review_stamps_the_review_record_with_the_hash_of_the_change_it_reviewed(run_cli, adopted):
     put(adopted, "intake", intake_record("code.S", adopted))
+    write(adopted / "src" / "app.py", "def main():\n    return 2\n")  # uncommitted: part of the change all the same
     for lens in ("correctness", "tests"):
-        put_part(adopted, "review", f"prosecutor-{lens}", {"lens": lens, "findings": []})
+        put_part(adopted, "review", f"prosecutor-{lens}", {"lens": lens, "findings": []})  # each part carries the hash of the change it saw
     for k in (1, 2, 3):
         put_part(adopted, "review", f"defender-{k}", {"defender": f"defender-{k}", "defenses": []})
-    write(adopted / "src" / "app.py", "def main():\n    return 2\n")  # uncommitted: part of the change all the same
     expected = pl.change_hash(adopted, merge_base(adopted))
     assert run_cli("merge-review", RUN, "review", cwd=adopted).returncode == 0
     record = read(adopted, "review")
@@ -281,8 +281,9 @@ def test_a_change_verified_before_it_is_committed_passes_once_it_is_committed_as
     write(adopted / "src" / "app.py", "def main():\n    return 2\n")
     write(adopted / "src" / "helper.py", "def helper():\n    return 1\n")  # untracked while it is verified
     diff = now(adopted)  # what the verifier's check-diff printed
-    put(adopted, "intake", intake_record("docs", adopted))
+    put(adopted, "intake", intake_record("code.S", adopted, intent="review-only"))  # a change that exists, reviewed as it is
     put(adopted, "verify", verify_record(diff=diff))
+    run_entry(adopted, "verify", diff)
     put(adopted, "review", review_record(diff=diff))
     commit_all(adopted, "the change, as it was verified")
     result = run_cli("pass", RUN, cwd=adopted)
@@ -290,7 +291,7 @@ def test_a_change_verified_before_it_is_committed_passes_once_it_is_committed_as
 
 
 def test_pass_refuses_when_the_change_was_edited_after_verify_and_review(run_cli, ready):
-    write(ready / "src" / "app.py", "def main():\n    return 99\n")  # an edit after the records were made
+    write(ready / "README.md", "# demo\nedited after the review\n")  # an edit after the records were made
     commit_all(ready, "edited after review")
     result = run_cli("pass", RUN, cwd=ready)
     assert result.returncode == 1
@@ -308,23 +309,25 @@ def test_pass_refuses_when_only_the_review_is_stale(run_cli, ready):
 
 
 def test_pass_refuses_when_a_file_is_added_after_review_and_committed(run_cli, ready):
-    write(ready / "src" / "sneaky.py", "print('not reviewed')\n")
+    write(ready / "notes.md", "not reviewed\n")
     commit_all(ready, "one more file")
-    assert run_cli("pass", RUN, cwd=ready).returncode == 1
+    result = run_cli("pass", RUN, cwd=ready)
+    assert result.returncode == 1 and "its record covers the change" in result.stdout
 
 
 def test_rerunning_verify_and_review_on_the_edited_change_lets_it_pass(run_cli, ready):
-    write(ready / "src" / "app.py", "def main():\n    return 99\n")
+    write(ready / "README.md", "# demo\nedited\n")
     commit_all(ready, "edited")
     assert run_cli("pass", RUN, cwd=ready).returncode == 1
     diff = change_of(ready)
     put(ready, "verify", verify_record(diff=diff))
+    run_entry(ready, "verify", diff)  # the commands ran again, on the edited change
     put(ready, "review", review_record(diff=diff))
     assert run_cli("pass", RUN, cwd=ready).returncode == 0
 
 
 def test_the_stale_change_is_reported_only_once_every_gate_passes(run_cli, ready):
-    write(ready / "src" / "app.py", "def main():\n    return 99\n")
+    write(ready / "README.md", "# demo\nedited\n")
     commit_all(ready, "edited")
     put(ready, "verify", verify_record(green=False, diff=hashlib.sha256(b"x").hexdigest()))
     result = run_cli("pass", RUN, cwd=ready)
@@ -332,31 +335,34 @@ def test_the_stale_change_is_reported_only_once_every_gate_passes(run_cli, ready
 
 
 def test_the_review_of_the_tests_is_not_compared_with_the_change_of_head(run_cli, adopted):
+    write_test_file(adopted)
+    commit_all(adopted, "the tests")
     diff = change_of(adopted)
     put(adopted, "intake", intake_record("code.M", adopted))
-    from rundata import spec_record, written_tests_record
-
     put(adopted, "plan", spec_record())
     put(adopted, "tests", written_tests_record())
+    run_entry(adopted, "tests", None, exit_code=1, cmd=FAILING)
     put(adopted, "test-review", review_record(target="tests", diff=hashlib.sha256(b"the change before the build").hexdigest()))
     put(adopted, "build", build_note_record())
     put(adopted, "verify", verify_record(diff=diff))
+    run_entry(adopted, "verify", diff)
     put(adopted, "review", review_record(diff=diff))
     result = run_cli("pass", RUN, cwd=adopted)
     assert result.returncode == 0, result.stdout
 
 
 def test_a_run_without_verify_or_review_needs_no_hash(run_cli, adopted):
-    write(adopted / "plumbline.toml", 'schema = 1\n\n[matrix.docs]\nstages = ["intake", "reduce"]\n')
-    commit_all(adopted, "docs go straight to reduce")
-    put(adopted, "intake", intake_record("docs", merge_base="89abcdef0123456789abcdef0123456789abcdef"))  # not even a real merge base
+    write(adopted / "plumbline.toml", 'schema = 1\n\n[matrix.docs]\nstages = ["intake", "reduce"]\n\n[matrix.config]\nstages = ["intake", "reduce"]\n')
+    commit_all(adopted, "docs and config go straight to reduce")
+    begin(adopted, "docs")
     assert run_cli("pass", RUN, cwd=adopted).returncode == 0
 
 
 def test_a_merge_base_that_is_gone_is_reported_not_crashed_on(run_cli, ready):
     put(ready, "intake", intake_record("docs", ready, merge_base="89abcdef0123456789abcdef0123456789abcdef"))
     result = run_cli("pass", RUN, cwd=ready)
-    assert result.returncode == 1 and "cannot hash the change from 89abcdef0123" in result.stdout
+    assert result.returncode == 1
+    assert "the change could not be measured again: base '89abcdef0123456789abcdef0123456789abcdef' is not a commit in this repository" in result.stdout
 
 
 # --- the ledger pins what pass wrote
@@ -493,9 +499,10 @@ def test_status_says_when_the_pass_does_not_hold_up(run_cli, passed):
     assert f"HEAD {head(passed)[:7]}: NOT covered" in out and "does not hold up: records altered after the pass" in out
 
 
-def test_the_coverage_helper_without_a_project_still_trusts_the_file_for_internal_callers(passed):
+def test_the_coverage_helper_needs_the_project_so_that_no_caller_trusts_the_pass_file_alone(passed):  # C-25
     run_path(passed, RUN, "review.json").unlink()
-    assert pl.coverage(passed, head(passed))[0] == "pass"  # the hook and status pass the project; nothing else asks
+    with pytest.raises(TypeError):
+        pl.coverage(passed, head(passed))
     assert pl.coverage(passed, head(passed), pl.load_project(passed))[0] is None
 
 

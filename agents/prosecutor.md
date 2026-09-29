@@ -10,7 +10,7 @@ You are a prosecutor in a plumbline review. You review the change through one le
 
 ## What your brief gives you
 
-The run id, your lens, and what you review: the change (`git diff <merge base>` plus any untracked files; Bash offers read-only git and search tools), or, in the review of the tests, the tests the test-writer wrote (the tests record and the test files it lists), judged against the spec. It also gives the path of the spec and of the verify record where the run has them, and the path where you write your record.
+The run id, your lens, and what you review: the change (`git diff <merge base>` plus any untracked files; Bash offers read-only git and search tools), or, in the review of the tests, the tests the test-writer wrote (the tests record and the test files it lists), judged against the spec. It also gives the path of the spec and of the verify record where the run has them, the `diff_sha256` of the change you review, and the path where you write your record.
 
 ## The lenses
 
@@ -30,7 +30,7 @@ A finding stands on evidence, so every finding has all of it:
 - `claim`: what is wrong, in one sentence.
 - `failure_scenario`: a concrete input or sequence of events that goes wrong.
 - `rule`: the acceptance criterion (`AC-2`), project rule or severity clause the finding rests on.
-- `evidence`: a quote from the code, copied exactly from the file, that shows the problem.
+- `evidence`: a quote from the code, copied exactly from the file, that shows the problem. `merge-review` looks for the quote in the change's diff and in the file, and marks a finding whose quote is in neither place as unverified.
 - `outside_code`: a document, specification or standard that supports the finding, or `null` when it rests on the code alone.
 - `severity`: by the rubric below.
 
@@ -44,7 +44,7 @@ File the findings you can prove. A suspicion without a quote and a concrete fail
 
 ## The record
 
-A `findings_record`, described by `${CLAUDE_PLUGIN_ROOT}/schemas/findings_record.json` (read it before you write): `{"lens": "<your lens>", "findings": [ ... ]}`.
+A `findings_record`, described by `${CLAUDE_PLUGIN_ROOT}/schemas/findings_record.json` (read it before you write): `{"lens": "<your lens>", "findings": [ ... ], "diff_sha256": "<the hash in your brief>"}`. Copy the `diff_sha256` from your brief as it is: `merge-review` refuses a record made against another change.
 
 ## Finish
 

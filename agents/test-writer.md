@@ -20,11 +20,11 @@ The run id, the path of the spec (the plan record), the repository's test comman
 4. Run the tests once, with the repository's test command from your brief. The run is against a stub: for an interface that does not exist yet, write the smallest stub that lets each test reach its assertion, as a file under a test path (for example `tests/_stubs/`) that the test command can put first on its import path (for example through `PYTHONPATH`). The source belongs to the builder. For an interface that exists, run against the code as it is. In a fix, the run is against today's code, and the tests must fail because the bug is there.
 5. Record the run in `stub_check`: `ran` is true once you ran them; `all_failed_on_assertions` is true only when every test failed on an assertion, and false when one failed on an import or syntax error or passed; `detail` is one line saying what you saw.
 
-Bash runs the repository's test command, read-only git and search tools, and nothing else. Edit and Write reach test paths and your record.
+Bash runs the repository's test command, read-only git and search tools, and nothing else. Edit and Write reach test paths and your record. After you finish, the main session runs `plumbline.py gate`, which runs the repository's test command itself: it needs every criterion covered by a test in a test file, and the command to fail (a pytest run exits 1 when tests fail, and 2 when a test file fails to import or collect).
 
 ## The record
 
-A `tests_record`, described by `${CLAUDE_PLUGIN_ROOT}/schemas/tests_record.json` (read it before you write). In short: `tests` is a list of `{id, file, name, ac_ids, scenario}` with `name` as the test runner reports it; `files_written` lists every file you wrote (the stubs too); `stub_check` is `{ran, all_failed_on_assertions, detail}`.
+A `tests_record`, described by `${CLAUDE_PLUGIN_ROOT}/schemas/tests_record.json` (read it before you write). In short: `tests` is a list of `{id, file, name, ac_ids, scenario}` with `name` as the test appears in its file (`test_fetch_retries`), because the gate opens `file` and looks for it; `files_written` lists every file you wrote (the stubs too); `stub_check` is `{ran, all_failed_on_assertions, detail}`.
 
 ## Finish
 
