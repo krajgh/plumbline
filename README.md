@@ -47,6 +47,12 @@ The command line, `python3 scripts/plumbline.py`:
 | `check-record TYPE FILE` | validates a record against its schema |
 | `render FILE [--type TYPE]` | prints a record as markdown |
 | `init [--project PATH] [--graft]` | adopts a repository |
+| `merge-review RUN STAGE [--round N]` | builds a review stage's `review_record` from its prosecutors', defenders' and detective's records, applying the survival rule |
+| `gate RUN STAGE` | evaluates the stage's gate mechanically; exit 0 if it passes, 1 if not; the evaluation is entered in the ledger |
+| `tokens RUN` | prints, as JSON, the output, fresh input and cache reads of the run's agents per model |
+| `pass RUN` | writes the `pass_record` for HEAD, if the working tree is clean and every gate of the run passed |
+| `override --reason TEXT [--run RUN]` | writes an override record for HEAD (a reason of at least 20 characters); only when the builder asks for it |
+| `status [--run RUN]` | shows the latest run, its stages and gates, and whether HEAD is covered |
 
 ### Repository overrides
 
@@ -83,13 +89,44 @@ Every stage writes one record. The schemas in `schemas/` use a small JSON Schema
 | `tests_record` | test-writer | the tests, which criteria they cover, the stub check |
 | `build_note` | builder | files changed, criteria addressed, assumptions |
 | `verify_record` | verifier | commands run, test counts, failing criteria, mechanical checks |
-| `review_record` | a review unit | findings, defenses, survivors, gaps |
+| `review_record` | a review unit, by `merge-review` | findings, defenses, survivors, gaps |
+| `findings_record` | each prosecutor | one lens and its findings |
+| `defense_record` | each defender | one defender's verdict on each finding |
+| `gaps_record` | the detective | what is missing, once no blocker stands |
 | `pass_record` | reduce | stage results, tokens, the verdict |
 | `override_record` | the builder | a push without a passing run, with a reason |
 
+## Runs, gates and the pass record
+
+A run is the directory `.plumbline/runs/<run-id>/` in the checkout:
+
+```
+.plumbline/runs/<run-id>/<stage-id>.json                    the stage's record
+.plumbline/runs/<run-id>/<stage-id>/round-<n>/<name>.json   a review unit's per-agent records
+.plumbline/runs/<run-id>/ledger.jsonl                       only ever appended to
+.plumbline/pass/<HEAD>.json                                 the pass record that lets HEAD be pushed
+.plumbline/pass/<HEAD>.override.json                        or an override record
+```
+
+**Gates** are mechanical. `gate RUN STAGE` first requires the stage's record to exist and validate, then checks it: `spec_complete` (at least one acceptance criterion, each with a test plan entry), `acs_covered` (each criterion appears in some test's `ac_ids`), `tests_fail_on_stub` (the stub check ran and every test failed on an assertion), `verify_green` (`green`), `no_surviving_blockers` (`blockers_surviving` is 0), and `all_gates_passed` (every other stage of the run's row has a valid record and passed its gate at its last evaluation in the ledger, with its record unchanged since).
+
+**A review unit** writes one record per agent under `<stage-id>/round-<n>/`, and `merge-review` builds the stage's record. A finding survives when at least `survive_if_unrefuted_by` of the stage's `defenders` did not refute it (a majority when the stage sets none). A defender refutes only with a verdict of `refuted` and a quote of the code; silence, a concession, or a refutation without a quote does not count. A stage without defenders lets every finding survive. Duplicate finding ids, a missing lens and a defense of an unknown finding are errors, never silently repaired.
+
+**`pass RUN`** needs a clean working tree apart from `.plumbline/`, so commit first. It evaluates every gate afresh, then writes the `pass_record` (with the tokens of the run's agents) to the run and to `.plumbline/pass/<HEAD>.json`. **`override --reason`** writes `.plumbline/pass/<HEAD>.override.json` instead, and never overwrites one.
+
+## Hooks
+
+`hooks/hooks.json` registers three hooks, each command ending in `|| true`. All three are silent, and allow everything, in a repository without `plumbline.toml`, and on any error.
+
+- **SubagentStop**, for plumbline agents only (`plumbline:planner`, `test-writer`, `builder`, `verifier`, `prosecutor`, `defender`, `detective`): the agent's final reply must end with `RECORD: <path>`, a record under `.plumbline/runs/<run-id>/` that validates against that agent's record type. Until it does, the stop is blocked, at most 3 times; then the agent is let go and the ledger marks the record invalid. Every stop that is let go is entered in `ledger.jsonl` with the agent's id, type, stage, record and transcript path. Because `|| true` turns exit status 2 into 0, a block is delivered as `{"decision": "block", "reason": ...}` on stdout (the script also writes the reason to stderr and exits 2).
+- **PreToolUse on Bash**: `git push` and `gh pr create` are denied unless HEAD has a valid pass or override record. `git commit` is denied when what it would commit adds a symlink, an absolute home path (a `home` or `Users` directory at the root, then a user name and a slash), or a key-shaped secret (`sk-ant-` and 20 more characters). The command line is parsed, so `git push --dry-run` and `echo git push` are not pushes. A push in the same command line as a commit is denied, because the new commit cannot have a record yet.
+- **PreToolUse on Read, Grep and Glob, for `plumbline:builder` only**: the builder works blind to the tests. A path matching the pipeline's `tests` type, or listed in the newest run's tests record (that record itself included), is denied, and so is a Grep or Glob without an explicit path, or with a path that leads to a directory holding tests.
+
+A deny uses `permissionDecision: "deny"`, which the model sees as `PreToolUse:<Tool> hook error: <reason>`.
+
 ## Status
 
-Phase 1 of 5, the foundation: the repository, the pipeline definition and its validator, the record schemas, the command line, session start, and `/plumbline:init`. Agents, gates, graft and CI arrive in later phases; nothing here yet runs a pipeline or blocks a push. Not yet published. The tests run with `uv run --with pytest pytest -q`.
+Phase 2a of 5, the enforcement core: on top of the foundation, the gates, the review-unit records and `merge-review`, `pass`, `override`, `status` and `tokens`, and the hooks that validate agents' records, gate pushes, check commits and blind the builder. The agents and the `/plumbline:run` recipe that drives a pipeline arrive in phase 2b, graft and CI later. Not yet published. The tests run with `uv run --with pytest pytest -q`.
 
 ## Licence
 

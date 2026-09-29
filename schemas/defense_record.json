@@ -1,0 +1,43 @@
+{
+  "description": "One defender's record: a verdict on each finding of the round. A defender refutes a finding only by quoting the code that shows it is wrong; a refutation without a quote does not count.",
+  "type": "object",
+  "required": ["defender", "defenses"],
+  "additionalProperties": false,
+  "properties": {
+    "defender": {
+      "description": "This defender's name, the same in every entry (for example defender-1).",
+      "type": "string",
+      "minLength": 1
+    },
+    "defenses": {
+      "description": "One entry per finding of the round.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["finding_id", "defender", "verdict", "quote", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "finding_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "defender": {
+            "type": "string",
+            "minLength": 1
+          },
+          "verdict": {
+            "enum": ["refuted", "conceded"]
+          },
+          "quote": {
+            "description": "The line of code the defender relies on.",
+            "type": "string"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

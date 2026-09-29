@@ -8,7 +8,10 @@ from pathlib import Path
 
 import pytest
 
+import plumbline as pl
 from helpers import REPO, clean_env
+from hookdata import bash_payload, stop_payload
+from rundata import adopt, put
 
 PLUGIN = REPO / ".claude-plugin" / "plugin.json"
 MARKETPLACE = REPO / ".claude-plugin" / "marketplace.json"
@@ -40,7 +43,7 @@ def frontmatter(path):
 def test_plugin_json_says_what_the_task_specified():
     plugin = load(PLUGIN)
     assert plugin["name"] == "plumbline"
-    assert plugin["version"] == "0.1.0"
+    assert plugin["version"] == "0.2.0"
     assert plugin["author"] == {"name": "krajgh", "url": "https://github.com/krajgh"}
     assert plugin["homepage"] == "https://github.com/krajgh/plumbline"
     assert plugin["repository"] == "https://github.com/krajgh/plumbline"
@@ -87,53 +90,113 @@ def hook_commands():
                 yield event, group, hook
 
 
-def test_hooks_json_registers_session_start_with_no_matcher_and_a_10_second_timeout():
+def hook_of(event):
+    [(_, _, hook)] = [entry for entry in hook_commands() if entry[0] == event]
+    return hook
+
+
+def test_hooks_json_registers_session_start_pre_tool_use_and_subagent_stop():
     hooks = load(HOOKS)["hooks"]
-    assert list(hooks) == ["SessionStart"]
+    assert list(hooks) == ["SessionStart", "PreToolUse", "SubagentStop"]
     [group] = hooks["SessionStart"]
     assert "matcher" not in group
     [hook] = group["hooks"]
     assert hook["type"] == "command" and hook["timeout"] == 10
+    [group] = hooks["PreToolUse"]
+    assert group["matcher"] == "Bash|PowerShell|Read|Grep|Glob"  # letters and | only: an exact list of tool names
+    [hook] = group["hooks"]
+    assert hook["type"] == "command" and hook["timeout"] == 30
+    [group] = hooks["SubagentStop"]
+    assert "matcher" not in group  # the script tells plumbline agents from the others
+    [hook] = group["hooks"]
+    assert hook["type"] == "command" and hook["timeout"] == 30
 
 
 def test_every_hook_command_ends_in_or_true():
     commands = [hook["command"] for _, _, hook in hook_commands()]
-    assert commands
+    assert len(commands) == 3
     for command in commands:
         assert command.endswith(" || true"), command
 
 
-def test_the_session_start_command_runs_the_script_from_the_plugin_root_quoted():
-    [(_, _, hook)] = list(hook_commands())
-    assert hook["command"] == 'python3 "${CLAUDE_PLUGIN_ROOT}/scripts/session_start.py" || true'
-    assert (REPO / "scripts" / "session_start.py").is_file()
+def test_each_hook_command_runs_its_script_from_the_plugin_root_quoted():
+    for event, script in (("SessionStart", "session_start"), ("PreToolUse", "pre_tool_use"), ("SubagentStop", "subagent_stop")):
+        assert hook_of(event)["command"] == f'python3 "${{CLAUDE_PLUGIN_ROOT}}/scripts/{script}.py" || true'
+        assert (REPO / "scripts" / f"{script}.py").is_file()
 
 
-def test_the_hook_command_runs_under_sh_from_a_plugin_root_with_a_space(tmp_path, home):
-    # exactly as Claude Code runs it: the command string through a shell, the plugin root in the environment
+def plugin_root_with_a_space(tmp_path):
     root = tmp_path / "with space" / "plumbline"
     for name in ("scripts", "schemas", "pipeline"):
         shutil.copytree(REPO / name, root / name, ignore=shutil.ignore_patterns("__pycache__"))
+    return root
+
+
+def run_registered(event, payload, root, cwd, home, tmp_path):
+    """Exactly as Claude Code runs it: the command string through a shell, the plugin root in the environment."""
+    return subprocess.run(
+        hook_of(event)["command"], shell=True, cwd=cwd, capture_output=True, text=True,
+        env=clean_env(home, CLAUDE_PLUGIN_ROOT=str(root), CLAUDE_PROJECT_DIR=str(cwd), GIT_CEILING_DIRECTORIES=str(tmp_path)),
+        input=payload if isinstance(payload, str) else json.dumps(payload),
+    )
+
+
+def test_the_hook_command_runs_under_sh_from_a_plugin_root_with_a_space(tmp_path, home):
     project = tmp_path / "project"
     project.mkdir()
-    [(_, _, hook)] = list(hook_commands())
-    result = subprocess.run(
-        hook["command"], shell=True, cwd=project, capture_output=True, text=True,
-        env=clean_env(home, CLAUDE_PLUGIN_ROOT=str(root), CLAUDE_PROJECT_DIR=str(project), GIT_CEILING_DIRECTORIES=str(tmp_path)),
-        input='{"hook_event_name": "SessionStart", "source": "startup"}',
-    )
+    result = run_registered("SessionStart", {"hook_event_name": "SessionStart", "source": "startup"}, plugin_root_with_a_space(tmp_path), project, home, tmp_path)
     assert result.returncode == 0, result.stderr
     context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
     assert "plumbline:subagent-discipline" in context
 
 
-def test_the_or_true_keeps_a_broken_hook_from_failing_the_session(tmp_path, home):
-    [(_, _, hook)] = list(hook_commands())
+def test_the_registered_pre_tool_use_command_denies_through_the_shell(tmp_path, home, repo):
+    adopt(repo)
+    result = run_registered("PreToolUse", bash_payload(repo, "git push origin feature"), plugin_root_with_a_space(tmp_path), repo, home, tmp_path)
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny" and "has no pass or override record" in output["permissionDecisionReason"]
+
+
+def test_the_registered_subagent_stop_command_blocks_through_the_or_true_as_json_on_stdout(tmp_path, home, repo):
+    # `|| true` turns the script's exit status 2 into 0: what blocks is the decision on stdout
+    adopt(repo)
+    put(repo, "plan", {"goal": ""})
+    payload = stop_payload(repo, message="RECORD: .plumbline/runs/r1/plan.json")
+    result = run_registered("SubagentStop", payload, plugin_root_with_a_space(tmp_path), repo, home, tmp_path)
+    assert result.returncode == 0
+    decision = json.loads(result.stdout)
+    assert decision["decision"] == "block" and "not a valid spec" in decision["reason"]
+
+
+def test_the_registered_commands_let_everything_through_when_nothing_applies(tmp_path, home, repo):
+    root = plugin_root_with_a_space(tmp_path)  # the repository has not adopted plumbline
+    for event, payload in (("PreToolUse", bash_payload(repo, "git push")), ("SubagentStop", stop_payload(repo, message="no record"))):
+        result = run_registered(event, payload, root, repo, home, tmp_path)
+        assert (result.returncode, result.stdout, result.stderr) == (0, "", ""), event
+
+
+@pytest.mark.parametrize("event", ["SessionStart", "PreToolUse", "SubagentStop"])
+def test_the_or_true_keeps_a_broken_hook_from_failing_the_session(tmp_path, home, event):
     result = subprocess.run(
-        hook["command"], shell=True, cwd=tmp_path, capture_output=True, text=True,
-        env=clean_env(home, CLAUDE_PLUGIN_ROOT=str(tmp_path / "nowhere")),
+        hook_of(event)["command"], shell=True, cwd=tmp_path, capture_output=True, text=True,
+        env=clean_env(home, CLAUDE_PLUGIN_ROOT=str(tmp_path / "nowhere")), input="{}",
     )
-    assert result.returncode == 0  # the script was not found, and the hook still exits 0
+    assert result.returncode == 0  # the script was not found (python exits 2 for that), and the hook still exits 0
+    assert result.stdout == ""  # and says nothing that could be read as a decision
+
+
+@pytest.mark.parametrize("script", ["pre_tool_use", "subagent_stop"])
+def test_a_hook_script_that_cannot_import_plumbline_still_exits_0_and_says_nothing(tmp_path, home, script):
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    shutil.copy(REPO / "scripts" / f"{script}.py", broken / f"{script}.py")
+    (broken / "plumbline.py").write_text("raise SystemExit('this Python is too old')\n", encoding="utf-8")
+    payload = bash_payload(tmp_path, "git push") if script == "pre_tool_use" else stop_payload(tmp_path, message="no record")
+    result = subprocess.run(
+        ["python3", str(broken / f"{script}.py")], cwd=tmp_path, capture_output=True, text=True, env=clean_env(home), input=json.dumps(payload),
+    )
+    assert (result.returncode, result.stdout) == (0, "")
 
 
 # --- skills
@@ -210,13 +273,16 @@ def test_gitignore_ignores_python_caches():
 def test_the_layout_matches_the_spec():
     for path in (
         ".claude-plugin/plugin.json", ".claude-plugin/marketplace.json", "LICENSE", "NOTICE", "README.md",
-        "hooks/hooks.json", "scripts/plumbline.py", "scripts/session_start.py", "pipeline/default.toml",
-        "skills/subagent-discipline/SKILL.md", "skills/init/SKILL.md",
+        "hooks/hooks.json", "scripts/plumbline.py", "scripts/session_start.py", "scripts/subagent_stop.py", "scripts/pre_tool_use.py",
+        "pipeline/default.toml", "skills/subagent-discipline/SKILL.md", "skills/init/SKILL.md",
     ):
         assert (REPO / path).is_file(), path
-    assert not (REPO / "agents").exists()  # agents arrive in phase 2
+    assert not (REPO / "agents").exists()  # the agents arrive in phase 2b
     assert sorted(p.name for p in (REPO / "schemas").glob("*.json")) == sorted(
-        f"{n}.json" for n in ("change_class", "spec", "tests_record", "build_note", "verify_record", "review_record", "pass_record", "override_record")
+        f"{n}.json" for n in (
+            "change_class", "spec", "tests_record", "build_note", "verify_record", "review_record", "pass_record", "override_record",
+            "findings_record", "defense_record", "gaps_record",
+        )
     )
 
 

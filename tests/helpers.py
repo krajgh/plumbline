@@ -9,6 +9,8 @@ REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / "scripts"
 CLI = SCRIPTS / "plumbline.py"
 SESSION_START = SCRIPTS / "session_start.py"
+SUBAGENT_STOP = SCRIPTS / "subagent_stop.py"
+PRE_TOOL_USE = SCRIPTS / "pre_tool_use.py"
 DEFAULT_TOML = REPO / "pipeline" / "default.toml"
 
 GIT_IDENTITY = {
@@ -63,11 +65,12 @@ def default_pipeline() -> dict:
     return tomllib.loads(DEFAULT_TOML.read_text(encoding="utf-8"))
 
 
-def run_script(script: Path, args, cwd: Path, home: Path, **env_extra) -> subprocess.CompletedProcess:
+def run_script(script: Path, args, cwd: Path, home: Path, stdin: str | None = None, **env_extra) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(script), *map(str, args)],
         cwd=str(cwd),
         capture_output=True,
         text=True,
         env=clean_env(home, **env_extra),
+        input=stdin,
     )

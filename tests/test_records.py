@@ -9,6 +9,7 @@ from samples import RECORD_TYPES, sample
 SPEC_TYPES = {
     "change_class", "spec", "tests_record", "build_note",
     "verify_record", "review_record", "pass_record", "override_record",
+    "findings_record", "defense_record", "gaps_record",
 }
 
 
@@ -71,6 +72,25 @@ def test_the_severity_rubric_is_in_the_review_schema_description():
     assert "MAJOR: wrong behaviour on a realistic path" in text
     assert "MINOR: an edge case" in text
     assert severity["enum"] == ["BLOCKING", "MAJOR", "MINOR"]
+
+
+def test_the_per_agent_review_records_use_the_review_records_item_shapes():
+    # each is a piece of a review_record; the shapes are written out three times
+    # because the schema subset has no references, so this is what keeps them equal
+    review = pl.load_schema("review_record")["properties"]
+    assert pl.load_schema("findings_record")["properties"]["findings"]["items"] == review["findings"]["items"]
+    assert pl.load_schema("defense_record")["properties"]["defenses"]["items"] == review["defenses"]["items"]
+    assert pl.load_schema("gaps_record")["properties"]["gaps"]["items"] == review["gaps"]["items"]
+    assert pl.load_schema("findings_record")["properties"]["lens"]["enum"] == review["lenses"]["items"]["enum"]
+
+
+def test_a_findings_record_has_one_lens_and_a_defense_record_one_defender():
+    assert pl.load_schema("findings_record")["required"] == ["lens", "findings"]
+    assert pl.load_schema("defense_record")["required"] == ["defender", "defenses"]
+    assert pl.load_schema("gaps_record")["required"] == ["gaps"]
+    assert_error(errors_after("findings_record", lambda r: r.update(lens=["security"])), "$.lens", "is not one of")
+    assert_error(errors_after("findings_record", lambda r: r.update(lens="vibes")), "$.lens", "is not one of")
+    assert_error(errors_after("defense_record", lambda r: r.update(defender="")), "$.defender", "at least 1 characters")
 
 
 def test_an_unknown_record_type_is_an_error_listing_the_known_ones():
@@ -161,6 +181,9 @@ def test_an_extra_top_level_key_is_reported(name):
         ("review_record", "$.gaps[0].bogus", lambda r: r["gaps"][0]),
         ("pass_record", "$.stages[1].bogus", lambda r: r["stages"][1]),
         ("pass_record", "$.tokens.bogus", lambda r: r["tokens"]),
+        ("findings_record", "$.findings[0].bogus", lambda r: r["findings"][0]),
+        ("defense_record", "$.defenses[1].bogus", lambda r: r["defenses"][1]),
+        ("gaps_record", "$.gaps[0].bogus", lambda r: r["gaps"][0]),
     ],
 )
 def test_an_extra_key_in_a_nested_object_is_reported_with_its_path(name, path, container):
@@ -179,6 +202,9 @@ def test_an_extra_key_in_a_nested_object_is_reported_with_its_path(name, path, c
         ("review_record", "$.gaps[1].ac", lambda r: r["gaps"][1].pop("ac")),
         ("pass_record", "$.tokens.by_model", lambda r: r["tokens"].pop("by_model")),
         ("pass_record", "$.stages[0].gate", lambda r: r["stages"][0].pop("gate")),
+        ("findings_record", "$.findings[1].outside_code", lambda r: r["findings"][1].pop("outside_code")),
+        ("defense_record", "$.defenses[0].quote", lambda r: r["defenses"][0].pop("quote")),
+        ("gaps_record", "$.gaps[1].ac", lambda r: r["gaps"][1].pop("ac")),
     ],
 )
 def test_a_missing_nested_key_is_reported_with_its_path(name, path, delete):
@@ -211,6 +237,10 @@ def test_a_missing_nested_key_is_reported_with_its_path(name, path, delete):
         ("pass_record", "$.stages[0].rounds", lambda r: r["stages"][0].update(rounds=-1)),
         ("pass_record", "$.tokens.by_model", lambda r: r["tokens"].update(by_model=[])),
         ("override_record", "$.stages_skipped[1]", lambda r: r["stages_skipped"].__setitem__(1, 7)),
+        ("findings_record", "$.findings[0].line", lambda r: r["findings"][0].update(line=0)),
+        ("findings_record", "$.findings", lambda r: r.update(findings={})),
+        ("defense_record", "$.defenses[0].reason", lambda r: r["defenses"][0].update(reason="")),
+        ("gaps_record", "$.gaps", lambda r: r.update(gaps="none")),
     ],
 )
 def test_wrong_types_and_ranges_in_nested_fields_name_their_path(name, path, mutate):
@@ -232,6 +262,10 @@ def test_wrong_types_and_ranges_in_nested_fields_name_their_path(name, path, mut
         ("review_record", "$.defenses[0].verdict", lambda r: r["defenses"][0].update(verdict="maybe")),
         ("review_record", "$.gaps[0].kind", lambda r: r["gaps"][0].update(kind="typo")),
         ("pass_record", "$.verdict", lambda r: r.update(verdict="maybe")),
+        ("findings_record", "$.findings[1].severity", lambda r: r["findings"][1].update(severity="SEVERE")),
+        ("findings_record", "$.findings[0].lens", lambda r: r["findings"][0].update(lens="vibes")),
+        ("defense_record", "$.defenses[0].verdict", lambda r: r["defenses"][0].update(verdict="maybe")),
+        ("gaps_record", "$.gaps[0].kind", lambda r: r["gaps"][0].update(kind="typo")),
     ],
 )
 def test_a_bad_enum_value_is_reported_with_its_path(name, path, mutate):
@@ -254,6 +288,7 @@ def test_a_bad_ac_id_pattern_is_reported_wherever_an_ac_is_named(bad):
     assert_error(errors_after("build_note", lambda r: r["acs_addressed"].append(bad)), "$.acs_addressed[2]")
     assert_error(errors_after("verify_record", lambda r: r["failing_acs"][0].update(ac=bad)), "$.failing_acs[0].ac")
     assert_error(errors_after("review_record", lambda r: r["gaps"][0].update(ac=bad)), "$.gaps[0].ac")
+    assert_error(errors_after("gaps_record", lambda r: r["gaps"][0].update(ac=bad)), "$.gaps[0].ac")
 
 
 @pytest.mark.parametrize("good", ["AC-1", "AC-0", "AC-42", "AC-1000"])
@@ -477,6 +512,12 @@ def test_render_carries_the_records_content():
     assert "The pipeline cannot run offline" in pl.render_record("override_record", sample("override_record"))
     assert "`src/app.py`" in pl.render_record("build_note", sample("build_note"))
     assert "covers AC-1" in pl.render_record("tests_record", sample("tests_record"))
+    findings = pl.render_record("findings_record", sample("findings_record"))
+    assert findings.startswith("# Findings through the correctness lens") and "[BLOCKING]" in findings and "`src/app.py:14`" in findings
+    defenses = pl.render_record("defense_record", sample("defense_record"))
+    assert defenses.startswith("# Defenses by defender-1") and "correctness-1, defender-1: conceded" in defenses
+    gaps = pl.render_record("gaps_record", sample("gaps_record"))
+    assert gaps.startswith("# Gaps") and "**G-1** (uncovered_ac, AC-2) No test covers AC-2." in gaps
 
 
 def test_render_escapes_pipes_in_table_cells():

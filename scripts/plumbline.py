@@ -9,10 +9,21 @@ Standard library only (Python 3.11 or newer).
     check-record TYPE FILE
     render FILE [--type TYPE]
     init [--project PATH] [--graft]
+    merge-review RUN STAGE [--round N] [--project PATH]
+    gate RUN STAGE [--project PATH]
+    tokens RUN [--project PATH]
+    pass RUN [--project PATH]
+    override --reason TEXT [--run RUN] [--project PATH]
+    status [--run RUN] [--project PATH]
 
-Exit status: 0 on success; 1 when what was checked is invalid (or init
-refuses to overwrite); 2 when the command could not run (bad arguments, not a
-git repository, an unreadable file).
+A run is the directory .plumbline/runs/<run-id>/: one <stage-id>.json per stage,
+the per-agent records of a review unit under <stage-id>/round-<n>/, and a
+ledger.jsonl that only ever grows.
+
+Exit status: 0 on success; 1 when what was checked is invalid, a gate fails, or
+a command refuses (init over an existing plumbline.toml, pass on a dirty tree);
+2 when the command could not run (bad arguments, not a git repository, an
+unreadable file, no such run).
 """
 from __future__ import annotations
 
@@ -25,7 +36,9 @@ import argparse
 import copy
 import datetime as dt
 import functools
+import hashlib
 import json
+import os
 import re
 import subprocess
 import tomllib
@@ -39,6 +52,8 @@ PIPELINE_DIR = PLUGIN_ROOT / "pipeline"
 CONFIG_FILE = "plumbline.toml"
 DEFAULT_PIPELINE = "default"
 RUNS_DIR = ".plumbline/runs"
+PASS_DIR = ".plumbline/pass"
+LEDGER_FILE = "ledger.jsonl"
 IGNORE_ENTRY = ".plumbline/"
 IGNORE_EQUIVALENTS = {".plumbline", ".plumbline/", "/.plumbline", "/.plumbline/"}
 
@@ -55,6 +70,20 @@ KNOWN_GATES = (
     "all_gates_passed",
 )
 REVIEW_ONLY_KEYS = ("target", "lenses", "defenders", "survive_if_unrefuted_by", "detective")
+
+# The plumbline agents (agent type `plumbline:<name>`) and the record each one
+# ends its work with; the SubagentStop hook validates against it.
+AGENT_PREFIX = "plumbline:"
+AGENT_RECORDS = {
+    "planner": "spec",
+    "test-writer": "tests_record",
+    "builder": "build_note",
+    "verifier": "verify_record",
+    "prosecutor": "findings_record",
+    "defender": "defense_record",
+    "detective": "gaps_record",
+}
+REVIEW_PART_TYPES = ("findings_record", "defense_record", "gaps_record")
 ID_PATTERN = r"^[a-z][a-z0-9_-]*$"
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
@@ -1045,18 +1074,24 @@ MARKERS = {
     "stub_check": "tests_record",
     "acs_addressed": "build_note",
     "failing_acs": "verify_record",
-    "findings": "review_record",
+    "survivors": "review_record",
+    "lens": "findings_record",
+    "defender": "defense_record",
     "run_id": "pass_record",
     "stages_skipped": "override_record",
 }
 
 
 def infer_record_type(data) -> str:
-    """The record type, from a key only that type has."""
+    """The record type, from a key only that type has. A gaps_record has only
+    `gaps`, which a review_record has too, so it is what is left when no
+    review_record key is there."""
     if isinstance(data, dict):
         hits = {MARKERS[key] for key in data if key in MARKERS}
         if len(hits) == 1:
             return hits.pop()
+        if not hits and "gaps" in data:
+            return "gaps_record"
     raise PlumblineError("cannot tell the record type from its keys; pass --type")
 
 
@@ -1195,6 +1230,30 @@ def _render_verify_record(d) -> list[str]:
     return out
 
 
+def _finding_lines(f) -> list[str]:
+    lines = [
+        f"- **{_s(_get(f, 'id'))}** [{_s(_get(f, 'severity'))}] ({_s(_get(f, 'lens'))}) `{_s(_get(f, 'file'))}:{_s(_get(f, 'line'))}` {_s(_get(f, 'claim'))}",
+        f"  - Failure scenario: {_s(_get(f, 'failure_scenario'))}",
+        f"  - Rule: {_s(_get(f, 'rule'))}",
+        f"  - Evidence: `{_s(_get(f, 'evidence'))}`",
+    ]
+    if _get(f, "outside_code") is not None:
+        lines.append(f"  - Outside the code: {_s(_get(f, 'outside_code'))}")
+    return lines
+
+
+def _defense_text(x) -> str:
+    return f"{_s(_get(x, 'finding_id'))}, {_s(_get(x, 'defender'))}: {_s(_get(x, 'verdict'))}. {_s(_get(x, 'reason'))}"
+
+
+def _gap_text(g) -> str:
+    return (
+        f"**{_s(_get(g, 'id'))}** ({_s(_get(g, 'kind'))}"
+        + (f", {_s(_get(g, 'ac'))}" if _get(g, "ac") is not None else "")
+        + f") {_s(_get(g, 'detail'))}"
+    )
+
+
 def _render_review_record(d) -> list[str]:
     out = [
         f"# Review of {_s(d.get('target'))}, round {_s(d.get('round'))}",
@@ -1207,30 +1266,31 @@ def _render_review_record(d) -> list[str]:
     ]
     findings = _list(d.get("findings"))
     for f in findings:
-        out += [
-            f"- **{_s(_get(f, 'id'))}** [{_s(_get(f, 'severity'))}] ({_s(_get(f, 'lens'))}) `{_s(_get(f, 'file'))}:{_s(_get(f, 'line'))}` {_s(_get(f, 'claim'))}",
-            f"  - Failure scenario: {_s(_get(f, 'failure_scenario'))}",
-            f"  - Rule: {_s(_get(f, 'rule'))}",
-            f"  - Evidence: `{_s(_get(f, 'evidence'))}`",
-        ]
-        if _get(f, "outside_code") is not None:
-            out.append(f"  - Outside the code: {_s(_get(f, 'outside_code'))}")
+        out += _finding_lines(f)
     if not findings:
         out.append("None.")
-    out += _section(
-        "Defenses",
-        d.get("defenses"),
-        lambda x: f"{_s(_get(x, 'finding_id'))}, {_s(_get(x, 'defender'))}: {_s(_get(x, 'verdict'))}. {_s(_get(x, 'reason'))}",
-    )
+    out += _section("Defenses", d.get("defenses"), _defense_text)
     out += _section("Survivors", d.get("survivors"))
-    out += _section(
-        "Gaps",
-        d.get("gaps"),
-        lambda g: f"**{_s(_get(g, 'id'))}** ({_s(_get(g, 'kind'))}"
-        + (f", {_s(_get(g, 'ac'))}" if _get(g, "ac") is not None else "")
-        + f") {_s(_get(g, 'detail'))}",
-    )
+    out += _section("Gaps", d.get("gaps"), _gap_text)
     return out
+
+
+def _render_findings_record(d) -> list[str]:
+    out = [f"# Findings through the {_s(d.get('lens'))} lens", "", "## Findings", ""]
+    findings = _list(d.get("findings"))
+    for f in findings:
+        out += _finding_lines(f)
+    if not findings:
+        out.append("None.")
+    return out
+
+
+def _render_defense_record(d) -> list[str]:
+    return [f"# Defenses by {_s(d.get('defender'))}"] + _section("Defenses", d.get("defenses"), _defense_text)
+
+
+def _render_gaps_record(d) -> list[str]:
+    return ["# Gaps"] + _section("Gaps", d.get("gaps"), _gap_text)
 
 
 def _render_pass_record(d) -> list[str]:
@@ -1280,6 +1340,9 @@ RENDERERS = {
     "build_note": _render_build_note,
     "verify_record": _render_verify_record,
     "review_record": _render_review_record,
+    "findings_record": _render_findings_record,
+    "defense_record": _render_defense_record,
+    "gaps_record": _render_gaps_record,
     "pass_record": _render_pass_record,
     "override_record": _render_override_record,
 }
@@ -1296,6 +1359,688 @@ def render_record(type_name: str, data) -> str:
     if lines is None:
         lines = [f"# {type_name}", "", "```json", json.dumps(data, indent=2), "```"]
     return "\n".join(lines).rstrip() + "\n"
+
+
+# ----------------------------------------------------- runs and the ledger
+#
+# A run is a directory, .plumbline/runs/<run-id>/. It holds one <stage-id>.json
+# per stage, the per-agent records of a review unit under
+# <stage-id>/round-<n>/, and ledger.jsonl, which only ever grows: a line for
+# each plumbline agent that stopped (written by the SubagentStop hook) and a
+# line for each gate evaluation (written by `gate` and `pass`).
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def check_run_id(run_id: str) -> str:
+    if not RUN_ID_PATTERN.fullmatch(run_id):
+        raise PlumblineError(f"run id {run_id!r} must be letters, digits, '.', '_' or '-', and start with a letter or digit")
+    return run_id
+
+
+def run_dir(root: Path, run_id: str) -> Path:
+    return root / RUNS_DIR / check_run_id(run_id)
+
+
+def existing_run_dir(root: Path, run_id: str) -> Path:
+    path = run_dir(root, run_id)
+    if not path.is_dir():
+        raise PlumblineError(f"there is no run '{run_id}' in {root} (expected the directory {RUNS_DIR}/{run_id}/)")
+    return path
+
+
+def rel_path(root: Path, path: Path) -> str:
+    """`path` relative to `root`, with forward slashes; as given when it lies outside."""
+    for base, candidate in ((root, path), (root.resolve(), path.resolve())):
+        try:
+            return candidate.relative_to(base).as_posix()
+        except ValueError:
+            continue
+    return path.as_posix()
+
+
+def load_json_file(path: Path):
+    """(data, problem): the parsed JSON, or None and a one-line problem."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), None
+    except FileNotFoundError:
+        return None, "no such file"
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, f"cannot read: {exc}"
+    except ValueError as exc:
+        return None, f"not valid JSON: {exc}"
+
+
+def write_json_atomic(path: Path, data) -> None:
+    """Write `data` as JSON so that a reader sees the old file or the whole new one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.tmp")
+    temp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp, path)
+
+
+def file_sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def ledger_path(root: Path, run_id: str) -> Path:
+    return run_dir(root, run_id) / LEDGER_FILE
+
+
+def append_ledger(root: Path, run_id: str, entry: dict) -> None:
+    """Append one line to the run's ledger, in a single write."""
+    path = ledger_path(root, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps({"at": utc_now(), **entry}) + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def read_ledger(root: Path, run_id: str) -> list[dict]:
+    """The ledger's entries in order; a line that is not a JSON object is skipped."""
+    try:
+        text = ledger_path(root, run_id).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    entries = []
+    for line in text.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
+def latest_run_id(root: Path) -> str | None:
+    """The run touched most recently: the newest file in a run directory wins."""
+    best: tuple[float, str] | None = None
+    try:
+        candidates = [d for d in (root / RUNS_DIR).iterdir() if d.is_dir() and RUN_ID_PATTERN.fullmatch(d.name)]
+    except OSError:
+        return None
+    for directory in candidates:
+        try:
+            newest = max([directory.stat().st_mtime] + [child.stat().st_mtime for child in directory.iterdir()])
+        except OSError:
+            continue
+        if best is None or (newest, directory.name) > best:
+            best = (newest, directory.name)
+    return best[1] if best else None
+
+
+def head_sha(root: Path) -> str:
+    result = _git(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    sha = result.stdout.decode().strip()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", sha):
+        raise PlumblineError("the repository has no commits yet")
+    return sha
+
+
+def read_stage_record(root: Path, run_id: str, stage: dict) -> tuple[dict | None, list[str]]:
+    """A stage's record as (data, problems): the problems say the file is missing
+    or unreadable, or list the schema errors; data is None when there are any."""
+    path = run_dir(root, run_id) / f"{stage['id']}.json"
+    data, problem = load_json_file(path)
+    where = rel_path(root, path)
+    if problem:
+        return None, [f"{where}: {problem}"]
+    errors = check_record(stage["record"], data)
+    if errors:
+        return None, [f"{where}: {error}" for error in errors]
+    return data, []
+
+
+@dataclass
+class Run:
+    """A run's row and the stages it goes through, from its intake record."""
+
+    root: Path
+    run_id: str
+    row: str  # the matrix row, such as code.M
+    stages: list[dict]  # the row's stage definitions, in order
+    lenses: list[str] | None  # the row's own review lenses, when it sets any
+    note: str | None
+
+
+def load_run(project: Project, run_id: str) -> Run:
+    existing_run_dir(project.root, run_id)
+    all_stages = project.pipeline["stage"]
+    by_id = {s["id"]: s for s in all_stages}
+    intake = next((s for s in all_stages if s["record"] == "change_class"), None)
+    if intake is None:
+        raise PlumblineError("the pipeline has no stage that writes a change_class record")
+    data, problems = read_stage_record(project.root, run_id, intake)
+    if data is None:
+        raise PlumblineError(f"the run's intake record is not usable: {problems[0]}")
+    try:
+        row = find_row(project.pipeline, data["row"])
+        stages = [by_id[sid] for sid in row["stages"]]
+    except (KeyError, TypeError):
+        raise PlumblineError(f"the run's row {data['row']!r} is not a row of this repository's pipeline") from None
+    return Run(project.root, run_id, data["row"], stages, row.get("lenses"), row.get("note"))
+
+
+# ------------------------------------------------------------------ gates
+#
+# A gate is a mechanical check of a stage's record; no model is asked. Every
+# gate first requires the record to exist and validate against its schema.
+
+
+@dataclass
+class GateOutcome:
+    stage: str
+    gate: str | None
+    passed: bool
+    problems: list[str]
+    record: str  # the stage's record, relative to the repository root
+    record_sha256: str | None
+    data: dict | None = None  # the record itself, when it exists and validates
+
+
+def _gate_spec_complete(spec: dict, _load_spec) -> list[str]:
+    criteria = spec["acceptance_criteria"]
+    planned = {entry["ac"] for entry in spec["test_plan"]}
+    problems = [] if criteria else ["the spec has no acceptance criteria"]
+    problems += [f"{ac['id']} has no test_plan entry" for ac in criteria if ac["id"] not in planned]
+    return problems
+
+
+def _gate_acs_covered(tests: dict, load_spec) -> list[str]:
+    spec, problems = load_spec()
+    if spec is None:
+        return problems
+    covered = {ac for test in tests["tests"] for ac in test["ac_ids"]}
+    return [f"{ac['id']} is covered by no test" for ac in spec["acceptance_criteria"] if ac["id"] not in covered]
+
+
+def _gate_tests_fail_on_stub(tests: dict, _load_spec) -> list[str]:
+    stub = tests["stub_check"]
+    if not stub["ran"]:
+        return ["the stub check did not run"]
+    if not stub["all_failed_on_assertions"]:
+        return ["not every test failed on an assertion against the stubs"]
+    return []
+
+
+def _gate_verify_green(verify: dict, _load_spec) -> list[str]:
+    if verify["green"]:
+        return []
+    failing = [entry["ac"] for entry in verify["failing_acs"]]
+    return ["the verify record is not green" + (f" (failing: {', '.join(failing)})" if failing else "")]
+
+
+def _gate_no_surviving_blockers(review: dict, _load_spec) -> list[str]:
+    if review["blockers_surviving"] == 0:
+        return []
+    blocking = {f["id"] for f in review["findings"] if f["severity"] == "BLOCKING"}
+    ids = [fid for fid in review["survivors"] if fid in blocking]
+    return [f"{review['blockers_surviving']} blocker(s) survive" + (f": {', '.join(ids)}" if ids else "")]
+
+
+GATE_CHECKS = {
+    "spec_complete": _gate_spec_complete,
+    "acs_covered": _gate_acs_covered,
+    "tests_fail_on_stub": _gate_tests_fail_on_stub,
+    "verify_green": _gate_verify_green,
+    "no_surviving_blockers": _gate_no_surviving_blockers,
+}
+
+
+def check_all_gates_passed(project: Project, run_id: str, own_stage: dict) -> list[str]:
+    """Every other stage of the run's row has a valid record and, where it has a
+    gate, passed it at its last evaluation in the ledger, with its record unchanged since."""
+    root = project.root
+    run = load_run(project, run_id)
+    latest: dict[str, dict] = {}
+    for entry in read_ledger(root, run_id):
+        if entry.get("kind") == "gate" and isinstance(entry.get("stage"), str):
+            latest[entry["stage"]] = entry
+    problems = []
+    for stage in run.stages:
+        if stage["id"] == own_stage["id"]:
+            continue
+        _data, record_problems = read_stage_record(root, run_id, stage)
+        if record_problems:
+            problems.append(f"stage '{stage['id']}': {record_problems[0]}")
+            continue
+        gate = stage.get("gate")
+        if gate is None:
+            continue
+        entry = latest.get(stage["id"])
+        if entry is None or entry.get("gate") != gate:
+            problems.append(f"stage '{stage['id']}': its gate {gate} has not been evaluated")
+        elif entry.get("passed") is not True:
+            problems.append(f"stage '{stage['id']}': its gate {gate} failed at its last evaluation")
+        elif entry.get("record_sha256") != file_sha256(run_dir(root, run_id) / f"{stage['id']}.json"):
+            problems.append(f"stage '{stage['id']}': its record changed after its gate {gate} passed; evaluate the gate again")
+    return problems
+
+
+def evaluate_stage(project: Project, run_id: str, stage: dict) -> GateOutcome:
+    """The stage's record must exist and validate; then its gate, if it has one, must pass."""
+    root = project.root
+    path = run_dir(root, run_id) / f"{stage['id']}.json"
+    gate = stage.get("gate")
+    data, problems = read_stage_record(root, run_id, stage)
+    if gate == "all_gates_passed":
+        problems = check_all_gates_passed(project, run_id, stage)
+    elif data is not None and gate is not None:
+
+        def load_spec():
+            for name, _optional in _read_names(stage):
+                source = next((s for s in project.pipeline["stage"] if s["id"] == name), None)
+                if source is not None and source["record"] == "spec":
+                    return read_stage_record(root, run_id, source)
+            return None, [f"stage '{stage['id']}' reads no spec, so {gate} has nothing to compare against"]
+
+        problems = GATE_CHECKS[gate](data, load_spec)
+    return GateOutcome(stage["id"], gate, not problems, problems, rel_path(root, path), file_sha256(path), data)
+
+
+def ledger_gate_entry(outcome: GateOutcome) -> dict:
+    return {
+        "kind": "gate",
+        "stage": outcome.stage,
+        "gate": outcome.gate,
+        "passed": outcome.passed,
+        "record_sha256": outcome.record_sha256,
+        "problems": outcome.problems[:10],
+    }
+
+
+# ----------------------------------------------------------- review units
+#
+# A review unit's agents each write a small record under
+# .plumbline/runs/<run>/<stage>/round-<n>/: a findings_record per prosecutor,
+# a defense_record per defender and, once no blocker stands, one gaps_record.
+# merge_review turns them into the stage's review_record.
+
+
+def _round_number(path: Path) -> int | None:
+    match = re.fullmatch(r"round-([1-9][0-9]*)", path.name)
+    return int(match.group(1)) if match and path.is_dir() else None
+
+
+def _part_type(data) -> str | None:
+    """Which per-agent review record `data` is, or None when it is none of them."""
+    return next((name for name in REVIEW_PART_TYPES if not check_record(name, data)), None)
+
+
+def _guess_part_type(data) -> str:
+    """The type a record that validates as none of them was most likely meant to be."""
+    if isinstance(data, dict):
+        if "defender" in data or "defenses" in data:
+            return "defense_record"
+        if "lens" in data or "findings" in data:
+            return "findings_record"
+    return "gaps_record"
+
+
+def _majority(count: int) -> int:
+    return count // 2 + 1
+
+
+def merge_review(project: Project, run_id: str, stage_id: str, round_no: int | None = None) -> tuple[dict | None, list[str], list[str]]:
+    """The review_record of a review stage's round, built from the per-agent
+    records, as (record, problems, warnings). The record is None when there are problems.
+
+    A finding survives when at least `survive_if_unrefuted_by` of the stage's
+    `defenders` did not refute it (the majority when the stage sets none). A
+    defender refutes a finding by a verdict of `refuted` with a quote; a defender
+    that is silent on a finding, concedes it, or refutes without a quote did not
+    refute it. A stage without defenders lets every finding survive."""
+    root = project.root
+    stage = next((s for s in project.pipeline["stage"] if s["id"] == stage_id), None)
+    if stage is None:
+        raise PlumblineError(f"the pipeline has no stage '{stage_id}'")
+    if stage.get("kind", "agent") != "review":
+        raise PlumblineError(f"stage '{stage_id}' is not a review stage")
+    run = load_run(project, run_id)
+    if stage_id not in [s["id"] for s in run.stages]:
+        raise PlumblineError(f"stage '{stage_id}' is not part of row {run.row}, the row of run '{run_id}'")
+    expected = list(run.lenses) if _is_diff_review(stage) and run.lenses else list(stage["lenses"])
+
+    unit = run_dir(root, run_id) / stage_id
+    rounds = sorted(n for n in (_round_number(p) for p in unit.glob("round-*")) if n is not None)
+    if round_no is None:
+        if not rounds:
+            raise PlumblineError(f"no per-agent records for stage '{stage_id}': expected files in {rel_path(root, unit)}/round-<n>/")
+        round_no = rounds[-1]
+    if round_no < 1:
+        raise PlumblineError("the round must be 1 or more")
+    round_dir = unit / f"round-{round_no}"
+    if not round_dir.is_dir():
+        raise PlumblineError(f"there is no {rel_path(root, round_dir)}/")
+
+    problems: list[str] = []
+    warnings: list[str] = []
+    findings_records: list[tuple[str, dict]] = []
+    defense_records: list[tuple[str, dict]] = []
+    gaps_records: list[tuple[str, dict]] = []
+    for path in sorted(round_dir.glob("*.json")):
+        where = rel_path(root, path)
+        data, problem = load_json_file(path)
+        if problem:
+            problems.append(f"{where}: {problem}")
+            continue
+        kind = _part_type(data)
+        if kind is None:
+            guess = _guess_part_type(data)
+            errors = check_record(guess, data)
+            problems.append(f"{where}: not a valid {guess}: {errors[0]}" + (f" (and {len(errors) - 1} more)" if len(errors) > 1 else ""))
+            continue
+        {"findings_record": findings_records, "defense_record": defense_records, "gaps_record": gaps_records}[kind].append((where, data))
+
+    by_lens: dict[str, str] = {}
+    for where, data in findings_records:
+        if data["lens"] in by_lens:
+            problems.append(f"{where}: a second findings_record for lens '{data['lens']}' (the first is {by_lens[data['lens']]})")
+        elif data["lens"] not in expected:
+            problems.append(f"{where}: lens '{data['lens']}' is not one of this round's lenses ({', '.join(expected)})")
+        else:
+            by_lens[data["lens"]] = where
+    for lens in expected:
+        if lens not in by_lens:
+            problems.append(f"no findings_record for lens '{lens}' in {rel_path(root, round_dir)}/")
+    if len(gaps_records) > 1:
+        problems.append(f"{len(gaps_records)} gaps_records ({', '.join(w for w, _ in gaps_records)}); the detective writes one")
+
+    findings: list[dict] = []
+    owner: dict[str, str] = {}
+    for lens in expected:
+        for where, data in findings_records:
+            if data["lens"] != lens:
+                continue
+            for finding in data["findings"]:
+                if finding["lens"] != lens:
+                    warnings.append(f"{where}: finding '{finding['id']}' carries lens '{finding['lens']}' but was written by the '{lens}' prosecutor")
+                if finding["id"] in owner:
+                    problems.append(f"{where}: finding id '{finding['id']}' is also used in {owner[finding['id']]}; ids must be unique across the round")
+                else:
+                    owner[finding["id"]] = where
+                    findings.append(finding)
+
+    defenders = stage.get("defenders", 0)
+    threshold = stage.get("survive_if_unrefuted_by", _majority(defenders)) if defenders else 0
+    names = sorted({data["defender"] for _, data in defense_records}) if defenders else []
+    seen_pairs: set[tuple[str, str]] = set()
+    defenses: list[dict] = []
+    for where, data in defense_records if defenders else []:
+        for defense in data["defenses"]:
+            pair = (defense["finding_id"], defense["defender"])
+            if defense["defender"] != data["defender"]:
+                problems.append(f"{where}: an entry names defender '{defense['defender']}' in the record of defender '{data['defender']}'")
+            elif defense["finding_id"] not in owner:
+                problems.append(f"{where}: a defense of unknown finding '{defense['finding_id']}'")
+            elif pair in seen_pairs:
+                problems.append(f"{where}: defender '{defense['defender']}' defends finding '{defense['finding_id']}' more than once")
+            else:
+                seen_pairs.add(pair)
+                defenses.append(defense)
+    if defenders and len(names) > defenders:
+        problems.append(f"{len(names)} defenders reported ({', '.join(names)}) but the stage has {defenders}")
+    if not defenders and defense_records:
+        warnings.append("this stage has no defenders, so its defense records were ignored and every finding survives")
+    if defenders and findings and len(names) < defenders:
+        warnings.append(f"only {len(names)} of {defenders} defenders reported; a missing defender did not refute anything")
+    if problems:
+        return None, problems, warnings
+
+    position = {finding["id"]: index for index, finding in enumerate(findings)}
+    refuted_by: dict[str, set[str]] = {}
+    for defense in defenses:
+        if defense["verdict"] != "refuted":
+            continue
+        if not defense["quote"].strip():
+            warnings.append(f"defender '{defense['defender']}' refuted '{defense['finding_id']}' without quoting code, which does not count")
+            continue
+        refuted_by.setdefault(defense["finding_id"], set()).add(defense["defender"])
+    survivors = [f["id"] for f in findings if defenders - len(refuted_by.get(f["id"], ())) >= threshold]
+    severity = {f["id"]: f["severity"] for f in findings}
+    defenses.sort(key=lambda d: (position[d["finding_id"]], d["defender"]))
+    record = {
+        "target": stage["target"],
+        "round": round_no,
+        "lenses": expected,
+        "findings": findings,
+        "defenses": defenses,
+        "survivors": survivors,
+        "gaps": gaps_records[0][1]["gaps"] if gaps_records else [],
+        "blockers_surviving": sum(1 for fid in survivors if severity[fid] == "BLOCKING"),
+    }
+    errors = check_record("review_record", record)
+    if errors:
+        raise PlumblineError("internal error: the merged review_record does not validate: " + "; ".join(errors[:3]))
+    return record, [], warnings
+
+
+# ------------------------------------------------------------------ tokens
+
+USAGE_FIELDS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
+
+
+def usage_by_model(transcripts: list[Path]) -> dict:
+    """Token usage per model from Claude Code transcripts. A transcript holds
+    several records for one API message (one per streamed content block), each
+    with the usage known when it was written, so the maximum of each counter per
+    message id is what counts. Output is output_tokens, fresh input is
+    input_tokens plus cache writes, and cache reads stand alone."""
+    best: dict[str, dict] = {}
+    for path in transcripts:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            message = record.get("message") if isinstance(record, dict) else None
+            if not isinstance(message, dict) or not isinstance(message.get("usage"), dict):
+                continue
+            message_id, model = message.get("id"), message.get("model")
+            if not isinstance(message_id, str) or not message_id or model == "<synthetic>":
+                continue
+            entry = best.setdefault(message_id, {"model": None, **{name: 0 for name in USAGE_FIELDS}})
+            if isinstance(model, str) and model:
+                entry["model"] = model
+            for name in USAGE_FIELDS:
+                value = message["usage"].get(name)
+                if isinstance(value, int) and not isinstance(value, bool) and value > entry[name]:
+                    entry[name] = value
+    by_model: dict[str, dict] = {}
+    for entry in best.values():
+        totals = by_model.setdefault(entry["model"] or "unknown", {"output": 0, "fresh_input": 0, "cache_read": 0})
+        totals["output"] += entry["output_tokens"]
+        totals["fresh_input"] += entry["input_tokens"] + entry["cache_creation_input_tokens"]
+        totals["cache_read"] += entry["cache_read_input_tokens"]
+    return dict(sorted(by_model.items()))
+
+
+def ledger_transcripts(root: Path, run_id: str) -> tuple[list[Path], list[str]]:
+    """The agent transcripts a run's ledger points to, and notes about those it cannot find.
+    The path Claude Code reported for the agent is used; failing that, it is derived
+    from the session transcript as <dir>/<session_id>/subagents/agent-<agent_id>.jsonl."""
+    found: list[Path] = []
+    notes: list[str] = []
+    for entry in read_ledger(root, run_id):
+        if entry.get("kind") != "agent":
+            continue
+        candidates = []
+        if isinstance(entry.get("transcript"), str) and entry["transcript"]:
+            candidates.append(Path(entry["transcript"]))
+        session, session_id, agent_id = entry.get("session_transcript"), entry.get("session_id"), entry.get("agent_id")
+        if isinstance(session, str) and isinstance(session_id, str) and isinstance(agent_id, str) and session and session_id and agent_id:
+            candidates.append(Path(session).parent / session_id / "subagents" / f"agent-{agent_id}.jsonl")
+        path = next((c for c in candidates if c.is_file()), None)
+        if path is None:
+            notes.append(f"no transcript found for agent {entry.get('agent_id')} ({entry.get('agent_type')}, stage {entry.get('stage')})")
+        elif path not in found:
+            found.append(path)
+    return found, notes
+
+
+def tokens_for_run(root: Path, run_id: str) -> tuple[dict, list[str]]:
+    """The run's `tokens` object, {"by_model": {...}}, and notes."""
+    existing_run_dir(root, run_id)
+    transcripts, notes = ledger_transcripts(root, run_id)
+    return {"by_model": usage_by_model(transcripts)}, notes
+
+
+# ------------------------------------------- pass records and overrides
+
+
+def dirty_paths(root: Path) -> list[str]:
+    """Paths with uncommitted changes (untracked files included), apart from .plumbline/."""
+    output = _git_text(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    entries = output.split("\0")
+    paths = []
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        if entry[0] in "RC" or entry[1] in "RC":
+            index += 1  # a rename or copy is followed by its source path
+        paths.append(entry[3:])
+    return [p for p in paths if not p.startswith(IGNORE_ENTRY)]
+
+
+def coverage(root: Path, head: str) -> tuple[str | None, str]:
+    """How HEAD is covered: ("pass" or "override", detail), or (None, why not).
+    The record must validate and name this very commit; a pass record must say pass."""
+    if not re.fullmatch(r"[0-9a-f]{40,64}", head):
+        return None, "HEAD is not a commit id"
+    pass_file = root / PASS_DIR / f"{head}.json"
+    data, problem = load_json_file(pass_file)
+    if problem is None:
+        errors = check_record("pass_record", data)
+        if errors:
+            reason = f"{rel_path(root, pass_file)} is not a valid pass_record ({errors[0]})"
+        elif data["commit"] != head:
+            reason = f"{rel_path(root, pass_file)} is for another commit"
+        elif data["verdict"] != "pass":
+            reason = f"{rel_path(root, pass_file)} says {data['verdict']}, not pass"
+        else:
+            return "pass", f"run {data['run_id']}"
+    elif problem == "no such file":
+        reason = "no pass or override record"
+    else:
+        reason = f"{rel_path(root, pass_file)} cannot be used: {problem}"
+    override_file = root / PASS_DIR / f"{head}.override.json"
+    data, problem = load_json_file(override_file)
+    if problem is None and not check_record("override_record", data) and data["commit"] == head:
+        return "override", data["reason"]
+    return None, reason
+
+
+def rounds_taken(stage: dict, record: dict | None, ledger: list[dict]) -> int:
+    """How many rounds a stage took: a review stage says so itself, an agent stage
+    is counted by the agents the ledger saw stop for it, a main-session stage took one."""
+    if stage.get("kind", "agent") == "review" and record is not None:
+        return record["round"]
+    agents = sum(1 for e in ledger if e.get("kind") == "agent" and e.get("stage") == stage["id"])
+    return agents or 1
+
+
+def make_pass_record(project: Project, run_id: str) -> tuple[dict | None, list[str], Path]:
+    """The pass_record for HEAD, as (record, problems, the run's copy of it). It
+    needs a clean working tree (apart from .plumbline/) and every gate of the
+    run's row to pass, each gate being evaluated afresh and entered in the ledger."""
+    root = project.root
+    head = head_sha(root)
+    run = load_run(project, run_id)
+    problems: list[str] = []
+    dirty = dirty_paths(root)
+    if dirty:
+        listed = ", ".join(dirty[:10]) + (f" and {len(dirty) - 10} more" if len(dirty) > 10 else "")
+        problems.append(f"the working tree is not clean apart from {IGNORE_ENTRY}: {listed} (commit the change, then run pass)")
+
+    reduce_stage = next((s for s in run.stages if s["record"] == "pass_record"), None)
+    ledger = read_ledger(root, run_id)
+    stages = []
+    for stage in run.stages:
+        if stage is reduce_stage:
+            continue
+        outcome = evaluate_stage(project, run_id, stage)
+        if outcome.gate is not None:
+            append_ledger(root, run_id, ledger_gate_entry(outcome))
+        if not outcome.passed:
+            problems.append(f"stage '{stage['id']}'" + (f" (gate {outcome.gate})" if outcome.gate else "") + ": " + "; ".join(outcome.problems[:3]))
+        stages.append(
+            {"id": stage["id"], "record": outcome.record, "gate": outcome.gate, "passed": outcome.passed, "rounds": rounds_taken(stage, outcome.data, ledger)}
+        )
+    reduce_id = reduce_stage["id"] if reduce_stage else "reduce"
+    reduce_path = run_dir(root, run_id) / f"{reduce_id}.json"
+    if reduce_stage is not None and reduce_stage.get("gate") == "all_gates_passed" and not problems:
+        final = check_all_gates_passed(project, run_id, reduce_stage)
+        problems += [f"stage '{reduce_id}' (gate all_gates_passed): {p}" for p in final]
+    if problems:
+        return None, problems, reduce_path
+    if reduce_stage is not None:
+        stages.append({"id": reduce_id, "record": rel_path(root, reduce_path), "gate": reduce_stage.get("gate"), "passed": True, "rounds": 1})
+    tokens, notes = tokens_for_run(root, run_id)
+    if run.note:
+        notes.insert(0, run.note)
+    record = {"commit": head, "run_id": run_id, "row": run.row, "stages": stages, "tokens": tokens, "verdict": "pass", "notes": notes}
+    errors = check_record("pass_record", record)
+    if errors:
+        raise PlumblineError("internal error: the pass_record does not validate: " + "; ".join(errors[:3]))
+    return record, [], reduce_path
+
+
+def git_identity(root: Path) -> str:
+    """Who is running this: the git author name, else the login name, else 'unknown'."""
+    result = _git(root, "var", "GIT_AUTHOR_IDENT")
+    ident = result.stdout.decode("utf-8", "replace").strip()
+    name = ident.split(" <", 1)[0].strip() if result.returncode == 0 else ""
+    if name:
+        return name
+    try:
+        import getpass
+
+        return getpass.getuser() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def make_override(project: Project, reason: str, run_id: str | None) -> dict:
+    """The override_record for HEAD. `stages_skipped` are the stages of the run's
+    row (the latest run when none is named) that did not pass, or every stage of
+    the pipeline when there is no run."""
+    root = project.root
+    head = head_sha(root)
+    reason = reason.strip()
+    if run_id is not None:
+        existing_run_dir(root, run_id)  # a run that was named must exist
+    else:
+        run_id = latest_run_id(root)
+    skipped = None
+    if run_id is not None:
+        try:
+            run = load_run(project, run_id)
+            skipped = [s["id"] for s in run.stages if s["record"] != "pass_record" and not evaluate_stage(project, run_id, s).passed]
+        except PlumblineError:
+            pass  # a run whose intake cannot be read did not get anywhere
+    if skipped is None:
+        skipped = [s["id"] for s in project.pipeline["stage"]]
+    record = {"commit": head, "reason": reason, "by": git_identity(root), "at": utc_now(), "stages_skipped": skipped}
+    errors = check_record("override_record", record)
+    if errors:
+        raise PlumblineError("the override needs a reason of at least 20 characters" if any(e.startswith("$.reason") for e in errors) else errors[0])
+    return record
 
 
 # ------------------------------------------------------------------- CLI
@@ -1359,9 +2104,7 @@ def cmd_classify(args) -> int:
 
 def cmd_plan(args) -> int:
     project = _ready_project(args.project)
-    run_id = args.run_id if args.run_id is not None else default_run_id(project.root)
-    if not RUN_ID_PATTERN.fullmatch(run_id):
-        raise PlumblineError(f"run id {run_id!r} must be letters, digits, '.', '_' or '-', and start with a letter or digit")
+    run_id = check_run_id(args.run_id if args.run_id is not None else default_run_id(project.root))
     record = classify(project.root, project.pipeline, args.base)
     sys.stdout.write(json.dumps(build_plan(project.pipeline, record, run_id), indent=2) + "\n")
     return 0
@@ -1424,6 +2167,149 @@ def cmd_init(args) -> int:
     return 0
 
 
+def cmd_merge_review(args) -> int:
+    project = _ready_project(args.project)
+    record, problems, warnings = merge_review(project, args.run_id, args.stage, args.round)
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    if record is None:
+        for problem in problems:
+            print(f"error: {problem}")
+        print(f"merge-review: stage '{args.stage}' cannot be merged ({_plural(len(problems), 'problem')})")
+        return 1
+    path = run_dir(project.root, args.run_id) / f"{args.stage}.json"
+    write_json_atomic(path, record)
+    print(
+        f"wrote {rel_path(project.root, path)}: round {record['round']}, {_plural(len(record['findings']), 'finding')}, "
+        f"{len(record['survivors'])} surviving ({record['blockers_surviving']} blocking), {_plural(len(record['gaps']), 'gap')}"
+    )
+    return 0
+
+
+def cmd_gate(args) -> int:
+    project = _ready_project(args.project)
+    existing_run_dir(project.root, args.run_id)
+    stage = next((s for s in project.pipeline["stage"] if s["id"] == args.stage), None)
+    if stage is None:
+        raise PlumblineError(f"the pipeline has no stage '{args.stage}'")
+    if stage.get("gate") is None:
+        print(f"stage '{args.stage}' has no gate; nothing to evaluate")
+        return 0
+    outcome = evaluate_stage(project, args.run_id, stage)
+    append_ledger(project.root, args.run_id, ledger_gate_entry(outcome))
+    if outcome.passed:
+        print(f"gate {outcome.gate} for stage '{stage['id']}': pass")
+        return 0
+    print(f"gate {outcome.gate} for stage '{stage['id']}': FAIL")
+    for problem in outcome.problems:
+        print(f"  - {problem}")
+    return 1
+
+
+def cmd_tokens(args) -> int:
+    root = resolve_root(args.project, require_git=True)
+    tokens, notes = tokens_for_run(root, args.run_id)
+    for note in notes:
+        print(f"note: {note}", file=sys.stderr)
+    print(json.dumps(tokens, indent=2))
+    return 0
+
+
+def _adopted_project(project_arg: str | None) -> Project:
+    project = _ready_project(project_arg)
+    if not project.adopted:
+        raise PlumblineError(f"{project.root} has not adopted plumbline (there is no {CONFIG_FILE}); /plumbline:init adopts it")
+    return project
+
+
+def cmd_pass(args) -> int:
+    project = _adopted_project(args.project)
+    record, problems, run_copy = make_pass_record(project, args.run_id)
+    if record is None:
+        for problem in problems:
+            print(f"error: {problem}")
+        print(f"pass: refused for run '{args.run_id}' ({_plural(len(problems), 'problem')}); nothing was written")
+        return 1
+    pass_file = project.root / PASS_DIR / f"{record['commit']}.json"
+    write_json_atomic(run_copy, record)
+    write_json_atomic(pass_file, record)
+    print(f"plumbline: pass recorded for {record['commit'][:7]} (run {args.run_id}, row {record['row']})")
+    print(f"  wrote {rel_path(project.root, run_copy)} and {rel_path(project.root, pass_file)}")
+    for model, usage in record["tokens"]["by_model"].items():
+        print(f"  tokens {model}: output {usage['output']}, fresh input {usage['fresh_input']}, cache read {usage['cache_read']}")
+    return 0
+
+
+def cmd_override(args) -> int:
+    project = _adopted_project(args.project)
+    reason = args.reason.strip()
+    if len(reason) < 20:
+        print(f"plumbline: the reason must be at least 20 characters (this one has {len(reason)}); nothing was written", file=sys.stderr)
+        return 1
+    record = make_override(project, reason, args.run_id)
+    path = project.root / PASS_DIR / f"{record['commit']}.override.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, "x", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, indent=2) + "\n")
+    except FileExistsError:
+        print(f"plumbline: {rel_path(project.root, path)} already exists; an override is never overwritten. Nothing was changed.", file=sys.stderr)
+        return 1
+    print(f"plumbline: override recorded for {record['commit'][:7]} in {rel_path(project.root, path)}")
+    print(f"  pushes of this commit are no longer held back. By {record['by']}. Stages skipped: {', '.join(record['stages_skipped']) or 'none'}")
+    return 0
+
+
+def _stage_state(project: Project, run_id: str, stage: dict) -> tuple[str, list[str]]:
+    """A stage's state for `status`, judged afresh and without writing anything."""
+    if stage["record"] == "pass_record":
+        data, _ = read_stage_record(project.root, run_id, stage)
+        return ("recorded" if data is not None else "pending"), []
+    outcome = evaluate_stage(project, run_id, stage)
+    if outcome.data is None:
+        return ("missing" if outcome.problems[0].endswith(": no such file") else "invalid"), outcome.problems[:1]
+    if outcome.gate is None:
+        return "recorded", []
+    return ("pass" if outcome.passed else "FAIL"), outcome.problems[:3]
+
+
+def cmd_status(args) -> int:
+    project = _ready_project(args.project)
+    root = project.root
+    if project.adopted:
+        print(f"plumbline: adopted in {root} (pipeline '{project.pipeline['name']}', graft {'on' if project.graft_enabled else 'off'})")
+    else:
+        print(f"plumbline: not adopted in {root} (there is no {CONFIG_FILE}); /plumbline:init adopts it")
+    try:
+        head = head_sha(root)
+    except PlumblineError as exc:
+        print(f"HEAD: {exc}")
+    else:
+        how, detail = coverage(root, head)
+        if how == "pass":
+            print(f"HEAD {head[:7]}: covered by a pass record ({detail})")
+        elif how == "override":
+            print(f"HEAD {head[:7]}: covered by an override ({detail})")
+        else:
+            print(f"HEAD {head[:7]}: NOT covered ({detail})")
+    run_id = check_run_id(args.run_id) if args.run_id else latest_run_id(root)
+    if run_id is None:
+        print("latest run: none")
+        return 0
+    try:
+        run = load_run(project, run_id)
+    except PlumblineError as exc:
+        print(f"run {run_id}: {exc}")
+        return 0
+    print(f"run {run_id}: row {run.row}, {_plural(len(run.stages), 'stage')}")
+    for stage in run.stages:
+        state, problems = _stage_state(project, run_id, stage)
+        print(f"  {stage['id']:<13}{stage['record']:<15}{state:<10}{stage.get('gate') or '-'}")
+        for problem in problems:
+            print(f"      {problem}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="plumbline", description="The plumbline pipeline CLI.")
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -1459,6 +2345,40 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project", metavar="PATH")
     p.add_argument("--graft", action="store_true", help="record graft as enabled")
     p.set_defaults(run=cmd_init)
+
+    p = sub.add_parser("merge-review", help="build a review stage's record from its per-agent records, applying the survival rule")
+    p.add_argument("run_id", metavar="RUN")
+    p.add_argument("stage")
+    p.add_argument("--round", type=int, metavar="N", help="default: the latest round directory")
+    p.add_argument("--project", metavar="PATH")
+    p.set_defaults(run=cmd_merge_review)
+
+    p = sub.add_parser("gate", help="evaluate a stage's gate mechanically: exit 0 if it passes, 1 if not")
+    p.add_argument("run_id", metavar="RUN")
+    p.add_argument("stage")
+    p.add_argument("--project", metavar="PATH")
+    p.set_defaults(run=cmd_gate)
+
+    p = sub.add_parser("tokens", help="print the token usage of a run's agents, per model, as JSON")
+    p.add_argument("run_id", metavar="RUN")
+    p.add_argument("--project", metavar="PATH")
+    p.set_defaults(run=cmd_tokens)
+
+    p = sub.add_parser("pass", help="write the pass record for HEAD, if the tree is clean and every gate of the run passed")
+    p.add_argument("run_id", metavar="RUN")
+    p.add_argument("--project", metavar="PATH")
+    p.set_defaults(run=cmd_pass)
+
+    p = sub.add_parser("override", help="record an override for HEAD, so that it can be pushed without a pass (only when the builder asks)")
+    p.add_argument("--reason", required=True, metavar="TEXT", help="why the pipeline is bypassed: at least 20 characters")
+    p.add_argument("--run", dest="run_id", metavar="RUN", help="the run whose unfinished stages are listed (default: the latest)")
+    p.add_argument("--project", metavar="PATH")
+    p.set_defaults(run=cmd_override)
+
+    p = sub.add_parser("status", help="show the latest run, its stages and gates, and whether HEAD is covered")
+    p.add_argument("--run", dest="run_id", metavar="RUN", help="default: the latest run")
+    p.add_argument("--project", metavar="PATH")
+    p.set_defaults(run=cmd_status)
     return parser
 
 

@@ -103,6 +103,48 @@ _SAMPLES = {
         ],
         "blockers_surviving": 1,
     },
+    "findings_record": {
+        "lens": "correctness",
+        "findings": [
+            {
+                "id": "correctness-1",
+                "lens": "correctness",
+                "file": "src/app.py",
+                "line": 14,
+                "claim": "The retry loop swallows the last error.",
+                "failure_scenario": "Every attempt fails: the caller receives None instead of the error.",
+                "rule": "AC-2",
+                "evidence": "except OSError: continue",
+                "outside_code": None,
+                "severity": "BLOCKING",
+            },
+            {
+                "id": "correctness-2",
+                "lens": "correctness",
+                "file": "src/app.py",
+                "line": 21,
+                "claim": "retries=0 is treated as no limit.",
+                "failure_scenario": "fetch(url, retries=0) loops forever on a dead server.",
+                "rule": "Severity rubric: an edge case",
+                "evidence": "while not retries or attempt < retries:",
+                "outside_code": None,
+                "severity": "MINOR",
+            },
+        ],
+    },
+    "defense_record": {
+        "defender": "defender-1",
+        "defenses": [
+            {"finding_id": "correctness-1", "defender": "defender-1", "verdict": "conceded", "quote": "continue", "reason": "The loop never raises."},
+            {"finding_id": "correctness-2", "defender": "defender-1", "verdict": "refuted", "quote": "retries: int = 3", "reason": "The default is 3, and 0 is documented as no retries."},
+        ],
+    },
+    "gaps_record": {
+        "gaps": [
+            {"id": "G-1", "kind": "uncovered_ac", "detail": "No test covers AC-2.", "ac": "AC-2"},
+            {"id": "G-2", "kind": "edge_case", "detail": "retries=0 is not handled.", "ac": None},
+        ],
+    },
     "pass_record": {
         "commit": SHA_A,
         "run_id": "demo-20260101T000000Z",

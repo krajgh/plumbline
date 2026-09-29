@@ -1,4 +1,5 @@
 """Fixtures: an isolated environment, a throw-away git repository, and CLI runners."""
+import json
 import sys
 from pathlib import Path
 
@@ -63,5 +64,29 @@ def run_hook(home):
 
     def run(cwd, **env_extra):
         return helpers.run_script(helpers.SESSION_START, [], cwd, home, **env_extra)
+
+    return run
+
+
+def _as_stdin(payload) -> str:
+    return payload if isinstance(payload, str) else json.dumps(payload)
+
+
+@pytest.fixture
+def run_stop(home):
+    """Run scripts/subagent_stop.py with a hook payload (a dict, or a string as it is) on stdin."""
+
+    def run(payload, cwd, **env_extra):
+        return helpers.run_script(helpers.SUBAGENT_STOP, [], cwd, home, stdin=_as_stdin(payload), **env_extra)
+
+    return run
+
+
+@pytest.fixture
+def run_pre(home):
+    """Run scripts/pre_tool_use.py with a hook payload (a dict, or a string as it is) on stdin."""
+
+    def run(payload, cwd, **env_extra):
+        return helpers.run_script(helpers.PRE_TOOL_USE, [], cwd, home, stdin=_as_stdin(payload), **env_extra)
 
     return run

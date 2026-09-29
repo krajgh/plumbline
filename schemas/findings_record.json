@@ -1,0 +1,66 @@
+{
+  "description": "One prosecutor's record: the lens it reviewed through and the findings it makes. A prosecutor runs one lens per run; `merge-review` combines the records of a round into the stage's review_record.",
+  "type": "object",
+  "required": ["lens", "findings"],
+  "additionalProperties": false,
+  "properties": {
+    "lens": {
+      "description": "The one lens this prosecutor reviewed through.",
+      "enum": ["correctness", "tests", "security", "data", "boundaries", "docs"]
+    },
+    "findings": {
+      "description": "Every finding, each with its own evidence. Finding ids must be unique across the prosecutors of a round, so prefix them with the lens (for example security-1).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "lens", "file", "line", "claim", "failure_scenario", "rule", "evidence", "outside_code", "severity"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "lens": {
+            "enum": ["correctness", "tests", "security", "data", "boundaries", "docs"]
+          },
+          "file": {
+            "type": "string",
+            "minLength": 1
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "claim": {
+            "description": "What is wrong, in one sentence.",
+            "type": "string",
+            "minLength": 1
+          },
+          "failure_scenario": {
+            "description": "A concrete input or sequence of events that goes wrong.",
+            "type": "string",
+            "minLength": 1
+          },
+          "rule": {
+            "description": "The acceptance criterion, project rule or severity clause the finding rests on.",
+            "type": "string",
+            "minLength": 1
+          },
+          "evidence": {
+            "description": "A quote from the code that shows the problem.",
+            "type": "string",
+            "minLength": 1
+          },
+          "outside_code": {
+            "description": "Support from outside the code (a document, a specification, a standard), or null when the finding rests on the code alone.",
+            "type": ["string", "null"]
+          },
+          "severity": {
+            "description": "Severity rubric. BLOCKING: breaks a stated acceptance criterion, loses or corrupts data, exposes a secret or personal data, or breaks the main path for most users. MAJOR: wrong behaviour on a realistic path, with limited reach or a workaround. MINOR: an edge case, a leak without near-term impact, or an inconsistency.",
+            "enum": ["BLOCKING", "MAJOR", "MINOR"]
+          }
+        }
+      }
+    }
+  }
+}
