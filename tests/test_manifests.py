@@ -43,7 +43,7 @@ def frontmatter(path):
 def test_plugin_json_says_what_the_task_specified():
     plugin = load(PLUGIN)
     assert plugin["name"] == "plumbline"
-    assert plugin["version"] == "0.2.0"
+    assert plugin["version"] == "0.3.0"
     assert plugin["author"] == {"name": "krajgh", "url": "https://github.com/krajgh"}
     assert plugin["homepage"] == "https://github.com/krajgh/plumbline"
     assert plugin["repository"] == "https://github.com/krajgh/plumbline"
@@ -103,7 +103,7 @@ def test_hooks_json_registers_session_start_pre_tool_use_and_subagent_stop():
     [hook] = group["hooks"]
     assert hook["type"] == "command" and hook["timeout"] == 10
     [group] = hooks["PreToolUse"]
-    assert group["matcher"] == "Bash|PowerShell|Read|Grep|Glob"  # letters and | only: an exact list of tool names
+    assert group["matcher"] == "Bash|PowerShell|Read|Grep|Glob|Edit|Write|NotebookEdit|Agent"  # letters and | only: an exact list of tool names
     [hook] = group["hooks"]
     assert hook["type"] == "command" and hook["timeout"] == 30
     [group] = hooks["SubagentStop"]
@@ -120,9 +120,11 @@ def test_every_hook_command_ends_in_or_true():
 
 
 def test_each_hook_command_runs_its_script_from_the_plugin_root_quoted():
-    for event, script in (("SessionStart", "session_start"), ("PreToolUse", "pre_tool_use"), ("SubagentStop", "subagent_stop")):
-        assert hook_of(event)["command"] == f'python3 "${{CLAUDE_PLUGIN_ROOT}}/scripts/{script}.py" || true'
-        assert (REPO / "scripts" / f"{script}.py").is_file()
+    # session start runs Python once per session; the hooks that run on every tool call and every agent stop go through an sh filter
+    assert hook_of("SessionStart")["command"] == 'python3 "${CLAUDE_PLUGIN_ROOT}/scripts/session_start.py" || true'
+    for event, script in (("PreToolUse", "pre_tool_use"), ("SubagentStop", "subagent_stop")):
+        assert hook_of(event)["command"] == f'sh "${{CLAUDE_PLUGIN_ROOT}}/scripts/{script}.sh" || true'
+        assert (REPO / "scripts" / f"{script}.sh").is_file() and (REPO / "scripts" / f"{script}.py").is_file()
 
 
 def plugin_root_with_a_space(tmp_path):
@@ -206,8 +208,8 @@ def skill_dirs():
     return sorted(p.parent for p in (REPO / "skills").glob("*/SKILL.md"))
 
 
-def test_the_two_skills_exist():
-    assert [d.name for d in skill_dirs()] == ["init", "subagent-discipline"]
+def test_the_five_skills_exist():
+    assert [d.name for d in skill_dirs()] == ["init", "override", "run", "status", "subagent-discipline"]
 
 
 @pytest.mark.parametrize("directory", skill_dirs(), ids=lambda d: d.name)
@@ -274,10 +276,14 @@ def test_the_layout_matches_the_spec():
     for path in (
         ".claude-plugin/plugin.json", ".claude-plugin/marketplace.json", "LICENSE", "NOTICE", "README.md",
         "hooks/hooks.json", "scripts/plumbline.py", "scripts/session_start.py", "scripts/subagent_stop.py", "scripts/pre_tool_use.py",
-        "pipeline/default.toml", "skills/subagent-discipline/SKILL.md", "skills/init/SKILL.md",
+        "scripts/pre_tool_use.sh", "scripts/subagent_stop.sh", "pipeline/default.toml", "pipeline/templates/refactor.json",
+        "skills/subagent-discipline/SKILL.md", "skills/init/SKILL.md", "skills/run/SKILL.md", "skills/override/SKILL.md", "skills/status/SKILL.md",
+        *(f"agents/{name}.md" for name in ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")),
     ):
         assert (REPO / path).is_file(), path
-    assert not (REPO / "agents").exists()  # the agents arrive in phase 2b
+    assert sorted(p.name for p in (REPO / "agents").iterdir()) == sorted(  # the seven agents, and nothing else
+        f"{name}.md" for name in ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")
+    )
     assert sorted(p.name for p in (REPO / "schemas").glob("*.json")) == sorted(
         f"{n}.json" for n in (
             "change_class", "spec", "tests_record", "build_note", "verify_record", "review_record", "pass_record", "override_record",

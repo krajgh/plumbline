@@ -4,8 +4,8 @@
 Standard library only (Python 3.11 or newer).
 
     validate-pipeline [FILE] [--project PATH]
-    classify [--project PATH] [--base REF] [--out FILE]
-    plan [--project PATH] [--base REF] [--run-id ID]
+    classify [--project PATH] [--base REF] [--intent ID] [--row ROW] [--out FILE]
+    plan [--project PATH] [--base REF] [--run-id ID] [--intent ID [--spec FILE]] [--row ROW]
     check-record TYPE FILE
     render FILE [--type TYPE]
     init [--project PATH] [--graft]
@@ -15,10 +15,13 @@ Standard library only (Python 3.11 or newer).
     pass RUN [--project PATH]
     override --reason TEXT [--run RUN] [--project PATH]
     status [--run RUN] [--project PATH]
+    check-diff [--run RUN] [--base REF] [--project PATH]
 
 A run is the directory .plumbline/runs/<run-id>/: one <stage-id>.json per stage,
 the per-agent records of a review unit under <stage-id>/round-<n>/, and a
-ledger.jsonl that only ever grows.
+ledger.jsonl that only ever grows. `plan --intent ID` starts a run: it writes the
+intake record (which carries the intent) and copies the record an intent
+supplies in place of a skipped stage.
 
 Exit status: 0 on success; 1 when what was checked is invalid, a gate fails, or
 a command refuses (init over an existing plumbline.toml, pass on a dirty tree);
@@ -40,7 +43,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,10 +70,21 @@ KNOWN_GATES = (
     "spec_complete",
     "acs_covered",
     "tests_fail_on_stub",
+    "reproduces_on_head",
     "verify_green",
     "no_surviving_blockers",
     "all_gates_passed",
 )
+# The record type each gate reads, for checking an intent's `gates` against the stage they replace.
+GATE_RECORDS = {
+    "spec_complete": "spec",
+    "acs_covered": "tests_record",
+    "tests_fail_on_stub": "tests_record",
+    "reproduces_on_head": "tests_record",
+    "verify_green": "verify_record",
+    "no_surviving_blockers": "review_record",
+    "all_gates_passed": "pass_record",
+}
 REVIEW_ONLY_KEYS = ("target", "lenses", "defenders", "survive_if_unrefuted_by", "detective")
 
 # The plumbline agents (agent type `plumbline:<name>`) and the record each one
@@ -83,7 +99,14 @@ AGENT_RECORDS = {
     "defender": "defense_record",
     "detective": "gaps_record",
 }
+AGENT_ROLES = tuple(AGENT_RECORDS)  # the roles a [roles.<name>] policy may describe
 REVIEW_PART_TYPES = ("findings_record", "defense_record", "gaps_record")
+# Role policies (see [roles.*] in pipeline/default.toml): where an agent may write, and what its Bash may run.
+KNOWN_WRITE_TARGETS = ("record", "tests", "code")
+CONFIG_COMMANDS = ("test", "lint", "typecheck", "build")  # the keys of [commands] in plumbline.toml
+KNOWN_COMMAND_CLASSES = (*CONFIG_COMMANDS, "git-read", "search", "plumbline-check", "graft")
+DEFAULT_INTENT = "feature"
+TEMPLATE_DIR = PIPELINE_DIR / "templates"
 ID_PATTERN = r"^[a-z][a-z0-9_-]*$"
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
@@ -401,8 +424,14 @@ PIPELINE_SHAPE = {
         "type": {"type": "array", "minItems": 1, "items": TYPE_SHAPE},
         "stage": {"type": "array", "minItems": 1, "items": STAGE_SHAPE},
         "matrix": {"type": "object"},
+        "roles": {"type": "object"},
+        "intent": {"type": "object"},
     },
 }
+
+# [commands] in plumbline.toml: what the `test`, `lint`, `typecheck` and `build` command classes run,
+# each a command prefix, or a list of prefixes.
+_COMMAND_PREFIXES = {"type": ["string", "array"], "minLength": 1, "minItems": 1, "items": _TEXT}
 
 CONFIG_SHAPE = {
     "type": "object",
@@ -419,6 +448,11 @@ CONFIG_SHAPE = {
         "precedence": {"type": "array", "minItems": 1, "items": _TEXT},
         "type": {"type": "array", "items": TYPE_SHAPE},
         "matrix": {"type": "object"},
+        "commands": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {name: _COMMAND_PREFIXES for name in CONFIG_COMMANDS},
+        },
     },
 }
 
@@ -606,6 +640,10 @@ def validate_pipeline(pl: dict) -> tuple[list[str], list[str]]:
     for name, row in matrix.items():
         for label, flat in _split_row(name, row, errors):
             _check_row(label, flat, stages, index, input_names, bad_reads, errors, notes)
+    if "roles" in pl:
+        _check_roles(pl["roles"], errors)
+    if "intent" in pl:
+        _check_intents(pl, errors)
     return errors, notes
 
 
@@ -664,6 +702,117 @@ def _is_diff_review(stage: dict) -> bool:
     return stage.get("kind", "agent") == "review" and stage.get("target") == "diff"
 
 
+def _check_roles(roles, errors: list[str]) -> None:
+    """The [roles.<agent>] policies: known write targets and command classes, one policy per agent."""
+    for name, policy in roles.items():
+        where = f"roles.{name}"
+        if name not in AGENT_ROLES:
+            errors.append(f"{where}: unknown role (the agents are {', '.join(AGENT_ROLES)})")
+        if not isinstance(policy, dict):
+            errors.append(f"{where}: must be a table with writes and commands")
+            continue
+        for key in policy:
+            if key not in ("writes", "commands"):
+                errors.append(f"{where}: unexpected key {key!r} (a role policy has writes and commands)")
+        for key, known, what in (("writes", KNOWN_WRITE_TARGETS, "write target"), ("commands", KNOWN_COMMAND_CLASSES, "command")):
+            value = policy.get(key)
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                errors.append(f"{where}: {key} must be a list of strings")
+                continue
+            for item in dict.fromkeys(value):
+                if item not in known:
+                    errors.append(f"{where}: unknown {what} {item!r} (known: {', '.join(known)})")
+                elif value.count(item) > 1:
+                    errors.append(f"{where}: {key} names {item!r} more than once")
+        if isinstance(policy.get("writes"), list) and "record" not in policy["writes"]:
+            errors.append(f"{where}: writes must include 'record', because every agent ends with its record")
+    for name in AGENT_ROLES:
+        if name not in roles:
+            errors.append(f"roles: there is no policy for the agent '{name}' (every agent needs one)")
+
+
+def _check_intents(pl: dict, errors: list[str]) -> None:
+    """The [intent.<id>] tables. Each may name only known stages, gates and lenses; what it skips and
+    supplies must be consistent; and after it is applied to every row, each required read must be
+    produced by a stage left in the row or listed in `supplies`."""
+    intents = pl["intent"]
+    stages = pl["stage"]
+    index = {stage["id"]: position for position, stage in enumerate(stages)}
+    input_names = set(pl["inputs"])
+    rows: list[tuple[str, dict]] = []
+    for name, row in pl["matrix"].items():
+        rows += _split_row(name, row, [])  # the rows' own problems are reported elsewhere
+    for iid, intent in intents.items():
+        where = f"intent '{iid}'"
+        if not re.fullmatch(ID_PATTERN, iid):
+            errors.append(f"{where}: the id must match {ID_PATTERN}")
+        if not isinstance(intent, dict):
+            errors.append(f"{where}: must be a table (skip, supplies, gates, lenses)")
+            continue
+        before = len(errors)
+        for key in intent:
+            if key not in ("skip", "supplies", "gates", "lenses"):
+                errors.append(f"{where}: unexpected key {key!r} (an intent has skip, supplies, gates and lenses)")
+        lists = {}
+        for key in ("skip", "supplies"):
+            value = intent.get(key, [])
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                errors.append(f"{where}: {key} must be a list of stage ids")
+                value = []
+            lists[key] = value
+        skip, supplies = lists["skip"], lists["supplies"]
+        for sid in dict.fromkeys(skip):
+            if sid not in index:
+                errors.append(f"{where}: skip names unknown stage {sid!r}")
+            elif stages[index[sid]]["record"] in ("change_class", "pass_record"):
+                errors.append(f"{where}: skip names {sid!r}, which every run needs (it writes the {stages[index[sid]]['record']} record)")
+        for sid in dict.fromkeys(supplies):
+            if sid not in index:
+                errors.append(f"{where}: supplies names unknown stage {sid!r}")
+            elif sid not in skip:
+                errors.append(f"{where}: supplies names {sid!r}, which the intent does not skip (it supplies what it skips)")
+            elif stages[index[sid]]["record"] != "spec":
+                errors.append(f"{where}: supplies names {sid!r}, which writes a {stages[index[sid]]['record']} record; only a spec can be supplied")
+        gates = intent.get("gates", {})
+        if not isinstance(gates, dict) or not all(isinstance(g, str) for g in gates.values()):
+            errors.append(f"{where}: gates must map stage ids to gate names")
+            gates = {}
+        for sid, gate in gates.items():
+            if sid not in index:
+                errors.append(f"{where}: gates names unknown stage {sid!r}")
+            if gate not in KNOWN_GATES:
+                errors.append(f"{where}: unknown gate {gate!r} (known: {', '.join(KNOWN_GATES)})")
+            if sid in index and gate in KNOWN_GATES:
+                if sid in skip:
+                    errors.append(f"{where}: gates names {sid!r}, which the intent skips")
+                elif GATE_RECORDS[gate] != stages[index[sid]]["record"]:
+                    errors.append(f"{where}: gate {gate!r} reads a {GATE_RECORDS[gate]} record, but stage {sid!r} writes a {stages[index[sid]]['record']}")
+        if "lenses" in intent:
+            lenses = intent["lenses"]
+            if not isinstance(lenses, list) or not lenses or not all(isinstance(x, str) for x in lenses):
+                errors.append(f"{where}: lenses must be a non-empty list")
+            else:
+                for lens in lenses:
+                    if lens not in KNOWN_LENSES:
+                        errors.append(f"{where}: unknown lens {lens!r} (known: {', '.join(KNOWN_LENSES)})")
+        if len(errors) > before:
+            continue  # the reads cannot be judged from an intent that is malformed
+        available = input_names | set(supplies)
+        for label, row in rows:
+            listed = row.get("stages")
+            if not isinstance(listed, list):
+                continue  # a malformed row is reported as such elsewhere
+            seen: list[str] = []
+            for sid in (s for s in listed if isinstance(s, str) and s in index and s not in skip):
+                for name, optional in _read_names(stages[index[sid]]):
+                    if not optional and name not in available and name not in seen:
+                        errors.append(
+                            f"{where}, row '{label}': stage '{sid}' reads '{name}', which no stage left in the row produces "
+                            "and the intent does not supply"
+                        )
+                seen.append(sid)
+
+
 def check_pipeline_file(path: Path) -> tuple[dict | None, list[str], list[str]]:
     """Load and validate one pipeline file; returns (pipeline or None, errors, notes)."""
     try:
@@ -692,6 +841,36 @@ class Project:
     def graft_enabled(self) -> bool:
         graft = (self.config or {}).get("graft")
         return isinstance(graft, dict) and graft.get("enabled") is True
+
+    @property
+    def commands(self) -> dict[str, list[str]]:
+        """The repo's [commands] as {class: [command prefixes]}, only those that are set."""
+        raw = (self.config or {}).get("commands")
+        found: dict[str, list[str]] = {}
+        if isinstance(raw, dict):
+            for name in CONFIG_COMMANDS:
+                value = raw.get(name)
+                prefixes = [value] if isinstance(value, str) else (value if isinstance(value, list) else [])
+                prefixes = [p.strip() for p in prefixes if isinstance(p, str) and p.strip()]
+                if prefixes:
+                    found[name] = prefixes
+        return found
+
+    @property
+    def roles(self) -> dict:
+        """The role policies: the pipeline's own, or the shipped default's for a pipeline that has none."""
+        roles = (self.pipeline or {}).get("roles")
+        return roles if isinstance(roles, dict) and roles else default_roles()
+
+
+@functools.lru_cache(maxsize=None)
+def default_roles() -> dict:
+    try:
+        with open(PIPELINE_DIR / f"{DEFAULT_PIPELINE}.toml", "rb") as handle:
+            roles = tomllib.load(handle).get("roles")
+    except (OSError, ValueError):
+        roles = None
+    return roles if isinstance(roles, dict) else {}
 
 
 def shipped_pipelines() -> list[str]:
@@ -816,6 +995,82 @@ def default_base(root: Path) -> tuple[str, str | None]:
     raise PlumblineError("no base found: the remote's default branch, origin/main and main are all missing; pass --base REF")
 
 
+# The change, as one hash. `diff_sha256` in the verify and review records is the sha256 of what
+# `git diff-tree --raw` lists between the tree of the run's merge base and the tree of the files as they
+# are (untracked files included, .plumbline/ left out): the mode, blob id and path of each changed file.
+# It is content-addressed, so a change hashes the same before and after it is committed, and it differs
+# as soon as any file of the change differs.
+
+HIDE_RUNS = ":(exclude).plumbline"
+
+
+def _git_index(root: Path, index: Path, *args: str, timeout: int = 120) -> str:
+    """Run git with GIT_INDEX_FILE pointing at `index`; stdout as text."""
+    env = {**os.environ, "GIT_INDEX_FILE": str(index)}
+    try:
+        result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, timeout=timeout, env=env)
+    except FileNotFoundError:
+        raise PlumblineError("git was not found on PATH") from None
+    except subprocess.TimeoutExpired:
+        raise PlumblineError(f"git {args[0]} timed out") from None
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip() or f"exit status {result.returncode}"
+        raise PlumblineError(f"git {' '.join(args[:2])} failed: {detail}")
+    return result.stdout.decode("utf-8", "surrogateescape")
+
+
+def worktree_tree(root: Path) -> str:
+    """The tree a commit of everything would take: the tracked files as they are now, and the untracked
+    files that are not ignored. Nothing is staged: the work is done in a copy of the index. The copy keeps the
+    index's own timestamp (git's check for an edit made within the second of the last index write compares
+    it), and every tracked file is read again besides, so that no timestamp can hide an edit: a file of the
+    same size rewritten within that second looks unchanged to `git add` alone. Starting from the real index,
+    not an empty one, keeps the files that are tracked although .gitignore names them."""
+    named = _git_text(root, "rev-parse", "--git-path", "index").strip()
+    source = Path(named) if os.path.isabs(named) else root / named
+    with tempfile.TemporaryDirectory(prefix="plumbline-") as scratch:
+        index = Path(scratch) / "index"
+        try:
+            shutil.copy2(source, index)
+        except FileNotFoundError:
+            pass  # no index yet: start from an empty one
+        _git_index(root, index, "add", "-A")  # the untracked files, the deletions, and the edits that show in the stat data
+        _git_index(root, index, "add", "--renormalize", "-u")  # and every tracked file, read again
+        _git_index(root, index, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", ".plumbline")  # never part of the change
+        return _git_index(root, index, "write-tree").strip()
+
+
+def head_tree(root: Path) -> str:
+    return _git_text(root, "rev-parse", "--verify", "HEAD^{tree}").strip()
+
+
+def change_hash(root: Path, merge_base: str, tree: str | None = None) -> str:
+    """The sha256 of the change from `merge_base` to `tree` (the files as they are, by default)."""
+    if tree is None:
+        tree = worktree_tree(root)
+    result = _git(root, "diff-tree", "-r", "--raw", "--full-index", "--no-renames", "--no-ext-diff", "-z", merge_base, tree, "--", ".", HIDE_RUNS)
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip() or f"exit status {result.returncode}"
+        raise PlumblineError(f"cannot hash the change from {merge_base[:12]}: {detail}")
+    return hashlib.sha256(result.stdout).hexdigest()
+
+
+def resolve_base(root: Path, base: str | None) -> tuple[str, str, list[str]]:
+    """(the base ref, `git merge-base <base> HEAD`, notes): the base as given, or the default one."""
+    notes: list[str] = []
+    if base is None:
+        base, note = default_base(root)
+        if note:
+            notes.append(note)
+    elif base.startswith("-") or not _ref_exists(root, base):
+        raise PlumblineError(f"base {base!r} is not a commit in this repository")
+    merge_result = _git(root, "merge-base", base, "HEAD")
+    merge_base = merge_result.stdout.decode().strip()
+    if merge_result.returncode != 0 or not merge_base:
+        raise PlumblineError(f"'{base}' and HEAD have no common ancestor")
+    return base, merge_base, notes
+
+
 def _count_lines(path: Path) -> int | None:
     """Lines in a text file; None when it looks binary (a NUL in the first 8 KiB)."""
     lines, last, first = 0, b"", True
@@ -848,26 +1103,89 @@ def find_row(pipeline: dict, label: str) -> dict:
     return row[size] if size else row
 
 
-def classify(root: Path, pipeline: dict, base: str | None = None) -> dict:
+def row_labels(pipeline: dict) -> list[str]:
+    """Every row label of the pipeline: `docs` for a flat row, `code.S`, `code.M` and `code.L` for a split one."""
+    labels = []
+    for type_id, row in pipeline["matrix"].items():
+        labels += [type_id] if "stages" in row else [f"{type_id}.{size}" for size in SIZE_LABELS if size in row]
+    return labels
+
+
+# ---------------------------------------------------------------- intents
+#
+# The row selects stages; the intent then removes stages (`skip`), or supplies the
+# record a removed stage would have written (`supplies`), replaces the gate of a
+# stage (`gates`) and the lenses of the review of the diff (`lenses`).
+
+
+def intent_ids(pipeline: dict) -> list[str]:
+    ids = list(pipeline.get("intent") or {})
+    return ids if DEFAULT_INTENT in ids else [DEFAULT_INTENT, *ids]
+
+
+def intent_table(pipeline: dict, intent_id: str) -> dict:
+    """The [intent.<id>] table. `feature` is the default and skips nothing, even when the pipeline defines no intents."""
+    intents = pipeline.get("intent") or {}
+    if intent_id in intents:
+        return intents[intent_id]
+    if intent_id == DEFAULT_INTENT:
+        return {}
+    raise PlumblineError(f"unknown intent {intent_id!r}; the intents are {', '.join(intent_ids(pipeline))}")
+
+
+@dataclass
+class EffectiveRow:
+    """A row with an intent applied: the stages that run, the records that are supplied instead, and what is replaced."""
+
+    label: str
+    intent: str
+    stages: list[str]  # stage ids, in definition order
+    supplied: list[str]  # stage ids whose records the intent supplies
+    lenses: list[str] | None  # for the review of the diff
+    gates: dict[str, str]  # stage id -> the gate that replaces its own
+    note: str | None
+
+
+def effective_row(pipeline: dict, label: str, intent_id: str = DEFAULT_INTENT) -> EffectiveRow:
+    intent = intent_table(pipeline, intent_id)
+    if label not in row_labels(pipeline):  # `code` alone is no row when code is split by size
+        raise PlumblineError(f"{label!r} is not a row of this pipeline (the rows are {', '.join(row_labels(pipeline))})")
+    row = find_row(pipeline, label)
+    skip = set(intent.get("skip", []))
+    return EffectiveRow(
+        label=label,
+        intent=intent_id,
+        stages=[sid for sid in row["stages"] if sid not in skip],
+        supplied=list(intent.get("supplies", [])),
+        lenses=list(intent["lenses"]) if intent.get("lenses") else (list(row["lenses"]) if row.get("lenses") else None),
+        gates=dict(intent.get("gates", {})),
+        note=row.get("note"),
+    )
+
+
+def effective_stage(stage: dict, effective: EffectiveRow) -> dict:
+    """The stage as this run has it: a copy, with the intent's gate in place of its own."""
+    stage = dict(stage)
+    if stage["id"] in effective.gates:
+        stage["gate"] = effective.gates[stage["id"]]
+    return stage
+
+
+def classify(root: Path, pipeline: dict, base: str | None = None, intent: str = DEFAULT_INTENT, row: str | None = None) -> dict:
     """The change_class record for the work tree at `root`: the diff from
     `git merge-base <base> HEAD` to the working tree, plus untracked files that
-    are not ignored (counted as added lines)."""
+    are not ignored (counted as added lines). The record carries the `intent`.
+    A change that does not exist yet has nothing to measure: `row` then declares
+    the row, and the record says so."""
+    intent_table(pipeline, intent)  # an unknown intent is refused before anything is measured
+    if row is not None and row not in row_labels(pipeline):
+        raise PlumblineError(f"{row!r} is not a row of this pipeline (the rows are {', '.join(row_labels(pipeline))})")
     head_result = _git(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
     if head_result.returncode != 0:
         raise PlumblineError("the repository has no commits yet; there is nothing to compare against")
     head = head_result.stdout.decode().strip()
 
-    notes: list[str] = []
-    if base is None:
-        base, note = default_base(root)
-        if note:
-            notes.append(note)
-    elif base.startswith("-") or not _ref_exists(root, base):
-        raise PlumblineError(f"base {base!r} is not a commit in this repository")
-    merge_result = _git(root, "merge-base", base, "HEAD")
-    merge_base = merge_result.stdout.decode().strip()
-    if merge_result.returncode != 0 or not merge_base:
-        raise PlumblineError(f"'{base}' and HEAD have no common ancestor")
+    base, merge_base, notes = resolve_base(root, base)
 
     entries: dict[str, dict] = {}
     raw = _git_text(root, "diff", "--raw", "-z", "--no-renames", "--no-ext-diff", merge_base, "--").split("\0")
@@ -916,8 +1234,11 @@ def classify(root: Path, pipeline: dict, base: str | None = None) -> dict:
     if binary:
         notes.append("binary files count as 0 lines: " + ", ".join(sorted(binary)))
 
-    if not entries:
-        raise PlumblineError(f"no changes between the merge base of '{base}' and the working tree; there is nothing to classify")
+    if not entries and row is None:
+        raise PlumblineError(
+            f"no changes between the merge base of '{base}' and the working tree; there is nothing to classify "
+            "(a change that does not exist yet needs its row declared: --row ROW)"
+        )
 
     type_patterns = [(t["id"], t["paths"]) for t in pipeline["type"]]
     files = []
@@ -938,6 +1259,16 @@ def classify(root: Path, pipeline: dict, base: str | None = None) -> dict:
     size = size_for(lines, pipeline["sizes"])
     present = {f["type"] for f in files}
     types = [tid for tid in pipeline["precedence"] if tid in present]
+    if row is None:
+        chosen = row_label(pipeline, types[0], size)
+    else:
+        chosen = row
+        type_id, _, declared_size = row.partition(".")
+        if not files:
+            types, size = [type_id], declared_size or "S"
+            notes.append(f"nothing has changed yet, so the row {row} was declared, not measured")
+        elif row_label(pipeline, types[0], size) != row:
+            notes.append(f"the row {row} was declared; the change measures as {row_label(pipeline, types[0], size)}")
     return {
         "base": base,
         "head": head,
@@ -946,7 +1277,8 @@ def classify(root: Path, pipeline: dict, base: str | None = None) -> dict:
         "types": types,
         "lines": lines,
         "size": size,
-        "row": row_label(pipeline, types[0], size),
+        "row": chosen,
+        "intent": intent,
         "symlinks": [f["path"] for f in files if f["symlink"]],
         "notes": notes,
     }
@@ -960,25 +1292,30 @@ def default_run_id(root: Path) -> str:
     return f"{short}-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
 
 
-def build_plan(pipeline: dict, record: dict, run_id: str) -> dict:
+def build_plan(pipeline: dict, record: dict, run_id: str, commands: dict | None = None, graft: bool = False) -> dict:
     """The stages to run for a classified change, in order, with every read
-    resolved to a record path and every on_fail resolved within the row."""
-    row = find_row(pipeline, record["row"])
+    resolved to a record path and every on_fail resolved within the row. The
+    intake record's intent is applied to the row: skipped stages are left out,
+    the records it supplies count as present, and its gates and lenses replace
+    the stages' own."""
+    intent = record.get("intent", DEFAULT_INTENT)
+    effective = effective_row(pipeline, record["row"], intent)
     by_id = {s["id"]: s for s in pipeline["stage"]}
-    in_row = list(row["stages"])
+    in_row = list(effective.stages)
+    present = set(in_row) | set(effective.supplied)
     record_dir = f"{RUNS_DIR}/{run_id}"
 
     stages = []
     for sid in in_row:
-        stage = by_id[sid]
+        stage = effective_stage(by_id[sid], effective)
         kind = stage.get("kind", "agent")
         lenses = stage.get("lenses")
-        if _is_diff_review(stage) and "lenses" in row:
-            lenses = list(row["lenses"])
+        if _is_diff_review(stage) and effective.lenses:
+            lenses = list(effective.lenses)
         reads = []
         for name, optional in _read_names(stage):
             is_input = name in pipeline["inputs"]
-            path = None if is_input or name not in in_row else f"{record_dir}/{name}.json"
+            path = None if is_input or name not in present else f"{record_dir}/{name}.json"
             reads.append({"name": name, "kind": "input" if is_input else "record", "path": path, "optional": optional})
         on_fail = stage.get("on_fail")
         if on_fail is not None and on_fail != "main" and on_fail not in in_row:
@@ -1002,6 +1339,7 @@ def build_plan(pipeline: dict, record: dict, run_id: str) -> dict:
     return {
         "run_id": run_id,
         "pipeline": pipeline["name"],
+        "intent": intent,
         "row": record["row"],
         "size": record["size"],
         "lines": record["lines"],
@@ -1009,8 +1347,13 @@ def build_plan(pipeline: dict, record: dict, run_id: str) -> dict:
         "head": record["head"],
         "base": record["base"],
         "merge_base": record["merge_base"],
-        "note": row.get("note"),
+        "note": effective.note,
         "record_dir": record_dir,
+        "commands": commands or {},
+        "graft": graft,
+        "supplied": [
+            {"stage": sid, "record": by_id[sid]["record"], "path": f"{record_dir}/{sid}.json"} for sid in effective.supplied
+        ],
         "stages": stages,
     }
 
@@ -1039,6 +1382,14 @@ enabled = {enabled}
 # [matrix.voice]
 # stages = ["intake", "reduce"]
 # note = "Voice and prompt changes go through this repository's own evals."
+#
+# The commands the verifier and the test-writer run (each a command prefix, or a list of prefixes).
+# The verifier needs `test`; without it the verify stage cannot run the tests.
+# [commands]
+# test = "python3 -m pytest"
+# lint = "ruff check"
+# typecheck = "mypy ."
+# build = "make build"
 """
 
 
@@ -1507,27 +1858,37 @@ class Run:
     root: Path
     run_id: str
     row: str  # the matrix row, such as code.M
-    stages: list[dict]  # the row's stage definitions, in order
-    lenses: list[str] | None  # the row's own review lenses, when it sets any
+    stages: list[dict]  # the stage definitions that run, in order: the row's, less what the intent skips, with its gates
+    lenses: list[str] | None  # the review lenses of the row or the intent, when either sets any
     note: str | None
+    intent: str = DEFAULT_INTENT
+    supplied: list[dict] = field(default_factory=list)  # the stages whose records the intent supplies instead of running them
+    base: str = ""  # the intake record's base ref and merge base: the change is measured from there
+    merge_base: str = ""
+
+
+def intake_stage_of(pipeline: dict) -> dict:
+    intake = next((s for s in pipeline["stage"] if s["record"] == "change_class"), None)
+    if intake is None:
+        raise PlumblineError("the pipeline has no stage that writes a change_class record")
+    return intake
 
 
 def load_run(project: Project, run_id: str) -> Run:
     existing_run_dir(project.root, run_id)
-    all_stages = project.pipeline["stage"]
-    by_id = {s["id"]: s for s in all_stages}
-    intake = next((s for s in all_stages if s["record"] == "change_class"), None)
-    if intake is None:
-        raise PlumblineError("the pipeline has no stage that writes a change_class record")
-    data, problems = read_stage_record(project.root, run_id, intake)
+    by_id = {s["id"]: s for s in project.pipeline["stage"]}
+    data, problems = read_stage_record(project.root, run_id, intake_stage_of(project.pipeline))
     if data is None:
         raise PlumblineError(f"the run's intake record is not usable: {problems[0]}")
     try:
-        row = find_row(project.pipeline, data["row"])
-        stages = [by_id[sid] for sid in row["stages"]]
+        effective = effective_row(project.pipeline, data["row"], data["intent"])
+        stages = [effective_stage(by_id[sid], effective) for sid in effective.stages]
+        supplied = [effective_stage(by_id[sid], effective) for sid in effective.supplied]
+    except PlumblineError as exc:
+        raise PlumblineError(f"the run's intake record does not fit this repository's pipeline: {exc}") from None
     except (KeyError, TypeError):
         raise PlumblineError(f"the run's row {data['row']!r} is not a row of this repository's pipeline") from None
-    return Run(project.root, run_id, data["row"], stages, row.get("lenses"), row.get("note"))
+    return Run(project.root, run_id, data["row"], stages, effective.lenses, effective.note, data["intent"], supplied, data["base"], data["merge_base"])
 
 
 # ------------------------------------------------------------------ gates
@@ -1572,6 +1933,21 @@ def _gate_tests_fail_on_stub(tests: dict, _load_spec) -> list[str]:
     return []
 
 
+def _gate_reproduces_on_head(tests: dict, load_spec) -> list[str]:
+    """The gate of a fix's tests, in place of `acs_covered`: the new tests must fail on today's code, and on
+    an assertion. The stub check records that run (the code is HEAD's own, so there are no stubs). It keeps
+    the coverage rule of the gate it replaces: every acceptance criterion has a test."""
+    problems = _gate_acs_covered(tests, load_spec)
+    stub = tests["stub_check"]
+    if not tests["tests"]:
+        problems.append("there are no tests")
+    if not stub["ran"]:
+        problems.append("the new tests were not run against today's code")
+    elif not stub["all_failed_on_assertions"]:
+        problems.append("not every new test fails on an assertion against today's code (one that passes there, or fails on an import or syntax error, reproduces nothing)")
+    return problems
+
+
 def _gate_verify_green(verify: dict, _load_spec) -> list[str]:
     if verify["green"]:
         return []
@@ -1591,6 +1967,7 @@ GATE_CHECKS = {
     "spec_complete": _gate_spec_complete,
     "acs_covered": _gate_acs_covered,
     "tests_fail_on_stub": _gate_tests_fail_on_stub,
+    "reproduces_on_head": _gate_reproduces_on_head,
     "verify_green": _gate_verify_green,
     "no_surviving_blockers": _gate_no_surviving_blockers,
 }
@@ -1606,7 +1983,7 @@ def check_all_gates_passed(project: Project, run_id: str, own_stage: dict) -> li
         if entry.get("kind") == "gate" and isinstance(entry.get("stage"), str):
             latest[entry["stage"]] = entry
     problems = []
-    for stage in run.stages:
+    for stage in [*run.supplied, *run.stages]:  # what an intent supplies is part of the run: it must still hold
         if stage["id"] == own_stage["id"]:
             continue
         _data, record_problems = read_stage_record(root, run_id, stage)
@@ -1817,6 +2194,7 @@ def merge_review(project: Project, run_id: str, stage_id: str, round_no: int | N
         "survivors": survivors,
         "gaps": gaps_records[0][1]["gaps"] if gaps_records else [],
         "blockers_surviving": sum(1 for fid in survivors if severity[fid] == "BLOCKING"),
+        "diff_sha256": change_hash(root, run.merge_base),
     }
     errors = check_record("review_record", record)
     if errors:
@@ -1918,9 +2296,11 @@ def dirty_paths(root: Path) -> list[str]:
     return [p for p in paths if not p.startswith(IGNORE_ENTRY)]
 
 
-def coverage(root: Path, head: str) -> tuple[str | None, str]:
+def coverage(root: Path, head: str, project: Project | None = None) -> tuple[str | None, str]:
     """How HEAD is covered: ("pass" or "override", detail), or (None, why not).
-    The record must validate and name this very commit; a pass record must say pass."""
+    The record must validate and name this very commit; a pass record must say pass.
+    With a `project`, a pass record is not trusted on its own: its run is evaluated
+    again (see verify_pass), which is what the push gate and `status` do."""
     if not re.fullmatch(r"[0-9a-f]{40,64}", head):
         return None, "HEAD is not a commit id"
     pass_file = root / PASS_DIR / f"{head}.json"
@@ -1934,7 +2314,10 @@ def coverage(root: Path, head: str) -> tuple[str | None, str]:
         elif data["verdict"] != "pass":
             reason = f"{rel_path(root, pass_file)} says {data['verdict']}, not pass"
         else:
-            return "pass", f"run {data['run_id']}"
+            doubts = verify_pass(project, head, data) if project is not None else []
+            if not doubts:
+                return "pass", f"run {data['run_id']}"
+            reason = f"{rel_path(root, pass_file)} does not hold up: " + "; ".join(doubts[:3]) + (f"; and {len(doubts) - 3} more" if len(doubts) > 3 else "")
     elif problem == "no such file":
         reason = "no pass or override record"
     else:
@@ -1955,10 +2338,35 @@ def rounds_taken(stage: dict, record: dict | None, ledger: list[dict]) -> int:
     return agents or 1
 
 
+def stale_change_problems(project: Project, run: Run) -> list[str]:
+    """The verify record and the review of the diff must cover the change HEAD holds: the diff from the
+    run's merge base to HEAD must hash to the `diff_sha256` of each. A change edited after them does not."""
+    root = project.root
+    covered = [s for s in run.stages if s["record"] == "verify_record" or _is_diff_review(s)]
+    if not covered:
+        return []
+    try:
+        current = change_hash(root, run.merge_base, head_tree(root))
+    except PlumblineError as exc:
+        return [str(exc)]
+    problems = []
+    for stage in covered:
+        data, _ = read_stage_record(root, run.run_id, stage)
+        if data is not None and data["diff_sha256"] != current:
+            problems.append(
+                f"stage '{stage['id']}': its record covers the change {data['diff_sha256'][:12]}, but the change of HEAD from the merge base "
+                f"hashes to {current[:12]}; the change was edited after that record was made, so run the pipeline again from verify"
+            )
+    return problems
+
+
 def make_pass_record(project: Project, run_id: str) -> tuple[dict | None, list[str], Path]:
     """The pass_record for HEAD, as (record, problems, the run's copy of it). It
     needs a clean working tree (apart from .plumbline/) and every gate of the
-    run's row to pass, each gate being evaluated afresh and entered in the ledger."""
+    run's row to pass, each gate being evaluated afresh and entered in the ledger.
+    Once they pass, the verify record and the review of the diff must also cover
+    the change HEAD holds (see stale_change_problems). What the run's intent
+    supplies is evaluated like any stage, with rounds 0."""
     root = project.root
     head = head_sha(root)
     run = load_run(project, run_id)
@@ -1970,8 +2378,10 @@ def make_pass_record(project: Project, run_id: str) -> tuple[dict | None, list[s
 
     reduce_stage = next((s for s in run.stages if s["record"] == "pass_record"), None)
     ledger = read_ledger(root, run_id)
-    stages = []
-    for stage in run.stages:
+    order = {s["id"]: position for position, s in enumerate(project.pipeline["stage"])}
+    entries: list[dict] = []
+    supplied_ids = {s["id"] for s in run.supplied}
+    for stage in [*run.supplied, *run.stages]:
         if stage is reduce_stage:
             continue
         outcome = evaluate_stage(project, run_id, stage)
@@ -1979,26 +2389,78 @@ def make_pass_record(project: Project, run_id: str) -> tuple[dict | None, list[s
             append_ledger(root, run_id, ledger_gate_entry(outcome))
         if not outcome.passed:
             problems.append(f"stage '{stage['id']}'" + (f" (gate {outcome.gate})" if outcome.gate else "") + ": " + "; ".join(outcome.problems[:3]))
-        stages.append(
-            {"id": stage["id"], "record": outcome.record, "gate": outcome.gate, "passed": outcome.passed, "rounds": rounds_taken(stage, outcome.data, ledger)}
-        )
+        rounds = 0 if stage["id"] in supplied_ids else rounds_taken(stage, outcome.data, ledger)
+        entries.append({"id": stage["id"], "record": outcome.record, "gate": outcome.gate, "passed": outcome.passed, "rounds": rounds})
     reduce_id = reduce_stage["id"] if reduce_stage else "reduce"
     reduce_path = run_dir(root, run_id) / f"{reduce_id}.json"
     if reduce_stage is not None and reduce_stage.get("gate") == "all_gates_passed" and not problems:
         final = check_all_gates_passed(project, run_id, reduce_stage)
         problems += [f"stage '{reduce_id}' (gate all_gates_passed): {p}" for p in final]
+    if not problems:
+        problems += stale_change_problems(project, run)
     if problems:
         return None, problems, reduce_path
     if reduce_stage is not None:
-        stages.append({"id": reduce_id, "record": rel_path(root, reduce_path), "gate": reduce_stage.get("gate"), "passed": True, "rounds": 1})
+        entries.append({"id": reduce_id, "record": rel_path(root, reduce_path), "gate": reduce_stage.get("gate"), "passed": True, "rounds": 1})
+    entries.sort(key=lambda entry: order.get(entry["id"], len(order)))
     tokens, notes = tokens_for_run(root, run_id)
     if run.note:
         notes.insert(0, run.note)
-    record = {"commit": head, "run_id": run_id, "row": run.row, "stages": stages, "tokens": tokens, "verdict": "pass", "notes": notes}
+    if run.supplied:
+        notes.append(f"intent {run.intent}: the record of {', '.join(sorted(supplied_ids))} was supplied, not written by an agent")
+    record = {"commit": head, "run_id": run_id, "row": run.row, "stages": entries, "tokens": tokens, "verdict": "pass", "notes": notes}
     errors = check_record("pass_record", record)
     if errors:
         raise PlumblineError("internal error: the pass_record does not validate: " + "; ".join(errors[:3]))
     return record, [], reduce_path
+
+
+def note_pass(root: Path, run_id: str, record: dict, pass_file: Path) -> None:
+    """Enter a pass in the run's ledger, with the hash of every record the pass record lists and of the pass
+    record itself, so that `verify_pass` can tell later whether any of them was altered."""
+    append_ledger(
+        root,
+        run_id,
+        {
+            "kind": "pass",
+            "commit": record["commit"],
+            "pass_record": rel_path(root, pass_file),
+            "pass_sha256": file_sha256(pass_file),
+            "records": {entry["record"]: file_sha256(root / entry["record"]) for entry in record["stages"]},
+        },
+    )
+
+
+def verify_pass(project: Project, head: str, data: dict) -> list[str]:
+    """What makes a valid pass record for `head` untrustworthy, as problems (none when it holds). The pass
+    file is not taken at its word: the ledger of its run must show that `pass` wrote it, none of the records
+    it lists (nor the pass file) may have changed since, and the gate `all_gates_passed` is evaluated again."""
+    root = project.root
+    run_id = data["run_id"]
+    try:
+        run = load_run(project, run_id)
+    except PlumblineError as exc:
+        return [f"its run cannot be read ({exc})"]
+    entry = next((e for e in reversed(read_ledger(root, run_id)) if e.get("kind") == "pass" and e.get("commit") == head), None)
+    if entry is None:
+        return [f"the ledger of run {run_id} does not show `pass` writing it"]
+    problems = []
+    if entry.get("pass_sha256") != file_sha256(root / PASS_DIR / f"{head}.json"):
+        problems.append("the pass record was altered after `pass` wrote it")
+    hashed = entry.get("records") if isinstance(entry.get("records"), dict) else {}
+    altered = []
+    for listed in data["stages"]:
+        path = listed["record"]
+        if path not in hashed:
+            problems.append(f"the ledger has no hash of {path}, which the pass record lists")
+        elif file_sha256(root / path) != hashed[path]:
+            altered.append(path)
+    if altered:
+        problems.append("records altered after the pass: " + ", ".join(altered))
+    reduce_stage = next((s for s in run.stages if s["record"] == "pass_record"), None)
+    if reduce_stage is not None and reduce_stage.get("gate") == "all_gates_passed":
+        problems += [f"all_gates_passed: {p}" for p in check_all_gates_passed(project, run_id, reduce_stage)]
+    return problems
 
 
 def git_identity(root: Path) -> str:
@@ -2031,7 +2493,7 @@ def make_override(project: Project, reason: str, run_id: str | None) -> dict:
     if run_id is not None:
         try:
             run = load_run(project, run_id)
-            skipped = [s["id"] for s in run.stages if s["record"] != "pass_record" and not evaluate_stage(project, run_id, s).passed]
+            skipped = [s["id"] for s in [*run.supplied, *run.stages] if s["record"] != "pass_record" and not evaluate_stage(project, run_id, s).passed]
         except PlumblineError:
             pass  # a run whose intake cannot be read did not get anywhere
     if skipped is None:
@@ -2087,7 +2549,7 @@ def _ready_project(project_arg: str | None) -> Project:
 
 def cmd_classify(args) -> int:
     project = _ready_project(args.project)
-    record = classify(project.root, project.pipeline, args.base)
+    record = classify(project.root, project.pipeline, args.base, args.intent, args.row)
     problems = check_record("change_class", record)
     if problems:
         raise PlumblineError("internal error: the change_class record does not validate: " + "; ".join(problems))
@@ -2102,11 +2564,81 @@ def cmd_classify(args) -> int:
     return 0
 
 
+def supplied_records(effective: EffectiveRow, spec_file: str | None) -> tuple[str | None, dict | None, list[str]]:
+    """The spec an intent supplies, as (where it came from, the record, problems). A usage problem (no spec
+    where one is needed, a spec where none is wanted, an unreadable file) is an exception; a spec that does
+    not hold is a list of problems. The record is validated against the spec schema and must pass the gate
+    of the stage it stands for (`spec_complete`): supplying a record does not skip what the stage would have had to meet."""
+    if not effective.supplied:
+        if spec_file:
+            raise PlumblineError(f"the intent '{effective.intent}' supplies no record, so --spec does not apply")
+        return None, None, []
+    template = TEMPLATE_DIR / f"{effective.intent}.json"
+    if template.is_file():
+        if spec_file:
+            raise PlumblineError(f"the intent '{effective.intent}' uses its shipped template (pipeline/templates/{template.name}), so --spec does not apply")
+        path, source = template, f"the shipped template pipeline/templates/{template.name}"
+    else:
+        if not spec_file:
+            raise PlumblineError(f"the intent '{effective.intent}' supplies the spec: pass --spec FILE, a spec record (see schemas/spec.json)")
+        path, source = Path(spec_file).expanduser(), spec_file
+    data, problem = load_json_file(path)
+    if problem:
+        if problem.startswith("not valid JSON"):
+            return source, None, [f"{source}: {problem}"]
+        raise PlumblineError(f"{source}: {problem}")
+    problems = [f"{source}: {error}" for error in check_record("spec", data)]
+    if not problems:
+        problems = [f"{source}: {problem}" for problem in _gate_spec_complete(data, None)]
+    return source, (None if problems else data), problems
+
+
+def start_run(project: Project, run_id: str, record: dict, effective: EffectiveRow, source: str | None, supplied: dict | None) -> list[str]:
+    """Begin a run: copy what the intent supplies, then write the intake record, which carries the intent.
+    The intake record goes last: a run has begun once it exists, and a start that failed halfway can be redone.
+    Returns the reasons the run was not started (the run already began), or nothing."""
+    root = project.root
+    intake_stage = intake_stage_of(project.pipeline)
+    intake_path = run_dir(root, run_id) / f"{intake_stage['id']}.json"
+    if intake_path.exists():
+        return [f"run '{run_id}' has begun ({rel_path(root, intake_path)} exists); a run is never restarted, so pick another --run-id"]
+    by_id = {s["id"]: s for s in project.pipeline["stage"]}
+    for sid in effective.supplied:
+        path = run_dir(root, run_id) / f"{sid}.json"
+        write_json_atomic(path, supplied)
+        append_ledger(root, run_id, {"kind": "supplied", "stage": sid, "record": rel_path(root, path), "source": source, "record_sha256": file_sha256(path)})
+        outcome = evaluate_stage(project, run_id, effective_stage(by_id[sid], effective))
+        if outcome.gate is not None:
+            append_ledger(root, run_id, ledger_gate_entry(outcome))
+    write_json_atomic(intake_path, record)
+    return []
+
+
 def cmd_plan(args) -> int:
     project = _ready_project(args.project)
+    starting = args.intent is not None  # `--intent` starts the run: it writes its intake record
+    if args.spec and not starting:
+        raise PlumblineError("--spec goes with --intent (the intent that supplies the spec)")
+    intent = args.intent or DEFAULT_INTENT
     run_id = check_run_id(args.run_id if args.run_id is not None else default_run_id(project.root))
-    record = classify(project.root, project.pipeline, args.base)
-    sys.stdout.write(json.dumps(build_plan(project.pipeline, record, run_id), indent=2) + "\n")
+    record = classify(project.root, project.pipeline, args.base, intent, args.row)
+    effective = effective_row(project.pipeline, record["row"], intent)
+    plan = build_plan(project.pipeline, record, run_id, project.commands, project.graft_enabled)
+    if starting:
+        source, supplied, problems = supplied_records(effective, args.spec)
+        if problems:
+            for problem in problems:
+                print(f"error: {problem}")
+            print(f"plan: the spec for intent '{intent}' does not hold ({_plural(len(problems), 'problem')}); nothing was written")
+            return 1
+        refused = start_run(project, run_id, record, effective, source, supplied)
+        if refused:
+            for reason in refused:
+                print(f"plumbline: {reason}. Nothing was changed.", file=sys.stderr)
+            return 1
+        for entry in plan["supplied"]:
+            entry["source"] = source
+    sys.stdout.write(json.dumps(plan, indent=2) + "\n")
     return 0
 
 
@@ -2192,6 +2724,12 @@ def cmd_gate(args) -> int:
     stage = next((s for s in project.pipeline["stage"] if s["id"] == args.stage), None)
     if stage is None:
         raise PlumblineError(f"the pipeline has no stage '{args.stage}'")
+    try:
+        run = load_run(project, args.run_id)
+    except PlumblineError:
+        run = None  # a run without a usable intake record has no intent, so the stage's own gate applies
+    if run is not None:
+        stage = next((s for s in [*run.supplied, *run.stages] if s["id"] == stage["id"]), stage)  # the intent may have replaced its gate
     if stage.get("gate") is None:
         print(f"stage '{args.stage}' has no gate; nothing to evaluate")
         return 0
@@ -2233,6 +2771,7 @@ def cmd_pass(args) -> int:
     pass_file = project.root / PASS_DIR / f"{record['commit']}.json"
     write_json_atomic(run_copy, record)
     write_json_atomic(pass_file, record)
+    note_pass(project.root, args.run_id, record, pass_file)
     print(f"plumbline: pass recorded for {record['commit'][:7]} (run {args.run_id}, row {record['row']})")
     print(f"  wrote {rel_path(project.root, run_copy)} and {rel_path(project.root, pass_file)}")
     for model, usage in record["tokens"]["by_model"].items():
@@ -2242,7 +2781,7 @@ def cmd_pass(args) -> int:
 
 def cmd_override(args) -> int:
     project = _adopted_project(args.project)
-    reason = args.reason.strip()
+    reason = (sys.stdin.read() if args.reason == "-" else args.reason).strip()  # `-`: the reason arrives on stdin, so that no quoting can alter it
     if len(reason) < 20:
         print(f"plumbline: the reason must be at least 20 characters (this one has {len(reason)}); nothing was written", file=sys.stderr)
         return 1
@@ -2258,6 +2797,23 @@ def cmd_override(args) -> int:
     print(f"plumbline: override recorded for {record['commit'][:7]} in {rel_path(project.root, path)}")
     print(f"  pushes of this commit are no longer held back. By {record['by']}. Stages skipped: {', '.join(record['stages_skipped']) or 'none'}")
     return 0
+
+
+def cmd_check_diff(args) -> int:
+    root = resolve_root(args.project, require_git=True)
+    if args.run_id:
+        merge_base = load_run(_ready_project(args.project), args.run_id).merge_base  # the change is measured from where the run began
+    else:
+        _base, merge_base, _notes = resolve_base(root, args.base)
+    digest = change_hash(root, merge_base)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import pre_tool_use  # the commit checks live with the hook that applies them at commit time
+
+    problems = pre_tool_use.commit_problems(sys.modules[__name__], root, "all", base=merge_base)
+    kinds = {"symlinks": "adds a symlink", "abs_paths": "adds an absolute home path", "secrets": "adds a key-shaped secret"}
+    checks = {name: not any(problem.startswith(prefix) for problem in problems) for name, prefix in kinds.items()}
+    print(json.dumps({"merge_base": merge_base, "diff_sha256": digest, "checks": checks, "problems": problems}, indent=2))
+    return 1 if problems else 0
 
 
 def _stage_state(project: Project, run_id: str, stage: dict) -> tuple[str, list[str]]:
@@ -2285,7 +2841,7 @@ def cmd_status(args) -> int:
     except PlumblineError as exc:
         print(f"HEAD: {exc}")
     else:
-        how, detail = coverage(root, head)
+        how, detail = coverage(root, head, project)
         if how == "pass":
             print(f"HEAD {head[:7]}: covered by a pass record ({detail})")
         elif how == "override":
@@ -2301,9 +2857,13 @@ def cmd_status(args) -> int:
     except PlumblineError as exc:
         print(f"run {run_id}: {exc}")
         return 0
-    print(f"run {run_id}: row {run.row}, {_plural(len(run.stages), 'stage')}")
-    for stage in run.stages:
+    print(f"run {run_id}: row {run.row}, {_plural(len(run.stages), 'stage')}, intent {run.intent}")
+    supplied_ids = {s["id"] for s in run.supplied}
+    order = {s["id"]: position for position, s in enumerate(project.pipeline["stage"])}
+    for stage in sorted([*run.supplied, *run.stages], key=lambda s: order.get(s["id"], len(order))):
         state, problems = _stage_state(project, run_id, stage)
+        if stage["id"] in supplied_ids and state in ("pass", "recorded"):
+            state = "supplied"
         print(f"  {stage['id']:<13}{stage['record']:<15}{state:<10}{stage.get('gate') or '-'}")
         for problem in problems:
             print(f"      {problem}")
@@ -2322,13 +2882,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("classify", help="write the change_class record for the current change")
     p.add_argument("--project", metavar="PATH")
     p.add_argument("--base", metavar="REF", help="default: the remote's default branch, else origin/main, else main")
+    p.add_argument("--intent", metavar="ID", default=DEFAULT_INTENT, help="why the change is made; the record carries it (default: feature)")
+    p.add_argument("--row", metavar="ROW", help="declare the row (for example code.M) instead of measuring it: needed when nothing has changed yet")
     p.add_argument("--out", metavar="FILE", help="write the record here instead of to stdout")
     p.set_defaults(run=cmd_classify)
 
-    p = sub.add_parser("plan", help="print the stages to run for the current change, as JSON")
+    p = sub.add_parser("plan", help="print the stages to run for the current change, as JSON; with --intent, start the run")
     p.add_argument("--project", metavar="PATH")
     p.add_argument("--base", metavar="REF")
     p.add_argument("--run-id", metavar="ID", help="default: <short HEAD sha>-<UTC timestamp>")
+    p.add_argument("--intent", metavar="ID", help="start the run with this intent: writes its intake record and copies the record the intent supplies")
+    p.add_argument("--spec", metavar="FILE", help="the spec that an intent which supplies one (spec-supplied, fix) takes as the plan record")
+    p.add_argument("--row", metavar="ROW", help="declare the row (for example code.M) instead of measuring it: needed when nothing has changed yet")
     p.set_defaults(run=cmd_plan)
 
     p = sub.add_parser("check-record", help="validate a record file against its schema")
@@ -2370,7 +2935,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(run=cmd_pass)
 
     p = sub.add_parser("override", help="record an override for HEAD, so that it can be pushed without a pass (only when the builder asks)")
-    p.add_argument("--reason", required=True, metavar="TEXT", help="why the pipeline is bypassed: at least 20 characters")
+    p.add_argument("--reason", required=True, metavar="TEXT", help="why the pipeline is bypassed: at least 20 characters (`-` reads it from stdin)")
     p.add_argument("--run", dest="run_id", metavar="RUN", help="the run whose unfinished stages are listed (default: the latest)")
     p.add_argument("--project", metavar="PATH")
     p.set_defaults(run=cmd_override)
@@ -2379,6 +2944,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run", dest="run_id", metavar="RUN", help="default: the latest run")
     p.add_argument("--project", metavar="PATH")
     p.set_defaults(run=cmd_status)
+
+    p = sub.add_parser("check-diff", help="run the commit checks on the whole change and print its hash, as JSON: exit 1 when a check fails")
+    p.add_argument("--run", dest="run_id", metavar="RUN", help="measure the change from where this run began (default: from the merge base with the base)")
+    p.add_argument("--base", metavar="REF", help="default: the remote's default branch, else origin/main, else main")
+    p.add_argument("--project", metavar="PATH")
+    p.set_defaults(run=cmd_check_diff)
     return parser
 
 

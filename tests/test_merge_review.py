@@ -12,7 +12,7 @@ from samples import sample
 def unit(repo):
     """An adopted repository with a run of row code.S: its review stage has the lenses correctness and tests, 3 defenders, a survival threshold of 2."""
     adopt(repo)
-    put(repo, "intake", intake_record("code.S"))
+    put(repo, "intake", intake_record("code.S", repo))
     return repo
 
 
@@ -174,7 +174,7 @@ def test_merging_again_once_the_detective_has_run_adds_the_gaps(run_cli, unit):
 
 def test_a_stage_without_defenders_lets_every_finding_survive_and_ignores_defense_records(run_cli, repo):
     adopt(repo)
-    put(repo, "intake", intake_record("code.M"))
+    put(repo, "intake", intake_record("code.M", repo))
     put_part(repo, "test-review", "prosecutor-tests", {"lens": "tests", "findings": [finding("tests-1", "tests", "BLOCKING")]})
     put_part(repo, "test-review", "d1", {"defender": "d1", "defenses": [defense("tests-1", "d1", "refuted")]})
     result = merge(run_cli, repo, stage="test-review")

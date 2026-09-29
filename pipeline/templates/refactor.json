@@ -1,0 +1,23 @@
+{
+  "goal": "Restructure the code as requested without changing what it does.",
+  "non_goals": ["New behaviour", "Bug fixes", "Any edit to a test"],
+  "acceptance_criteria": [
+    {
+      "id": "AC-1",
+      "statement": "The behaviour of the code is unchanged: the same inputs give the same outputs, errors and side effects.",
+      "verification": "The existing test suite, run as it is, passes."
+    },
+    {
+      "id": "AC-2",
+      "statement": "Every existing test passes, and none is edited, skipped or deleted.",
+      "verification": "The verify stage runs the suite, and the diff touches no test file."
+    }
+  ],
+  "interfaces": [],
+  "test_plan": [
+    {"ac": "AC-1", "scenario": "Run the whole existing suite, unchanged, against the restructured code."},
+    {"ac": "AC-2", "scenario": "Check the diff for edits to test files, then run the suite: the same tests pass as before."}
+  ],
+  "risks": ["A restructuring can change behaviour where no existing test looks; the review reads the diff for that."],
+  "split_proposal": null
+}

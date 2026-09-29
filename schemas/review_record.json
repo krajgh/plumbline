@@ -1,7 +1,7 @@
 {
   "description": "One round of a review unit: the prosecutors' findings, the defenders' verdicts, the findings that survive, and the gaps the detective names.",
   "type": "object",
-  "required": ["target", "round", "lenses", "findings", "defenses", "survivors", "gaps", "blockers_surviving"],
+  "required": ["target", "round", "lenses", "findings", "defenses", "survivors", "gaps", "blockers_surviving", "diff_sha256"],
   "additionalProperties": false,
   "properties": {
     "target": {
@@ -144,6 +144,11 @@
       "description": "How many surviving findings are BLOCKING. The gate no_surviving_blockers passes at 0.",
       "type": "integer",
       "minimum": 0
+    },
+    "diff_sha256": {
+      "description": "The sha256 of the change this round covered: the diff from the run's merge base to the files as they were when `merge-review` built this record, untracked files included. For a review of the diff, `pass` refuses when the diff of HEAD hashes differently, so a change edited after its review fails.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     }
   }
 }

@@ -7,13 +7,17 @@ Prints exactly one JSON object on stdout, {"hookSpecificOutput": {"hookEventName
   - the subagent-discipline note, always;
   - inside a git repository, one line saying whether plumbline is adopted there
     (a plumbline.toml at the top level), not adopted, or has an invalid config;
-  - a warning when the ponytail plugin is not enabled in any settings file.
+  - a warning when the ponytail plugin is not enabled in any settings file, and, when it is,
+    a line unless its subagent matcher (the PONYTAIL_SUBAGENT_MATCHER environment variable, set
+    through the `env` block of a settings file) reaches exactly plumbline's planner, test-writer
+    and builder. plumbline writes no settings itself: the line says what to add, once.
 
 Nothing here may fail the session: every check is isolated, and if one breaks
 the note still goes out.
 """
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -36,6 +40,14 @@ PONYTAIL_WARNING = (
     "claude plugin marketplace add DietrichGebert/ponytail, "
     "then claude plugin install ponytail@ponytail."
 )
+
+# ponytail's SubagentStart hook (hooks/ponytail-subagent.js) injects its ruleset into every subagent, unless the
+# PONYTAIL_SUBAGENT_MATCHER environment variable holds a regular expression: then only a subagent whose agent_type
+# matches it (unanchored, case-insensitive) gets the ruleset. plumbline wants it on the agents that make the change.
+MATCHER_VAR = "PONYTAIL_SUBAGENT_MATCHER"
+MATCHER_EXAMPLE = "^plumbline:(planner|test-writer|builder)$"
+MAKING_AGENTS = ("planner", "test-writer", "builder")
+ALL_AGENTS = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")
 
 
 def one_line(text: str) -> str:
@@ -83,6 +95,51 @@ def ponytail_enabled(project_dirs: list) -> bool:
     return False
 
 
+def settings_env(project_dirs: list, name: str) -> str | None:
+    """The value of `name` in the `env` block of the settings files: a project's local settings, then its shared
+    ones, then the user's."""
+    home = Path(os.environ.get("HOME") or Path.home())
+    files = []
+    for directory in project_dirs:
+        files += [directory / ".claude" / "settings.local.json", directory / ".claude" / "settings.json"]
+    files.append(home / ".claude" / "settings.json")
+    for path in files:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        env = data.get("env") if isinstance(data, dict) else None
+        value = env.get(name) if isinstance(env, dict) else None
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def matcher_line(project_dirs: list) -> str | None:
+    """None when ponytail's subagent matcher reaches exactly plumbline's planner, test-writer and builder;
+    otherwise one line saying what is wrong and what to set."""
+    value = os.environ.get(MATCHER_VAR) or settings_env(project_dirs, MATCHER_VAR)
+    setting = f'"env": {{"{MATCHER_VAR}": "{MATCHER_EXAMPLE}"}}'
+    if not value:
+        return (
+            "ponytail reaches every subagent, plumbline's reviewers included. Scope it to the agents that make the change, once: "
+            f"add {setting} to ~/.claude/settings.json (plumbline changes none of your settings)."
+        )
+    try:
+        pattern = re.compile(value, re.IGNORECASE)
+    except re.error:
+        return f'{MATCHER_VAR} ("{value}") is not a valid regular expression, so ponytail reaches every subagent. Set it to "{MATCHER_EXAMPLE}".'
+    reached = [name for name in ALL_AGENTS if pattern.search(f"plumbline:{name}")]
+    if reached == [name for name in ALL_AGENTS if name in MAKING_AGENTS]:
+        return None
+    missed = [name for name in MAKING_AGENTS if name not in reached]
+    extra = [name for name in reached if name not in MAKING_AGENTS]
+    said = "; ".join(
+        ([f"it misses {', '.join(missed)}"] if missed else []) + ([f"it also reaches {', '.join(extra)}"] if extra else [])
+    )
+    return f'{MATCHER_VAR} ("{value}") should reach exactly plumbline\'s planner, test-writer and builder: {said}. Set it to "{MATCHER_EXAMPLE}".'
+
+
 def build_context() -> str:
     parts = [DISCIPLINE_NOTE]
     project = Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
@@ -99,6 +156,10 @@ def build_context() -> str:
         dirs = [project] + ([root] if root is not None and root != project else [])
         if not ponytail_enabled(dirs):
             parts.append(PONYTAIL_WARNING)
+        else:
+            line = matcher_line(dirs)
+            if line:
+                parts.append(line)
     except Exception:
         pass
     return "\n\n".join(parts)

@@ -1,7 +1,7 @@
 {
   "description": "The verifier's record: commands run, test counts, which acceptance criteria fail, and the mechanical checks.",
   "type": "object",
-  "required": ["commands", "tests", "failing_acs", "checks", "green"],
+  "required": ["commands", "tests", "failing_acs", "checks", "green", "diff_sha256"],
   "additionalProperties": false,
   "properties": {
     "commands": {
@@ -93,6 +93,11 @@
     "green": {
       "description": "True when every command and every applicable check passed.",
       "type": "boolean"
+    },
+    "diff_sha256": {
+      "description": "The sha256 of the change this record covers: the diff from the run's merge base to the files as they were, untracked files included, as `plumbline.py check-diff` prints it. `pass` refuses when the diff of HEAD hashes differently, so a change edited after this record was made fails.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     }
   }
 }

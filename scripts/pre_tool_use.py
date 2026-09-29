@@ -4,15 +4,32 @@
 Reads the hook's JSON on stdin and, to deny a tool call, prints
 {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
 "permissionDecisionReason": ...}} and exits 0. It acts only inside a repository
-that has adopted plumbline (a plumbline.toml at its top level):
+that has adopted plumbline (a plumbline.toml at its top level), except for the
+override rule:
 
-  Bash (and PowerShell)
+  Bash (and PowerShell), for everyone
+    - `plumbline.py override` is denied to the model, whoever runs it: the builder
+      types /plumbline:override, which runs the command itself.
     - `git push` and `gh pr create` are denied unless HEAD has a pass record or
       an override record (.plumbline/pass/<HEAD>.json or .override.json) that
-      validates and names HEAD. `--dry-run` and `--help` are not pushes.
+      validates and names HEAD; a pass record is not taken at its word (its run is
+      evaluated again). `--dry-run` and `--help` are not pushes.
     - `git commit` is denied when what it would commit adds a symlink, an
       absolute home path, or a key-shaped secret (sk-ant- followed by 20 or more
       characters).
+    - a redirection, `tee` or another writer aimed at .plumbline/pass/ or at a
+      run's ledger.jsonl is denied: only plumbline.py commands write them.
+  Bash, for plumbline agents
+    - every simple command must match the command classes of the agent's role
+      (the [roles.*] tables of the pipeline); a denial names what is allowed.
+  Edit, Write and NotebookEdit
+    - .plumbline/pass/ and every ledger.jsonl are denied to everyone.
+    - a plumbline agent writes only what its role's write targets cover: its own
+      record, the tests type, or everything else except .plumbline/,
+      plumbline.toml and the pipeline file.
+  Agent
+    - launching a plumbline agent with `isolation: "worktree"` is denied: a run's records live in the
+      main checkout, never in an agent's worktree.
   Read, Grep and Glob, for the agent plumbline:builder only
     - a path that matches the tests type of the pipeline, or is listed in the
       newest run's tests record (that record included), is denied; so is a Grep
@@ -63,6 +80,27 @@ COMMIT_LONG_VALUE = {
 COMMIT_SHORT_VALUE = "mFCct"
 HEAD_MOVERS = {"merge", "rebase", "cherry-pick", "revert", "pull", "am", "reset", "checkout", "switch"}
 
+# The plumbline agents, and the review units' among them (which write under a review stage's round directories).
+ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")
+REVIEW_ROLES = ("prosecutor", "defender", "detective")
+# A command of the main session concerns plumbline besides git and gh only if it mentions one of these.
+CARES = re.compile(r"plumbline|override|ledger")
+
+# The command classes of a role policy (see [roles.*] in the pipeline), besides the repo's [commands].
+CONFIG_COMMANDS = ("test", "lint", "typecheck", "build")
+GIT_READ = ("diff", "show", "log", "status", "rev-parse", "merge-base", "ls-files", "grep", "blame")
+GIT_QUIET_FLAGS = {"--no-pager", "-P", "--no-optional-locks", "--literal-pathspecs", "--no-replace-objects"}
+GIT_WRITES_OR_RUNS = ("--output", "--open-files-in-pager", "-O")  # a file is written, or a program is run
+SEARCH_TOOLS = ("grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "wc", "ls", "sed", "find")
+FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
+RG_RUNS = ("--pre", "--hostname-bin")  # ripgrep options that run a program
+SED_PRINT = re.compile(r"\s*(?:\d+|\$|/[^/]*/)?(?:,(?:\d+|\$|/[^/]*/))?\s*p\s*")  # `sed -n` prints lines: nothing else
+NO_EFFECT = {"cd", "pushd", "popd", "pwd", "true", "false", ":", "echo", "printf"}  # allowed wherever any command is
+WRITERS_ALL = {"tee", "rm", "unlink", "shred", "truncate", "touch", "mv"}  # every operand is written or removed
+WRITERS_LAST = {"cp", "install", "ln", "rsync"}  # the destination is written
+PASS_DIR = ".plumbline/pass"
+RUNS_DIR = ".plumbline/runs"
+
 
 # ------------------------------------------------------- parsing a command
 
@@ -95,30 +133,39 @@ def split_commands(text: str, depth: int = 0) -> list[list[str]]:
     """The simple commands of a shell command line, each as a list of words:
     split at ; & | ( ) and newlines, quotes removed, redirections and here-document
     bodies dropped. The commands inside $( ) and backticks come out too."""
-    commands: list[list[str]] = []
+    return [words for words, _redirects in split_commands_ex(text, depth) if words]
+
+
+def split_commands_ex(text: str, depth: int = 0) -> list[tuple[list[str], list[tuple[str, str]]]]:
+    """Like split_commands, but each command comes with its redirections as (operator, target) pairs,
+    in the order written, so that a caller can see what a command line writes to. A redirection with
+    no command (`> file`) is a command with no words."""
+    commands: list[tuple[list[str], list[tuple[str, str]]]] = []
     if depth > 4:
         return commands
     words: list[str] = []
+    redirects: list[tuple[str, str]] = []
     word: list[str] | None = None
-    skip_next = False  # the word after a redirection operator is a target, not an argument
+    pending: str | None = None  # the operator whose target is the next word
     heredocs: list[tuple[str, bool]] = []
     n, i = len(text), 0
 
     def end_word():
-        nonlocal word, skip_next
+        nonlocal word, pending
         if word is not None:
-            if skip_next:
-                skip_next = False
+            if pending is not None:
+                redirects.append((pending, "".join(word)))
+                pending = None
             else:
                 words.append("".join(word))
             word = None
 
     def end_command():
-        nonlocal words
+        nonlocal words, redirects, pending
         end_word()
-        if words:
-            commands.append(words)
-        words = []
+        if words or redirects:
+            commands.append((words, redirects))
+        words, redirects, pending = [], [], None
 
     def add(chunk: str):
         nonlocal word
@@ -169,13 +216,13 @@ def split_commands(text: str, depth: int = 0) -> list[list[str]]:
                     i += 2
                 elif d == "$" and text[i + 1 : i + 2] == "(":
                     j = _matching_paren(text, i + 1)
-                    commands.extend(split_commands(text[i + 2 : j], depth + 1))
+                    commands.extend(split_commands_ex(text[i + 2 : j], depth + 1))
                     add("$(...)")
                     i = j + 1
                 elif d == "`":
                     j = text.find("`", i + 1)
                     j = n if j < 0 else j
-                    commands.extend(split_commands(text[i + 1 : j], depth + 1))
+                    commands.extend(split_commands_ex(text[i + 1 : j], depth + 1))
                     add("`...`")
                     i = j + 1
                 else:
@@ -184,13 +231,13 @@ def split_commands(text: str, depth: int = 0) -> list[list[str]]:
             i += 1
         elif c == "$" and text[i + 1 : i + 2] == "(":
             j = _matching_paren(text, i + 1)
-            commands.extend(split_commands(text[i + 2 : j], depth + 1))
+            commands.extend(split_commands_ex(text[i + 2 : j], depth + 1))
             add("$(...)")
             i = j + 1
         elif c == "`":
             j = text.find("`", i + 1)
             j = n if j < 0 else j
-            commands.extend(split_commands(text[i + 1 : j], depth + 1))
+            commands.extend(split_commands_ex(text[i + 1 : j], depth + 1))
             add("`...`")
             i = j + 1
         elif c in "<>":
@@ -198,7 +245,7 @@ def split_commands(text: str, depth: int = 0) -> list[list[str]]:
                 word = None  # a file descriptor number, as in 2>&1
             end_word()
             if text[i : i + 3] == "<<<":
-                skip_next = True
+                pending = "<<<"
                 i += 3
             elif text[i : i + 2] == "<<":
                 i += 2
@@ -215,9 +262,10 @@ def split_commands(text: str, depth: int = 0) -> list[list[str]]:
                     i += 1
                 heredocs.append(("".join(delimiter), strip_tabs))
             else:
-                while i < n and text[i] in "<>&":
+                start = i
+                while i < n and (text[i] in "<>&" or (text[i] == "|" and text[i - 1] == ">")):  # `>|` overrides noclobber
                     i += 1
-                skip_next = True
+                pending = text[start:i]
         else:
             add(c)
             i += 1
@@ -382,7 +430,10 @@ def commit_scope(args: list[str], added: bool) -> str:
 
 
 def adopted_root(pl, directory: Path) -> Path | None:
-    """The top level of the repository `directory` is in, when it has adopted plumbline."""
+    """The top level of the repository `directory` is in, when it has adopted plumbline. A directory that does not
+    exist (a `cd` into it fails, and the command runs where the shell was) is looked up from the nearest one that does."""
+    while not directory.is_dir() and directory != directory.parent:
+        directory = directory.parent
     root = pl.git_toplevel(directory, timeout=5) if directory.is_dir() else None
     return root if root is not None and (root / pl.CONFIG_FILE).is_file() else None
 
@@ -407,20 +458,24 @@ def added_lines(patch: str):
             line += 1
 
 
-def commit_problems(pl, root: Path, scope: str) -> list[str]:
-    """What the coming commit adds that must not be committed."""
+def commit_problems(pl, root: Path, scope: str, base: str | None = None) -> list[str]:
+    """What the coming commit adds that must not be committed. With a `base` commit (scope "all"), what
+    the whole change adds: everything from that commit to the working tree, .plumbline/ left out."""
     problems: list[str] = []
     tracked = scope in ("tracked", "all")
     heads = _git(pl, root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}").returncode == 0
     variants = [["diff", "HEAD"]] if tracked and heads else ([["diff", "--cached"], ["diff"]] if tracked else [["diff", "--cached"]])
+    hide = []
+    if base is not None:
+        variants, hide = [["diff", base]], ["--", ".", ":(exclude).plumbline"]
     for variant in variants:
-        raw = _git(pl, root, *variant, "--raw", "-z", "--no-renames", "--no-ext-diff").stdout.decode("utf-8", "replace").split("\0")
+        raw = _git(pl, root, *variant, "--raw", "-z", "--no-renames", "--no-ext-diff", *hide).stdout.decode("utf-8", "replace").split("\0")
         for index, token in enumerate(raw):
             if token.startswith(":") and index + 1 < len(raw):
                 fields = token[1:].split(" ")
                 if len(fields) >= 5 and fields[1] == "120000" and not fields[4].startswith("D"):
                     problems.append(f"adds a symlink: {raw[index + 1]}")
-        patch = _git(pl, root, *variant, "-U0", "--no-color", "--no-ext-diff", "--no-renames").stdout[:MAX_SCANNED_BYTES].decode("utf-8", "replace")
+        patch = _git(pl, root, *variant, "-U0", "--no-color", "--no-ext-diff", "--no-renames", *hide).stdout[:MAX_SCANNED_BYTES].decode("utf-8", "replace")
         for path, line, text in added_lines(patch):
             if HOME_PATH.search(text):
                 problems.append(f"adds an absolute home path: {path}:{line}")
@@ -457,7 +512,7 @@ def push_reason(pl, root: Path, action: Action, head_moves: bool) -> str | None:
     head = result.stdout.decode().strip()
     if result.returncode != 0 or not head:
         return None  # nothing to gate: git itself has nothing to push
-    how, detail = pl.coverage(root, head)
+    how, detail = pl.coverage(root, head, pl.load_project(root))
     if how:
         return None
     return (
@@ -475,15 +530,12 @@ def commit_reason(pl, root: Path, action: Action, added: bool) -> str | None:
     return f"plumbline: this commit is held back. It {listed}. Remove them, stage the change again, and commit again."
 
 
-def bash_reason(data: dict) -> str | None:
-    command = (data.get("tool_input") or {}).get("command")
-    cwd = data.get("cwd")
-    if not isinstance(command, str) or not isinstance(cwd, str) or ("git" not in command and "gh" not in command):
+def gate_reason(pl, command: str, cwd: Path) -> str | None:
+    """The push gate and the commit checks."""
+    if "git" not in command and "gh" not in command:
         return None
-    import plumbline as pl
-
     added = head_moves = False
-    for action in analyze(command, Path(cwd)):
+    for action in analyze(command, cwd):
         root = adopted_root(pl, action.cwd)
         if root is None:
             continue
@@ -501,6 +553,25 @@ def bash_reason(data: dict) -> str | None:
             if reason:
                 return reason
     return None
+
+
+def bash_reason(data: dict) -> str | None:
+    command = (data.get("tool_input") or {}).get("command")
+    cwd = data.get("cwd")
+    if not isinstance(command, str) or not isinstance(cwd, str):
+        return None
+    role = agent_role(data)
+    if role is None and not CARES.search(command) and ".plumbline" not in cwd and "git" not in command and "gh" not in command:
+        return None  # nothing here concerns plumbline
+    import plumbline as pl
+
+    steps = list(walk(command, Path(cwd)))
+    reason = override_reason(pl, steps)
+    if reason is None and role is not None:
+        reason = role_command_reason(pl, role, steps, Path(cwd))
+    if reason is None:
+        reason = protected_command_reason(pl, steps)
+    return reason or gate_reason(pl, command, Path(cwd))
 
 
 # -------------------------------------------------- the builder's blindness
@@ -614,6 +685,407 @@ def builder_reason(data: dict) -> str | None:
     return None
 
 
+# ---------------------------------------------- what an agent may do
+
+
+@dataclass
+class Step:
+    """One simple command of a command line, with where it runs and what it redirects to."""
+
+    raw: list[str]  # the words as written
+    argv: list[str]  # the command itself: no VAR=value words, wrappers or shell keywords
+    redirects: list[tuple[str, str]]  # (operator, target)
+    cwd: Path
+
+
+def walk(text: str, cwd: Path, depth: int = 0):
+    """Every simple command of a command line, those inside `$( )`, backticks, `bash -c` and `eval`
+    included, each with the directory it runs in (`cd` is followed)."""
+    for words, redirects in split_commands_ex(text):
+        argv = strip_wrappers(words)
+        yield Step(words, argv, redirects, cwd)
+        name = os.path.basename(argv[0]) if argv else ""
+        if name in ("cd", "pushd"):
+            target = next((w for w in argv[1:] if not w.startswith("-")), None)
+            if target and not any(ch in target for ch in "$`") and target != "-":
+                cwd = _join(cwd, target)
+        elif name in SHELLS and depth < 3:
+            for i, word in enumerate(argv[1:], 1):
+                if word.startswith("-") and not word.startswith("--") and "c" in word[1:] and i + 1 < len(argv):
+                    yield from walk(argv[i + 1], cwd, depth + 1)
+                    break
+        elif name == "eval" and depth < 3:
+            yield from walk(" ".join(argv[1:]), cwd, depth + 1)
+
+
+def agent_role(data: dict) -> str | None:
+    """The role of the plumbline agent making this tool call, or None (the main session, or another agent)."""
+    agent_type = data.get("agent_type")
+    if isinstance(agent_type, str) and agent_type.startswith("plumbline:"):
+        role = agent_type[len("plumbline:") :]
+        return role if role in ROLES else None
+    return None
+
+
+def plumbline_cli(pl, argv: list[str]) -> str | None:
+    """The subcommand, when `argv` runs this plugin's own plumbline.py (`python3 <path>/plumbline.py <subcommand> ...`)."""
+    if not argv or not re.fullmatch(r"python(\d+(\.\d+)*)?", os.path.basename(argv[0])):
+        return None
+    i = 1
+    while i < len(argv) and argv[i].startswith("-"):
+        if argv[i] in ("-c", "-m"):
+            return None
+        i += 1
+    if i + 1 >= len(argv):
+        return None
+    if os.path.realpath(argv[i]) != os.path.realpath(pl.PLUGIN_ROOT / "scripts" / "plumbline.py"):
+        return None  # another script that happens to be called plumbline.py is not ours
+    return argv[i + 1]
+
+
+def runs_override(step: Step) -> bool:
+    """Does this command run `plumbline.py override`? By its script name, by the pair of words `override` and
+    `--reason` (which catches a script path held in a variable), or by inline code that names both."""
+    words = step.raw
+    for i, word in enumerate(words):
+        if os.path.basename(word) == "plumbline.py" and words[i + 1 : i + 2] == ["override"]:
+            return True
+    if "override" in words and any(w == "--reason" or w.startswith("--reason=") for w in words):
+        return True
+    interpreter = os.path.basename(step.argv[0]) if step.argv else ""
+    return bool(re.fullmatch(r"(python[\d.]*|node|ruby|perl|php)", interpreter)) and any("plumbline" in w and "override" in w for w in step.argv[1:])
+
+
+def override_reason(pl, steps: list[Step]) -> str | None:
+    """`plumbline.py override` is denied to every agent and to the main session, wherever the command would act:
+    in the directory it runs in, or in the one `--project` names, when that repository has adopted plumbline
+    (elsewhere the command refuses by itself, and this hook stays silent)."""
+    for step in steps:
+        if not runs_override(step):
+            continue
+        places = [step.cwd] + [_join(step.cwd, step.raw[i + 1]) for i, w in enumerate(step.raw[:-1]) if w == "--project"]
+        places += [_join(step.cwd, w.split("=", 1)[1]) for w in step.raw if w.startswith("--project=")]
+        if any(adopted_root(pl, place) is not None for place in places):
+            return (
+                "plumbline: `plumbline.py override` is the builder's command, and the builder types it: /plumbline:override followed by the reason. "
+                "An agent, or the main session, does not run it. To skip the pipeline for this commit, ask the builder to type /plumbline:override."
+            )
+    return None
+
+
+def written_operands(argv: list[str]) -> list[str]:
+    """The operands a command writes or removes, for the writers plumbline knows: `tee`, `rm`, `cp`, `mv`, `dd of=`, `sed -i` and the like."""
+    if not argv:
+        return []
+    name, args = os.path.basename(argv[0]), argv[1:]
+    operands = [a for a in args if not a.startswith("-") or a == "-"]
+    if name in WRITERS_ALL:
+        return operands
+    if name in WRITERS_LAST:
+        into = [args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-t", "--target-directory")]
+        return into + operands[-1:]
+    if name == "dd":
+        return [a[3:] for a in args if a.startswith("of=")]
+    if name in ("sed", "perl") and any(re.fullmatch(r"-[A-Za-z]*i.*", a) or a.startswith("--in-place") for a in args):
+        return operands
+    return []
+
+
+def written_targets(step: Step) -> list[str]:
+    """Where a command writes to: its output redirections (not fd duplications like `2>&1`) and its writer operands."""
+    targets = [
+        target
+        for op, target in step.redirects
+        if ">" in op and not (op.endswith("&") and re.fullmatch(r"\d+|-", target))
+    ]
+    return targets + written_operands(step.argv)
+
+
+def protected_rel(pl, roots: dict, path: Path) -> str | None:
+    """The repository-relative path, when `path` (or where it really leads) is under .plumbline/pass/ or is a
+    run's ledger.jsonl in a repository that has adopted plumbline: those are written only by plumbline.py."""
+    for candidate in dict.fromkeys((path, Path(os.path.realpath(path)))):
+        if ".plumbline" not in str(candidate) and candidate.name != "ledger.jsonl":
+            continue  # cannot be one of them: no need to look for the repository
+        directory = candidate.parent
+        while not directory.is_dir() and directory != directory.parent:
+            directory = directory.parent
+        if directory not in roots:
+            roots[directory] = adopted_root(pl, directory)
+        root = roots[directory]
+        rel = _relative(root, candidate) if root is not None else None
+        if rel is not None and (
+            rel == PASS_DIR or rel.startswith(PASS_DIR + "/") or re.fullmatch(re.escape(RUNS_DIR) + r"/[^/]+/ledger\.jsonl", rel)
+        ):
+            return rel
+    return None
+
+
+def protected_message(rel: str) -> str:
+    return (
+        f"plumbline: {rel} is written only by plumbline.py commands (`pass` writes .plumbline/pass/; the gates and the hooks write a run's ledger.jsonl), "
+        "so nothing edits it, redirects into it or pipes into it. Run the pipeline's commands instead."
+    )
+
+
+def protected_command_reason(pl, steps: list[Step]) -> str | None:
+    roots: dict = {}
+    for step in steps:
+        for target in written_targets(step):
+            if target:
+                rel = protected_rel(pl, roots, _join(step.cwd, target))
+                if rel:
+                    return protected_message(rel)
+    return None
+
+
+def _prefix_matches(argv: list[str], prefixes: list[str]) -> bool:
+    for prefix in prefixes:
+        parsed = split_commands(prefix)
+        want = strip_wrappers(parsed[0]) if len(parsed) == 1 else []
+        if not want:
+            continue  # not a simple command: nothing can match it
+        head = [argv[0] if "/" in want[0] else os.path.basename(argv[0])] + argv[1:]  # a bare name matches wherever the program lives
+        if head[: len(want)] == want:
+            return True
+    return False
+
+
+def _git_read_only(argv: list[str]) -> bool:
+    i = 1
+    while i < len(argv):
+        word = argv[i]
+        if word == "-C" and i + 1 < len(argv):
+            i += 2
+        elif word in GIT_QUIET_FLAGS:
+            i += 1
+        elif word.startswith("-"):
+            return False  # -c, --git-dir, --exec-path and the like change what git runs
+        else:
+            break
+    if i >= len(argv) or argv[i] not in GIT_READ:
+        return False
+    rest = argv[i + 1 :]
+    return not any(a.startswith(GIT_WRITES_OR_RUNS) for a in (rest[: rest.index("--")] if "--" in rest else rest))
+
+
+def _sed_read_only(args: list[str]) -> bool:
+    quiet, scripts, positional, i = False, [], [], 0
+    while i < len(args):
+        word = args[i]
+        if word in ("-n", "--quiet", "--silent"):
+            quiet = True
+        elif word in ("-E", "-r", "--regexp-extended"):
+            pass
+        elif word in ("-e", "--expression"):
+            if i + 1 >= len(args):
+                return False
+            scripts.append(args[i + 1])
+            i += 1
+        elif word.startswith("--expression="):
+            scripts.append(word.split("=", 1)[1])
+        elif word.startswith("-") and len(word) > 1:
+            return False  # -i, -f, -s, -z ...
+        else:
+            positional.append(word)
+        i += 1
+    if not scripts and positional:
+        scripts = [positional[0]]
+    return quiet and bool(scripts) and all(SED_PRINT.fullmatch(script) for script in scripts)
+
+
+def _search_only(argv: list[str]) -> bool:
+    name, args = os.path.basename(argv[0]), argv[1:]
+    if name not in SEARCH_TOOLS:
+        return False
+    if name == "find":
+        return not any(a in FIND_ACTIONS for a in args)
+    if name == "sed":
+        return _sed_read_only(args)
+    if name == "rg":
+        return not any(a.startswith(RG_RUNS) for a in args)
+    return True
+
+
+def _allowed_by_class(pl, project, classes: list[str], argv: list[str]) -> bool:
+    name = os.path.basename(argv[0])
+    for kind in classes:
+        if kind in CONFIG_COMMANDS and _prefix_matches(argv, project.commands.get(kind, [])):
+            return True
+        if kind == "git-read" and name == "git" and _git_read_only(argv):
+            return True
+        if kind == "search" and _search_only(argv):
+            return True
+        if kind == "plumbline-check" and plumbline_cli(pl, argv) == "check-diff":
+            return True
+        if kind == "graft" and project.graft_enabled and name == "graft":
+            return True
+    return False
+
+
+def _allowed_summary(project, role: str, classes: list[str]) -> str:
+    parts = []
+    configured = [kind for kind in classes if kind in CONFIG_COMMANDS]
+    for kind in configured:
+        if project.commands.get(kind):
+            parts.append(f"the repository's {kind} command ({', '.join(project.commands[kind])})")
+    unset = [kind for kind in configured if not project.commands.get(kind)]
+    if unset:
+        parts.append(f"the repository's {', '.join(unset)} command{'s' if len(unset) > 1 else ''} (not set: [commands] in plumbline.toml sets them)")
+    for kind in classes:
+        if kind in CONFIG_COMMANDS:
+            continue
+        if kind == "git-read":
+            parts.append(f"read-only git ({', '.join(GIT_READ)})")
+        elif kind == "search":
+            parts.append("read-only search tools (grep, rg, cat, head, tail, wc, sed -n, ls, find without -exec or -delete)")
+        elif kind == "plumbline-check":
+            parts.append("`plumbline.py check-diff`")
+        elif kind == "graft":
+            parts.append("the graft wrapper" if project.graft_enabled else "the graft wrapper (graft is off in this repository)")
+    parts.append("`plumbline.py check-record TYPE FILE` to check your record")
+    return "; ".join(parts)
+
+
+def role_command_reason(pl, role: str, steps: list[Step], cwd: Path) -> str | None:
+    """Every simple command of an agent's Bash line must be of a class its role allows, and nothing may be
+    redirected into a file (the write targets cover Edit, Write and NotebookEdit; Bash is for running things)."""
+    root = adopted_root(pl, cwd)
+    if root is None:
+        return None
+    project = pl.load_project(root)
+    policy = project.roles.get(role)
+    if not isinstance(policy, dict):
+        return None
+    classes = [c for c in policy.get("commands", []) if isinstance(c, str)]
+    for step in steps:
+        if not step.raw and not step.redirects:
+            continue
+        shown = " ".join(step.raw)[:100] or "a redirection"
+        if not classes:
+            return f"plumbline: the {role} has no Bash. Work with Read, Grep, Glob, Edit and Write, and end with your record. (`{shown}` was refused.)"
+        for op, target in step.redirects:
+            if ">" in op and target != "/dev/null" and not (op.endswith("&") and re.fullmatch(r"\d+|-", target)):
+                return (
+                    f"plumbline: the {role}'s Bash does not write files (`{shown}` redirects into {target}). "
+                    "Write your record with the Write tool; Bash may redirect only to /dev/null."
+                )
+        if not step.argv and all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", w) or w in KEYWORDS for w in step.raw):
+            continue  # nothing but variable assignments and shell keywords: no command runs
+        if step.argv and os.path.basename(step.argv[0]) in NO_EFFECT:
+            continue
+        if step.raw and os.path.basename(step.raw[0]) in ("sudo", "doas"):
+            return f"plumbline: the {role} does not run commands as another user (`{shown}`)."
+        if step.argv and (_allowed_by_class(pl, project, classes, step.argv) or plumbline_cli(pl, step.argv) == "check-record"):
+            continue
+        return f"plumbline: the {role}'s Bash may run only {_allowed_summary(project, role, classes)}. `{shown}` is none of these."
+    return None
+
+
+def own_record_paths(pipeline: dict, role: str) -> list[str]:
+    """Where an agent of `role` writes its record, as patterns for a message."""
+    if role in REVIEW_ROLES:
+        stages = [s["id"] for s in pipeline.get("stage", []) if s.get("kind") == "review"]
+        return [f"{RUNS_DIR}/<run-id>/{stages[0] if len(stages) == 1 else '{' + ','.join(stages) + '}'}/round-<n>/<name>.json"] if stages else []
+    return [f"{RUNS_DIR}/<run-id>/{s['id']}.json" for s in pipeline.get("stage", []) if s.get("kind", "agent") == "agent" and s.get("role") == role]
+
+
+def is_own_record(pipeline: dict, role: str, rel: str) -> bool:
+    match = re.fullmatch(re.escape(RUNS_DIR) + r"/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/(.+)", rel)
+    if not match:
+        return False
+    rest = match.group(1)
+    stages = pipeline.get("stage", [])
+    if any(s.get("kind", "agent") == "agent" and s.get("role") == role and rest == f"{s['id']}.json" for s in stages):
+        return True
+    return role in REVIEW_ROLES and any(
+        s.get("kind") == "review" and re.fullmatch(re.escape(s["id"]) + r"/round-[1-9][0-9]*/[A-Za-z0-9][A-Za-z0-9._-]*\.json", rest) for s in stages
+    )
+
+
+def pipeline_paths(pl, project, root: Path) -> set[str]:
+    """The pipeline file the repository names, as a path inside the repository (none, when it lies elsewhere)."""
+    value = (project.config or {}).get("pipeline", pl.DEFAULT_PIPELINE)
+    try:
+        rel = _relative(root, pl.resolve_pipeline_path(value, root)) if isinstance(value, str) else None
+    except pl.PlumblineError:
+        rel = None
+    return {rel} if rel else set()
+
+
+def partition_reason(pl, root: Path, role: str, target: Path, real: Path) -> str | None:
+    """Is a write by an agent of `role` to `target` inside the role's write targets? Where the path leads, through
+    symbolic links, must be inside them too."""
+    project = pl.load_project(root)
+    policy = project.roles.get(role)
+    if not isinstance(policy, dict):
+        return None
+    writes = [w for w in policy.get("writes", []) if isinstance(w, str)]
+    pipeline = project.pipeline or pl.load_toml(pl.PIPELINE_DIR / f"{pl.DEFAULT_PIPELINE}.toml")
+    patterns = next((t["paths"] for t in pipeline.get("type", []) if t.get("id") == "tests"), [])
+    fixed = pipeline_paths(pl, project, root) | {pl.CONFIG_FILE}
+    own = own_record_paths(pipeline, role)
+    for candidate in dict.fromkeys((target, real)):
+        rel = _relative(root, candidate)
+        if rel is None:
+            return f"plumbline: the {role} writes inside the repository, and {candidate} is outside it."
+        if "record" in writes and is_own_record(pipeline, role, rel):
+            continue
+        if rel == ".plumbline" or rel.startswith(".plumbline/"):
+            where = ", ".join(own) or "nowhere"
+            return f"plumbline: the {role} writes only its own record ({where}); {rel} is another of plumbline's files."
+        if rel in fixed:
+            return f"plumbline: {rel} defines how the pipeline runs, and the {role} leaves it alone."
+        if any(pl.glob_match(pattern, rel) for pattern in patterns):
+            if "tests" not in writes:
+                hint = " The test-writer writes them; build from the spec." if role == "builder" else ""
+                return f"plumbline: {rel} is a test path, and the {role} does not write tests.{hint}"
+        elif "code" not in writes:
+            can = ["its own record (" + (own[0] if own else "under .plumbline/runs/") + ")"] + (["test paths"] if "tests" in writes else [])
+            hint = " Put stubs under a test path; the source is the builder's." if role == "test-writer" else ""
+            return f"plumbline: the {role} writes {' and '.join(can)}; {rel} is neither.{hint}"
+    return None
+
+
+def agent_launch_reason(data: dict) -> str | None:
+    """A run's records live in the main checkout, so a plumbline agent is not launched into a worktree of its own."""
+    tool_input, cwd = data.get("tool_input"), data.get("cwd")
+    if not isinstance(tool_input, dict) or tool_input.get("isolation") != "worktree":
+        return None
+    subagent = tool_input.get("subagent_type")
+    if not isinstance(subagent, str) or not subagent.startswith("plumbline:") or not isinstance(cwd, str) or not cwd:
+        return None
+    import plumbline as pl
+
+    if adopted_root(pl, Path(cwd)) is None:
+        return None
+    return f"plumbline: a run's records live in the main checkout, so {subagent} runs there. Launch it without `isolation`."
+
+
+def write_reason(data: dict) -> str | None:
+    """Edit, Write and NotebookEdit: nobody writes the protected files, and an agent writes inside its role's targets."""
+    tool_input, cwd = data.get("tool_input"), data.get("cwd")
+    if not isinstance(tool_input, dict) or not isinstance(cwd, str) or not cwd:
+        return None
+    named = next((tool_input[k] for k in ("file_path", "notebook_path") if isinstance(tool_input.get(k), str) and tool_input[k]), None)
+    if named is None:
+        return None
+    role = agent_role(data)
+    target = _join(Path(cwd), named)
+    real = Path(os.path.realpath(target))
+    if role is None and ".plumbline" not in f"{target}{real}" and target.name != "ledger.jsonl" and real.name != "ledger.jsonl":
+        return None  # nothing here concerns plumbline: not even the repository is looked up
+    import plumbline as pl
+
+    rel = protected_rel(pl, {}, target)
+    if rel:
+        return protected_message(rel)
+    if role is None:
+        return None
+    root = adopted_root(pl, Path(cwd))
+    return partition_reason(pl, root, role, target, real) if root is not None else None
+
+
 # ------------------------------------------------------------- the hook
 
 
@@ -626,6 +1098,10 @@ def decide(data) -> str | None:
         return bash_reason(data)
     if tool in ("Read", "Grep", "Glob"):
         return builder_reason(data)
+    if tool in ("Edit", "Write", "NotebookEdit"):
+        return write_reason(data)
+    if tool in ("Agent", "Task"):  # the tool has been called both
+        return agent_launch_reason(data)
     return None
 
 

@@ -3,6 +3,7 @@ import copy
 
 SHA_A = "0123456789abcdef0123456789abcdef01234567"
 SHA_B = "89abcdef0123456789abcdef0123456789abcdef"
+DIFF_HASH = "0123456789abcdef" * 4  # a diff_sha256: 64 hex digits
 
 _SAMPLES = {
     "change_class": {
@@ -18,6 +19,7 @@ _SAMPLES = {
         "lines": 101,
         "size": "M",
         "row": "code.M",
+        "intent": "feature",
         "symlinks": ["docs/link.md"],
         "notes": ["1 untracked file(s) that are not ignored were counted as added lines"],
     },
@@ -61,6 +63,7 @@ _SAMPLES = {
         "failing_acs": [{"ac": "AC-1", "error_type": "AssertionError"}],
         "checks": {"lint": True, "secrets": True, "symlinks": False, "abs_paths": True, "graft_fresh": None},
         "green": False,
+        "diff_sha256": DIFF_HASH,
     },
     "review_record": {
         "target": "diff",
@@ -102,6 +105,7 @@ _SAMPLES = {
             {"id": "G-2", "kind": "edge_case", "detail": "retries=0 is not handled.", "ac": None},
         ],
         "blockers_surviving": 1,
+        "diff_sha256": DIFF_HASH,
     },
     "findings_record": {
         "lens": "correctness",

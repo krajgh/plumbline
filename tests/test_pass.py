@@ -8,7 +8,7 @@ import pytest
 import plumbline as pl
 from helpers import commit_all, git, write
 from rundata import (
-    HAIKU, RUN, SONNET, adopt, agent_row, assistant_record, gate_stages, intake_record, ledger, put, read, review_record,
+    HAIKU, RUN, SONNET, adopt, agent_row, assistant_record, change_of, gate_stages, intake_record, ledger, put, read, review_record,
     run_path, verify_record, write_code_s_run, write_docs_run, write_ledger, write_transcript,
 )
 
@@ -178,7 +178,7 @@ def test_the_pass_record_carries_the_tokens_of_the_runs_agents(run_cli, ready, t
 def test_rounds_come_from_the_review_record_and_from_the_agents_the_ledger_saw(run_cli, repo):
     adopt(repo)
     write_code_s_run(repo)
-    put(repo, "review", review_record(blockers=0, round_no=2))
+    put(repo, "review", review_record(blockers=0, round_no=2, diff=change_of(repo)))
     write_ledger(repo, [agent_row("b1", stage="build"), agent_row("b2", stage="build"), agent_row("p1", stage="plan", agent_type="plumbline:planner")])
     assert do_pass(run_cli, repo).returncode == 0
     rounds = {s["id"]: s["rounds"] for s in read(repo, "reduce")["stages"]}

@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import plumbline as pl
-from helpers import commit_all
+from helpers import commit_all, git
 from samples import sample
 
 RUN = "r1"
@@ -55,11 +55,19 @@ def write_ledger(repo, rows, run_id=RUN) -> None:
 # ------------------------------------------------------------- records
 
 
-def intake_record(row, **changes) -> dict:
+def intake_record(row, repo=None, **changes) -> dict:
+    """An intake record for `row`. With a `repo`, its base, merge base and head are the repository's own, as a real classification has them."""
     record = sample("change_class")
     record["row"] = row
+    if repo is not None:
+        record.update(base="main", head=git(repo, "rev-parse", "HEAD").strip(), merge_base=git(repo, "merge-base", "main", "HEAD").strip())
     record.update(changes)
     return record
+
+
+def change_of(repo) -> str:
+    """The diff_sha256 of what HEAD holds, measured from the merge base with main: what `pass` compares the records with."""
+    return pl.change_hash(repo, git(repo, "merge-base", "main", "HEAD").strip(), pl.head_tree(repo))
 
 
 def spec_record(planned=("AC-1", "AC-2")) -> dict:
@@ -84,8 +92,10 @@ def build_note_record() -> dict:
     return sample("build_note")
 
 
-def verify_record(green=True) -> dict:
+def verify_record(green=True, diff=None) -> dict:
     record = sample("verify_record")
+    if diff is not None:
+        record["diff_sha256"] = diff
     if green:
         record["commands"] = [
             {"name": "tests", "command": "python3 -m pytest -q", "exit_code": 0, "summary": "13 passed"},
@@ -98,30 +108,49 @@ def verify_record(green=True) -> dict:
     return record
 
 
-def review_record(blockers=0, target="diff", round_no=1) -> dict:
+def review_record(blockers=0, target="diff", round_no=1, diff=None) -> dict:
     """A review_record: clean when `blockers` is 0, else the sample with a surviving blocker."""
     record = sample("review_record")
     record.update(target=target, round=round_no)
+    if diff is not None:
+        record["diff_sha256"] = diff
     if not blockers:
         record.update(findings=[], defenses=[], survivors=[], gaps=[], blockers_surviving=0)
     return record
 
 
 def write_docs_run(repo, run_id=RUN) -> None:
-    """A finished run of the docs row (intake, verify, review) awaiting its reduce."""
-    put(repo, "intake", intake_record("docs"), run_id)
-    put(repo, "verify", verify_record(), run_id)
-    put(repo, "review", review_record(), run_id)
+    """A finished run of the docs row (intake, verify, review) awaiting its reduce. Its verify and review
+    records cover the change HEAD holds, so `pass` accepts it as long as HEAD's change stays as it is."""
+    diff = change_of(repo)
+    put(repo, "intake", intake_record("docs", repo), run_id)
+    put(repo, "verify", verify_record(diff=diff), run_id)
+    put(repo, "review", review_record(diff=diff), run_id)
 
 
 def write_code_s_run(repo, run_id=RUN) -> None:
     """A finished run of the code.S row (intake, plan, tests, build, verify, review) awaiting its reduce."""
-    put(repo, "intake", intake_record("code.S"), run_id)
+    diff = change_of(repo)
+    put(repo, "intake", intake_record("code.S", repo), run_id)
     put(repo, "plan", spec_record(), run_id)
     put(repo, "tests", written_tests_record(), run_id)
     put(repo, "build", build_note_record(), run_id)
-    put(repo, "verify", verify_record(), run_id)
-    put(repo, "review", review_record(), run_id)
+    put(repo, "verify", verify_record(diff=diff), run_id)
+    put(repo, "review", review_record(diff=diff), run_id)
+
+
+def genuine_pass(repo, run_id=RUN) -> dict:
+    """Run a docs-row pipeline to its end in `repo` (adopted, its tree clean) and record the pass for HEAD, as
+    the `pass` command does: the pass file, the run's copy, and the ledger entry that pins every record."""
+    write_docs_run(repo, run_id)
+    project = pl.load_project(repo)
+    record, problems, run_copy = pl.make_pass_record(project, run_id)
+    assert record is not None, problems
+    pass_file = repo / ".plumbline" / "pass" / f"{record['commit']}.json"
+    pl.write_json_atomic(run_copy, record)
+    pl.write_json_atomic(pass_file, record)
+    pl.note_pass(repo, run_id, record, pass_file)
+    return record
 
 
 def gate_stages(run_cli, repo, stages, run_id=RUN) -> None:

@@ -13,11 +13,11 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash|PowerShell|Read|Grep|Glob",
+        "matcher": "Bash|PowerShell|Read|Grep|Glob|Edit|Write|NotebookEdit|Agent",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/pre_tool_use.py\" || true",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/pre_tool_use.sh\" || true",
             "timeout": 30
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/subagent_stop.py\" || true",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/subagent_stop.sh\" || true",
             "timeout": 30
           }
         ]

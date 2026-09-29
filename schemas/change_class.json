@@ -1,7 +1,7 @@
 {
   "description": "The intake record: what changed against the base, and which pipeline row that change takes. Written by `plumbline.py classify`.",
   "type": "object",
-  "required": ["base", "head", "merge_base", "files", "types", "lines", "size", "row", "symlinks", "notes"],
+  "required": ["base", "head", "merge_base", "files", "types", "lines", "size", "row", "intent", "symlinks", "notes"],
   "additionalProperties": false,
   "properties": {
     "base": {
@@ -77,6 +77,11 @@
       "description": "The matrix row the change takes: the deciding type, plus the size for a row split by size (for example code.M).",
       "type": "string",
       "minLength": 1
+    },
+    "intent": {
+      "description": "Why the change is made: one of the pipeline's intents (feature, spec-supplied, fix, refactor or review-only). The row selects stages; the intent then removes stages, or supplies the record a removed stage would have written.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*$"
     },
     "symlinks": {
       "description": "Paths of the symbolic links among the files.",

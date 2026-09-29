@@ -10,7 +10,7 @@ import plumbline as pl
 import pre_tool_use as pre
 from helpers import DEFAULT_TOML, commit_all, git, write
 from hookdata import bash_payload, denial, tool_payload
-from rundata import RUN, adopt, put, spec_record, written_tests_record
+from rundata import RUN, adopt, genuine_pass, put, spec_record, written_tests_record
 from samples import sample
 
 # built from pieces, so that no file of this repository holds what the commit check forbids
@@ -34,8 +34,13 @@ def bash(run_pre, repo, command, **fields):
 
 
 def cover_with_pass(repo, sha=None):
+    """Cover HEAD with a genuine pass (the push gate evaluates the pass record's run again, so a hand-made one does not do);
+    with `sha`, write a pass record for another commit, which covers nothing."""
+    if sha is None:
+        genuine_pass(repo)
+        return
     record = sample("pass_record")
-    record["commit"] = sha or head(repo)
+    record["commit"] = sha
     pl.write_json_atomic(repo / ".plumbline" / "pass" / f"{record['commit']}.json", record)
 
 
@@ -504,7 +509,8 @@ def test_a_broken_plumbline_toml_still_blinds_the_builder_with_the_default_tests
 
 
 def test_other_tools_are_left_alone(run_pre, adopted):
-    for tool, tool_input in (("Edit", {"file_path": str(adopted / "tests" / "x.py"), "old_string": "a", "new_string": "b"}), ("Write", {"file_path": str(adopted / "tests" / "x.py"), "content": "x"}), ("WebFetch", {"url": "https://example.com"})):
+    # the builder's Edit and Write are partitioned by the write rules (see test_role_policies); here, a source file is its own
+    for tool, tool_input in (("Edit", {"file_path": str(adopted / "src" / "app.py"), "old_string": "a", "new_string": "b"}), ("Write", {"file_path": str(adopted / "src" / "app.py"), "content": "x"}), ("WebFetch", {"url": "https://example.com"})):
         assert denial(run_pre(tool_payload(adopted, tool, tool_input, agent_type=BUILDER), adopted)) is None
 
 

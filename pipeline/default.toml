@@ -113,3 +113,64 @@ stages = ["intake", "plan", "tests", "test-review", "build", "verify", "review",
 [matrix.code.L]
 stages = ["intake", "plan"]
 note = "The planner proposes a split into changes of size M or smaller; nothing is built at size L."
+
+# Role policies: what each agent may write and run. A PreToolUse hook enforces them for plumbline agents.
+#   writes:   record = the role's own records under .plumbline/runs/; tests = the tests type above;
+#             code = everything else, except .plumbline/, plumbline.toml and pipeline files
+#   commands: test, lint, typecheck and build are the repo's [commands] in plumbline.toml (command prefixes);
+#             git-read is read-only git (diff, show, log, status, rev-parse, merge-base, ls-files, grep, blame);
+#             search is read-only shell tools (grep, rg, cat, head, tail, wc, sed -n, ls, find without -exec or -delete);
+#             plumbline-check is `plumbline.py check-diff`; graft is the graft wrapper, where graft is on.
+#             A role with no commands has no Bash at all (`plumbline.py check-record` is allowed to every role that has some).
+[roles.planner]
+writes = ["record"]
+commands = ["git-read", "search", "graft"]
+
+[roles.test-writer]
+writes = ["record", "tests"]
+commands = ["test", "git-read", "search"]
+
+[roles.builder]
+writes = ["record", "code"]
+commands = []                   # its agent has no Bash tool
+
+[roles.verifier]
+writes = ["record"]
+commands = ["test", "lint", "typecheck", "build", "git-read", "search", "plumbline-check"]
+
+[roles.prosecutor]
+writes = ["record"]
+commands = ["git-read", "search", "graft"]
+
+[roles.defender]
+writes = ["record"]
+commands = ["git-read", "search"]
+
+[roles.detective]
+writes = ["record"]
+commands = ["git-read", "search", "graft"]
+
+# Intents: why a change is made, next to its type and size. The row selects stages; the intent then
+# removes stages (skip), or supplies the record a removed stage would have written (supplies), which is
+# validated against that stage's schema at intake. `gates` replaces a stage's gate, `lenses` the lenses
+# of the review of the diff. After an intent is applied to a row, every required read must be produced
+# by a stage left in the row or listed in `supplies`.
+[intent.feature]                # the default: the planner writes the spec
+skip = []
+
+[intent.spec-supplied]          # the builder or an issue supplies the spec
+skip = ["plan"]
+supplies = ["plan"]
+
+[intent.fix]                    # reproduce first
+skip = ["plan"]
+supplies = ["plan"]             # a one-AC spec from the bug report: "this no longer happens"
+gates = { tests = "reproduces_on_head" }   # the new tests must fail on today's code, on an assertion
+
+[intent.refactor]               # behaviour unchanged
+skip = ["plan", "tests", "test-review"]
+supplies = ["plan"]             # the shipped template spec (pipeline/templates/refactor.json): behaviour unchanged, every existing test passes
+lenses = ["correctness", "boundaries"]
+
+[intent.review-only]            # a change that already exists: nothing is built
+skip = ["plan", "tests", "test-review", "build"]
