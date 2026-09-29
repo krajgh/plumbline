@@ -1,0 +1,98 @@
+{
+  "description": "The verifier's record: commands run, test counts, which acceptance criteria fail, and the mechanical checks.",
+  "type": "object",
+  "required": ["commands", "tests", "failing_acs", "checks", "green"],
+  "additionalProperties": false,
+  "properties": {
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "command", "exit_code", "summary"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "command": {
+            "type": "string",
+            "minLength": 1
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "summary": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "tests": {
+      "type": "object",
+      "required": ["passed", "failed", "skipped"],
+      "additionalProperties": false,
+      "properties": {
+        "passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "failing_acs": {
+      "description": "The acceptance criteria whose tests fail. Each carries the kind of error only, never the assertion text: the builder reads this record and must not learn what the tests assert.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ac", "error_type"],
+        "additionalProperties": false,
+        "properties": {
+          "ac": {
+            "type": "string",
+            "pattern": "^AC-[0-9]+$"
+          },
+          "error_type": {
+            "description": "The kind of failure as one short token, such as AssertionError, TypeError or Timeout. Never an assertion message: whitespace is rejected, which keeps assertion text out.",
+            "type": "string",
+            "pattern": "^[^\\s]{1,80}$"
+          }
+        }
+      }
+    },
+    "checks": {
+      "description": "Mechanical checks. Each is true (passed), false (failed) or null (not applicable).",
+      "type": "object",
+      "required": ["lint", "secrets", "symlinks", "abs_paths", "graft_fresh"],
+      "additionalProperties": false,
+      "properties": {
+        "lint": {
+          "type": ["boolean", "null"]
+        },
+        "secrets": {
+          "type": ["boolean", "null"]
+        },
+        "symlinks": {
+          "type": ["boolean", "null"]
+        },
+        "abs_paths": {
+          "type": ["boolean", "null"]
+        },
+        "graft_fresh": {
+          "type": ["boolean", "null"]
+        }
+      }
+    },
+    "green": {
+      "description": "True when every command and every applicable check passed.",
+      "type": "boolean"
+    }
+  }
+}

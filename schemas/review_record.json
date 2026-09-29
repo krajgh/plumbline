@@ -1,0 +1,149 @@
+{
+  "description": "One round of a review unit: the prosecutors' findings, the defenders' verdicts, the findings that survive, and the gaps the detective names.",
+  "type": "object",
+  "required": ["target", "round", "lenses", "findings", "defenses", "survivors", "gaps", "blockers_surviving"],
+  "additionalProperties": false,
+  "properties": {
+    "target": {
+      "description": "What was reviewed: diff, or the id of the stage whose output was reviewed.",
+      "type": "string",
+      "minLength": 1
+    },
+    "round": {
+      "description": "1 for the first round, then 2 and so on up to the stage's max_rounds.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "lenses": {
+      "description": "The lenses this round ran, one prosecutor each.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "enum": ["correctness", "tests", "security", "data", "boundaries", "docs"]
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "lens", "file", "line", "claim", "failure_scenario", "rule", "evidence", "outside_code", "severity"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "lens": {
+            "enum": ["correctness", "tests", "security", "data", "boundaries", "docs"]
+          },
+          "file": {
+            "type": "string",
+            "minLength": 1
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "claim": {
+            "description": "What is wrong, in one sentence.",
+            "type": "string",
+            "minLength": 1
+          },
+          "failure_scenario": {
+            "description": "A concrete input or sequence of events that goes wrong.",
+            "type": "string",
+            "minLength": 1
+          },
+          "rule": {
+            "description": "The acceptance criterion, project rule or severity clause the finding rests on.",
+            "type": "string",
+            "minLength": 1
+          },
+          "evidence": {
+            "description": "A quote from the code that shows the problem.",
+            "type": "string",
+            "minLength": 1
+          },
+          "outside_code": {
+            "description": "Support from outside the code (a document, a specification, a standard), or null when the finding rests on the code alone.",
+            "type": ["string", "null"]
+          },
+          "severity": {
+            "description": "Severity rubric. BLOCKING: breaks a stated acceptance criterion, loses or corrupts data, exposes a secret or personal data, or breaks the main path for most users. MAJOR: wrong behaviour on a realistic path, with limited reach or a workaround. MINOR: an edge case, a leak without near-term impact, or an inconsistency.",
+            "enum": ["BLOCKING", "MAJOR", "MINOR"]
+          }
+        }
+      }
+    },
+    "defenses": {
+      "description": "One entry per defender per finding. A blocker stands when enough defenders fail to refute it.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["finding_id", "defender", "verdict", "quote", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "finding_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "defender": {
+            "type": "string",
+            "minLength": 1
+          },
+          "verdict": {
+            "enum": ["refuted", "conceded"]
+          },
+          "quote": {
+            "description": "The line of code the defender relies on.",
+            "type": "string"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "survivors": {
+      "description": "The ids of the findings that stand after the defenders.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "gaps": {
+      "description": "What the detective found missing once no blocker stands.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "detail", "ac"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "enum": ["missing_test", "edge_case", "uncovered_ac"]
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 1
+          },
+          "ac": {
+            "description": "The acceptance criterion the gap concerns, or null.",
+            "type": ["string", "null"],
+            "pattern": "^AC-[0-9]+$"
+          }
+        }
+      }
+    },
+    "blockers_surviving": {
+      "description": "How many surviving findings are BLOCKING. The gate no_surviving_blockers passes at 0.",
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

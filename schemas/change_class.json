@@ -1,0 +1,97 @@
+{
+  "description": "The intake record: what changed against the base, and which pipeline row that change takes. Written by `plumbline.py classify`.",
+  "type": "object",
+  "required": ["base", "head", "merge_base", "files", "types", "lines", "size", "row", "symlinks", "notes"],
+  "additionalProperties": false,
+  "properties": {
+    "base": {
+      "description": "The ref the change was measured against, as given or as defaulted (for example origin/main).",
+      "type": "string",
+      "minLength": 1
+    },
+    "head": {
+      "description": "The full commit id of HEAD when the record was written.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40,64}$"
+    },
+    "merge_base": {
+      "description": "The full commit id of `git merge-base <base> HEAD`: where the diff starts.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40,64}$"
+    },
+    "files": {
+      "description": "Every changed file: committed, uncommitted, and untracked but not ignored (counted as added lines).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "type", "added", "removed", "generated", "symlink"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "description": "Repository-relative path, with forward slashes.",
+            "type": "string",
+            "minLength": 1
+          },
+          "type": {
+            "description": "The first file type of the pipeline (repo types first) whose paths match.",
+            "type": "string",
+            "minLength": 1
+          },
+          "added": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "removed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "generated": {
+            "description": "True when the path matches the pipeline's `generated` globs; such files do not count toward `lines`.",
+            "type": "boolean"
+          },
+          "symlink": {
+            "description": "True when the path is a symbolic link (git mode 120000).",
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "types": {
+      "description": "The distinct file types among the files, in precedence order: the first decides the row.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "lines": {
+      "description": "Changed lines (added + removed) outside the generated files.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "size": {
+      "description": "S, M or L, from `lines` and the pipeline's [sizes] table.",
+      "enum": ["S", "M", "L"]
+    },
+    "row": {
+      "description": "The matrix row the change takes: the deciding type, plus the size for a row split by size (for example code.M).",
+      "type": "string",
+      "minLength": 1
+    },
+    "symlinks": {
+      "description": "Paths of the symbolic links among the files.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "notes": {
+      "description": "Anything the classifier had to assume or skip.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

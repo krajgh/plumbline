@@ -1,0 +1,15 @@
+{
+  "name": "plumbline",
+  "owner": {
+    "name": "krajgh"
+  },
+  "description": "The plumbline plugin: a typed adversarial change pipeline for Claude Code, and the subagent discipline behind it.",
+  "allowCrossMarketplaceDependenciesOn": ["ponytail"],
+  "plugins": [
+    {
+      "name": "plumbline",
+      "source": "./",
+      "description": "Typed adversarial change pipeline, defined as data, with the subagent discipline. Requires the ponytail plugin."
+    }
+  ]
+}

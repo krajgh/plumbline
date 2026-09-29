@@ -1,0 +1,35 @@
+{
+  "description": "The builder's decision to push a commit without a passing pass_record. Written only on the builder's instruction.",
+  "type": "object",
+  "required": ["commit", "reason", "by", "at", "stages_skipped"],
+  "additionalProperties": false,
+  "properties": {
+    "commit": {
+      "description": "The commit the override covers.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40,64}$"
+    },
+    "reason": {
+      "description": "Why the pipeline is being bypassed: at least 20 characters, so a bare 'skip' does not pass.",
+      "type": "string",
+      "minLength": 20
+    },
+    "by": {
+      "type": "string",
+      "minLength": 1
+    },
+    "at": {
+      "description": "When the override was given, as an ISO 8601 timestamp in UTC.",
+      "type": "string",
+      "minLength": 1
+    },
+    "stages_skipped": {
+      "description": "The ids of the stages that did not run or did not pass.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

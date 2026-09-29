@@ -1,0 +1,67 @@
+{
+  "description": "The test-writer's record: the tests written, which acceptance criteria each covers, and the result of running them against stubs.",
+  "type": "object",
+  "required": ["tests", "files_written", "stub_check"],
+  "additionalProperties": false,
+  "properties": {
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "file", "name", "ac_ids", "scenario"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "file": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "description": "The test's name as the test runner reports it.",
+            "type": "string",
+            "minLength": 1
+          },
+          "ac_ids": {
+            "description": "The acceptance criteria this test covers.",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^AC-[0-9]+$"
+            }
+          },
+          "scenario": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "files_written": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "stub_check": {
+      "description": "Run against stubs of the planned interfaces: every test should fail, and fail on an assertion rather than on an import or syntax error.",
+      "type": "object",
+      "required": ["ran", "all_failed_on_assertions", "detail"],
+      "additionalProperties": false,
+      "properties": {
+        "ran": {
+          "type": "boolean"
+        },
+        "all_failed_on_assertions": {
+          "type": "boolean"
+        },
+        "detail": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

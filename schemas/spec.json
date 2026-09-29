@@ -1,0 +1,102 @@
+{
+  "description": "The planner's record: what will be built and how each acceptance criterion is verified.",
+  "type": "object",
+  "required": ["goal", "non_goals", "acceptance_criteria", "interfaces", "test_plan", "risks", "split_proposal"],
+  "additionalProperties": false,
+  "properties": {
+    "goal": {
+      "description": "One or two sentences: what the change achieves.",
+      "type": "string",
+      "minLength": 1
+    },
+    "non_goals": {
+      "description": "What this change deliberately does not do.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "acceptance_criteria": {
+      "description": "The stated criteria the change is judged against. A finding that breaks one is BLOCKING.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "statement", "verification"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "AC-1, AC-2, ... Other records refer to criteria by this id.",
+            "type": "string",
+            "pattern": "^AC-[0-9]+$"
+          },
+          "statement": {
+            "type": "string",
+            "minLength": 1
+          },
+          "verification": {
+            "description": "How the criterion is checked: a test, a command, or an inspection.",
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "interfaces": {
+      "description": "The functions, commands or files the change adds or alters, with their signatures.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "file", "signature"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "file": {
+            "type": "string",
+            "minLength": 1
+          },
+          "signature": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "test_plan": {
+      "description": "The scenarios the test-writer should cover, each tied to a criterion.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ac", "scenario"],
+        "additionalProperties": false,
+        "properties": {
+          "ac": {
+            "type": "string",
+            "pattern": "^AC-[0-9]+$"
+          },
+          "scenario": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "split_proposal": {
+      "description": "At size L: a list of proposed changes, each of size M or smaller, described in one string. Otherwise null.",
+      "type": ["array", "null"],
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

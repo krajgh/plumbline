@@ -1,0 +1,73 @@
+{
+  "description": "The main session's final record for a run: which stages ran, whether each gate passed, what it cost, and the verdict. A passing pass_record for HEAD is what lets a push through.",
+  "type": "object",
+  "required": ["commit", "run_id", "row", "stages", "tokens", "verdict", "notes"],
+  "additionalProperties": false,
+  "properties": {
+    "commit": {
+      "description": "The commit the run was for.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40,64}$"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "row": {
+      "description": "The matrix row the run followed (for example code.M).",
+      "type": "string",
+      "minLength": 1
+    },
+    "stages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "record", "gate", "passed", "rounds"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "record": {
+            "description": "Path of the stage's record, relative to the repository root.",
+            "type": "string",
+            "minLength": 1
+          },
+          "gate": {
+            "description": "The stage's gate, or null when it has none.",
+            "type": ["string", "null"]
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "rounds": {
+            "description": "How many rounds the stage took.",
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "tokens": {
+      "description": "Token usage of the run. by_model maps a model name to {output, fresh_input, cache_read}, each an integer count.",
+      "type": "object",
+      "required": ["by_model"],
+      "additionalProperties": false,
+      "properties": {
+        "by_model": {
+          "type": "object"
+        }
+      }
+    },
+    "verdict": {
+      "enum": ["pass", "fail", "override"]
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
