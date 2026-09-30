@@ -285,12 +285,13 @@ def test_a_record_no_agent_left_has_no_ledger_entry_and_its_gate_fails_as_the_pr
     assert edited.returncode == 1 and "changed after plumbline:planner stopped" in edited.stdout
 
 
-def test_the_readme_counts_a_stages_rounds_by_its_agents_and_the_code_does(repo, run_cli, run_stop):
+def test_the_readme_counts_a_stages_rounds_by_its_attempts_and_the_code_does(repo, run_cli, run_stop):
     text = section("Runs, gates and the pass record")
     rounds = re.search(r"\*\*Rounds\.\*\*(.*?)\n\n", text, re.S).group(1)
-    assert "the number of distinct agents (by `agent_id`; an entry without one counts once)" in rounds
-    assert "so an agent that stops again for the same report is still one round" in rounds
-    assert "The `rounds` of a stage in the pass record count its distinct agents the same way, over the whole run" in rounds
+    assert "the number of its attempts since its gate last passed" in rounds
+    assert "an agent that stops again before the gate for the same report is still one attempt" in rounds
+    assert "the same agent resumed after a failed gate makes the next" in rounds
+    assert "The `rounds` of a stage in the pass record count its attempts over the whole run" in rounds
     assert "A stop that leaves the `record`, `record_sha256` and `valid` that the agent's latest entry already holds is not entered again" in text
     adopt_base(repo, commands={"test": CONTROLLED})
     assert run_cli("plan", "--run-id", RUN, "--intent", "feature", "--row", "code.S", cwd=repo).returncode == 0

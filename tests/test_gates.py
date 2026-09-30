@@ -596,9 +596,9 @@ def test_an_entry_without_an_agent_id_counts_once_each():
     assert pl.stage_round(PLAN_STAGE, None, mixed) == (3, 2) and pl.rounds_taken(PLAN_STAGE, None, mixed) == 3
 
 
-def test_the_round_counts_the_agents_since_the_gate_last_passed_and_no_other_stages_entries():
+def test_the_round_counts_the_attempts_since_the_gate_last_passed_and_no_other_stages_entries():
     assert pl.stage_round(PLAN_STAGE, None, [agent_entry("a"), agent_entry("b"), passed_gate(), agent_entry("b")]) == (1, 2)  # b again, in the new count
-    assert pl.stage_round(PLAN_STAGE, None, [agent_entry("a"), {**passed_gate(), "passed": False}, agent_entry("a")]) == (1, 2)  # a failed gate resets nothing
+    assert pl.stage_round(PLAN_STAGE, None, [agent_entry("a"), {**passed_gate(), "passed": False}, agent_entry("a")]) == (2, 2)  # resumed after a failed gate: the next attempt
     assert pl.stage_round(PLAN_STAGE, None, [agent_entry("a"), passed_gate()]) == (0, 2)
     others = [agent_entry("a"), agent_entry("x", stage="tests"), passed_gate("tests"), agent_entry("y", stage="tests")]
     assert pl.stage_round(PLAN_STAGE, None, others) == (1, 2)  # another stage's agents and gates are its own

@@ -2604,39 +2604,34 @@ def measure_stage(project: Project, run: Run | None, run_id: str, stage: dict) -
 
 # ---- rounds
 
-def count_agents(entries: list[dict]) -> int:
-    """How many agents these ledger entries show. A round is an agent that ran, and one agent can stop more than once (the
-    harness asks it again for a report it has not delivered), so each agent id counts once however many entries it has. An
-    entry without an agent id counts on its own: nothing says it is an agent seen before."""
-    ids: set[str] = set()
-    anonymous = 0
-    for entry in entries:
-        agent_id = entry.get("agent_id")
-        if isinstance(agent_id, str) and agent_id:
-            ids.add(agent_id)
-        else:
-            anonymous += 1
-    return len(ids) + anonymous
-
-
 def stage_agents(ledger: list[dict], stage_id: str, since_gate_passed: bool = False) -> int:
-    """The number of distinct agents (see count_agents) the ledger shows for a stage: every one of them, or, with
-    `since_gate_passed`, those that stopped after the stage's gate last passed."""
-    entries: list[dict] = []
+    """The number of attempts the ledger shows for a stage. An attempt is an agent's work up to the stage's next gate: an
+    agent that stops several times before the gate (the harness asks it again for a report it has not delivered) makes one
+    attempt, and the same agent resumed after a failed gate makes another. A second agent before the gate, or a stop that
+    names no agent, is an attempt of its own. With `since_gate_passed`, counting starts again after the gate last passed."""
+    attempts = 0
+    seen: set[str] = set()  # the agents already counted since the stage's last gate
     for entry in ledger:
         if entry.get("stage") != stage_id:
             continue
-        if entry.get("kind") == "agent":
-            entries.append(entry)
-        elif since_gate_passed and entry.get("kind") == "gate" and entry.get("passed") is True:
-            entries.clear()
-    return count_agents(entries)
+        if entry.get("kind") == "gate":
+            seen = set()
+            if since_gate_passed and entry.get("passed") is True:
+                attempts = 0
+        elif entry.get("kind") == "agent":
+            agent_id = entry.get("agent_id")
+            if not (isinstance(agent_id, str) and agent_id):
+                attempts += 1
+            elif agent_id not in seen:
+                seen.add(agent_id)
+                attempts += 1
+    return attempts
 
 
 def stage_round(stage: dict, data: dict | None, ledger: list[dict]) -> tuple[int, int | None]:
     """(the round this stage is in, its max_rounds). A review stage is in the round its record says. An agent stage is in the
-    round of its agents, counted once each (not once for each stop), that stopped since its gate last passed: a stage that
-    passed and is run again (the review sent the run back to build) starts counting again."""
+    round of its attempts since its gate last passed (see stage_agents): an agent counts once however often it stops before
+    the gate, again when it is resumed after a failed gate, and a stage that passed and is run again starts counting again."""
     limit = stage.get("max_rounds")
     if stage.get("kind", "agent") == "review":
         return (data["round"] if data is not None else 0), limit
@@ -3121,9 +3116,8 @@ def coverage(root: Path, head: str, project: Project) -> tuple[str | None, str]:
 
 
 def rounds_taken(stage: dict, record: dict | None, ledger: list[dict]) -> int:
-    """How many rounds a stage took: a review stage says so itself, an agent stage is counted by the distinct agents the ledger
-    saw stop for it (an agent that stopped several times is one round; a stage that ran again after its gate passed adds its
-    new agents), a main-session stage took one."""
+    """How many rounds a stage took: a review stage says so itself, an agent stage is counted by its attempts over the whole
+    run (see stage_agents: an agent that stopped several times before a gate is one), a main-session stage took one."""
     if stage.get("kind", "agent") == "review" and record is not None:
         return record["round"]
     return stage_agents(ledger, stage["id"]) or 1
