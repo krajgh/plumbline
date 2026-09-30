@@ -231,6 +231,7 @@ The prompts state what to do. The planner, test-writer and builder name ponytail
 ## Skills
 
 - `/plumbline:run` is the main session's recipe: continue the run in progress, or infer and confirm the intent and start a run with `plan --intent`; launch each stage's agent without `model`, because each is pinned in its definition (`run_in_background: false` when the next step needs its result); run the two measured gates with the Bash tool's largest timeout, or in the background; run a review round's prosecutors in the background together, then its defenders together, then the detective; evaluate the gates; loop to `on_fail` up to `max_rounds` (then stop and bring the findings and failing criteria to the builder); commit; `pass`; and report `status` and `tokens`. Records live in the main checkout, never in an agent's worktree.
+  **Relaying a request.** When you relay text from one session to another (a request written in a chat and pasted into the session that runs the pipeline), type a line of your own around the pasted text, such as `run this:` before it, or type `/plumbline:run` and paste only the request after it. Claude Code asks before it acts on a message that is only pasted text, and the pipeline does not start until you answer.
 - `/plumbline:override` (typed by the builder only: `disable-model-invocation: true`) records an override for HEAD. It runs `plumbline.py override` through skill shell injection with the builder's arguments as the reason (through a quoted here-document, so no character of the reason is read as shell), and the injection does not pass through PreToolUse. A Bash command that runs `plumbline.py override` is denied to every agent and to the main session, wherever the repository has adopted plumbline.
 - `/plumbline:status` shows a run (the one in progress), its stages and gates, and whether HEAD is covered.
 - `/plumbline:init` and `/plumbline:subagent-discipline`, as before.
@@ -318,6 +319,26 @@ The hooks are guard rails. They stop an agent that overreaches when a rule block
 **Agents' Bash**
 - **Honest commands can be refused.** An agent's Bash is judged command by command against its role's classes. `test`, `[` and `sort` are not among them, and neither are a `case` with several clauses or a `sed -n` script with several commands. An agent that needs one of them asks the main session to run it.
 - **`allowed-tools` is wider than the plugin's script.** While `/plumbline:run`, `/plumbline:status` or `/plumbline:init` is active, Claude Code pre-approves any `python3` command (`Bash(python3 *)`), not only `plumbline.py`. The install path differs per user, so a narrower pattern could silently drop the pre-approval. The hooks apply either way.
+
+## What a run costs
+
+This is one real run, so one data point and not an average: a feature of about 260 changed lines in a small Python CLI, size M, through all eight stages of the `code.M` row. Output is what a model wrote; a cache write is input stored in the prompt cache, and a cache read is input served from it, which costs less than fresh input.
+
+| | |
+| --- | --- |
+| Active machine time | about 18 minutes, without the time spent waiting for answers |
+| Rounds | plan 1, tests 2, test-review 1, verify 1, review 1 |
+| The agents (15 of them) | at least 42K output tokens, 415K cache writes, 2.7M cache reads |
+| The main session, which orchestrates | 26K output tokens, 114K cache writes, 5.3M cache reads |
+
+- **The main session is the biggest spender.** It holds about two thirds of all the cache reads, because every agent report and every stop is a turn of its own that reads the whole of its context again, and the review alone brought nine of them.
+- **The agents' output is a lower bound.** Some messages of the reviewers never got their final usage entry, so they count as the snapshot taken when they began; `plumbline.py tokens` says how many (`output_lower_bound`). Input and cache counts are exact.
+- **Only the tests stage needed a second round.** Nothing looped, so the round caps stayed as they are.
+- **There is no token cap.** The round caps and each agent's `maxTurns` bound what the agents spend, and nothing bounds the main session.
+
+## Developing plumbline
+
+The tests run with `uv run --with pytest pytest -q`. A plugin installed from a local-directory marketplace (`claude plugin marketplace add <directory>`) runs from that source folder in place, not from a copy, so an edit to the folder reaches every live session that uses the plugin. Edit it between runs, and work on a change in a separate git worktree until it is ready, so that a run in progress keeps the plugin it began with.
 
 ## Status
 
