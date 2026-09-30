@@ -103,6 +103,6 @@ When every stage has passed:
 1. Look at `git status` and `git diff`: the change is what was meant.
 2. Commit it yourself: add the files of the change and `git commit`. The commit is checked for a symlink, an absolute home path and a key-shaped secret.
 3. `PLUMBLINE pass <run_id>`. It needs a clean tree, a row that reaches reduce, and every gate passed. It measures the change again and refuses a run whose row lacks a stage the measured row selects, and it refuses when the change was edited after `verify` and `review` covered it: then run again from `verify`.
-4. Report to the builder: `PLUMBLINE status --run <run_id>`, `PLUMBLINE tokens <run_id>`, the intent, the declared and measured row, the rounds each stage took, and the detective's gaps.
+4. Report to the builder: `PLUMBLINE status --run <run_id>`, `PLUMBLINE tokens <run_id>` (an output count whose `output_lower_bound` is above 0 is at least that), the intent, the declared and measured row, the rounds each stage took, and the detective's gaps.
 
 Leave the push to the builder. With a pass recorded for HEAD, the push hook lets it through.

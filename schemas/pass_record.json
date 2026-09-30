@@ -50,7 +50,7 @@
       }
     },
     "tokens": {
-      "description": "Token usage of the run. by_model maps a model name to {output, fresh_input, cache_read}, each an integer count.",
+      "description": "Token usage of the run. by_model maps a model name to {output, fresh_input, cache_read, output_lower_bound}, each an integer count. output_lower_bound is how many messages never got their final usage entry: when it is above 0, output is at least the count given.",
       "type": "object",
       "required": ["by_model"],
       "additionalProperties": false,

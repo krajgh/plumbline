@@ -174,9 +174,24 @@ def test_the_pass_record_carries_the_tokens_of_the_runs_agents(run_cli, ready, t
     result = do_pass(run_cli, ready)
     assert result.returncode == 0
     assert read(ready, "reduce")["tokens"] == {
-        "by_model": {HAIKU: {"output": 2, "fresh_input": 1, "cache_read": 0}, SONNET: {"output": 12, "fresh_input": 7, "cache_read": 500}}
+        "by_model": {
+            HAIKU: {"output": 2, "fresh_input": 1, "cache_read": 0, "output_lower_bound": 0},
+            SONNET: {"output": 12, "fresh_input": 7, "cache_read": 500, "output_lower_bound": 0},
+        }
     }
     assert f"tokens {SONNET}: output 12, fresh input 7, cache read 500" in result.stdout
+
+
+def test_the_pass_record_and_its_output_say_when_an_output_count_is_a_lower_bound(run_cli, ready, tmp_path):
+    transcript = write_transcript(tmp_path / "agent.jsonl", [assistant_record("m1", SONNET, output=12, inp=3, cache_write=4, cache_read=500, stop_reason=None)])
+    write_ledger(ready, [agent_row("a1", transcript=str(transcript))])
+    result = do_pass(run_cli, ready)
+    assert result.returncode == 0, result.stdout
+    record = read(ready, "reduce")
+    assert record["tokens"]["by_model"][SONNET] == {"output": 12, "fresh_input": 7, "cache_read": 500, "output_lower_bound": 1}
+    assert f"the output tokens of {SONNET} are a lower bound: 1 message had no final usage entry" in " ".join(record["notes"])
+    assert f"tokens {SONNET}: output at least 12, fresh input 7, cache read 500" in result.stdout
+    assert pl.check_record("pass_record", record) == []
 
 
 def test_rounds_come_from_the_review_record_and_from_the_agents_the_ledger_saw(run_cli, repo):

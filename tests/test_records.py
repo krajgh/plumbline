@@ -540,6 +540,9 @@ def test_render_carries_the_records_content():
     assert "Row `code.M`: size M, 101 changed lines. Types: code, docs." in change
     passed = pl.render_record("pass_record", sample("pass_record"))
     assert "| sonnet | 1200 | 3400 | 56000 |" in passed and "# Pass record: pass" in passed
+    lower = sample("pass_record")
+    lower["tokens"]["by_model"]["sonnet"]["output_lower_bound"] = 3
+    assert "| sonnet | at least 1200 | 3400 | 56000 |" in pl.render_record("pass_record", lower)  # a count with messages missing their final entry is shown as at least
     assert "The pipeline cannot run offline" in pl.render_record("override_record", sample("override_record"))
     assert "`src/app.py`" in pl.render_record("build_note", sample("build_note"))
     assert "covers AC-1" in pl.render_record("tests_record", sample("tests_record"))

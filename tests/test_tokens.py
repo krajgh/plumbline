@@ -14,9 +14,9 @@ def transcripts(tmp_path):
         tmp_path / "t" / "agent-a1.jsonl",
         [
             {"type": "user", "message": {"role": "user", "content": "do it"}},
-            assistant_record("msg_1", SONNET, output=1, inp=10, cache_write=100, cache_read=1000, block="text"),
-            assistant_record("msg_1", SONNET, output=25, inp=10, cache_write=100, cache_read=1000, block="tool_use"),
-            assistant_record("msg_1", SONNET, output=40, inp=10, cache_write=100, cache_read=1000, block="tool_use"),
+            assistant_record("msg_1", SONNET, output=1, inp=10, cache_write=100, cache_read=1000, block="text", stop_reason=None),
+            assistant_record("msg_1", SONNET, output=25, inp=10, cache_write=100, cache_read=1000, block="tool_use", stop_reason=None),
+            assistant_record("msg_1", SONNET, output=40, inp=10, cache_write=100, cache_read=1000, block="tool_use", stop_reason="tool_use"),
             {"type": "attachment", "attachment": {"type": "hook_success"}},
             assistant_record("msg_2", SONNET, output=60, inp=5, cache_write=0, cache_read=2000),
             assistant_record("msg_synthetic", "<synthetic>", output=0),
@@ -27,7 +27,7 @@ def transcripts(tmp_path):
     second = write_transcript(
         tmp_path / "t" / "agent-b2.jsonl",
         [
-            assistant_record("msg_3", HAIKU, output=5, inp=7, cache_write=3, cache_read=50),
+            assistant_record("msg_3", HAIKU, output=5, inp=7, cache_write=3, cache_read=50, stop_reason=None),
             assistant_record("msg_3", HAIKU, output=9, inp=7, cache_write=3, cache_read=50),
             assistant_record("msg_1", SONNET, output=40, inp=10, cache_write=100, cache_read=1000),  # the same message again: not counted twice
         ],
@@ -36,8 +36,8 @@ def transcripts(tmp_path):
 
 
 EXPECTED = {
-    SONNET: {"output": 100, "fresh_input": 115, "cache_read": 3000},  # msg_1: 40, 10+100, 1000; msg_2: 60, 5, 2000
-    HAIKU: {"output": 9, "fresh_input": 10, "cache_read": 50},  # msg_3: 9, 7+3, 50
+    SONNET: {"output": 100, "fresh_input": 115, "cache_read": 3000, "output_lower_bound": 0},  # msg_1: 40, 10+100, 1000; msg_2: 60, 5, 2000
+    HAIKU: {"output": 9, "fresh_input": 10, "cache_read": 50, "output_lower_bound": 0},  # msg_3: 9, 7+3, 50
 }
 
 
@@ -47,7 +47,7 @@ def test_the_maximum_usage_per_message_id_is_summed_per_model(transcripts):
 
 def test_a_message_streamed_in_several_records_counts_once(tmp_path):
     path = write_transcript(tmp_path / "a.jsonl", [assistant_record("m", SONNET, output=n, inp=4, cache_write=6, cache_read=8) for n in (1, 2, 3, 30)])
-    assert pl.usage_by_model([path]) == {SONNET: {"output": 30, "fresh_input": 10, "cache_read": 8}}
+    assert pl.usage_by_model([path]) == {SONNET: {"output": 30, "fresh_input": 10, "cache_read": 8, "output_lower_bound": 0}}
 
 
 def test_each_counter_takes_its_own_maximum(tmp_path):
@@ -56,12 +56,12 @@ def test_each_counter_takes_its_own_maximum(tmp_path):
         tmp_path / "a.jsonl",
         [assistant_record("m", SONNET, output=50, inp=1, cache_write=0, cache_read=900), assistant_record("m", SONNET, output=2, inp=9, cache_write=5, cache_read=100)],
     )
-    assert pl.usage_by_model([path]) == {SONNET: {"output": 50, "fresh_input": 14, "cache_read": 900}}
+    assert pl.usage_by_model([path]) == {SONNET: {"output": 50, "fresh_input": 14, "cache_read": 900, "output_lower_bound": 0}}
 
 
 def test_fresh_input_is_input_plus_cache_writes_and_cache_reads_stand_alone(tmp_path):
     path = write_transcript(tmp_path / "a.jsonl", [assistant_record("m", HAIKU, output=1, inp=7, cache_write=30, cache_read=500)])
-    assert pl.usage_by_model([path]) == {HAIKU: {"output": 1, "fresh_input": 37, "cache_read": 500}}
+    assert pl.usage_by_model([path]) == {HAIKU: {"output": 1, "fresh_input": 37, "cache_read": 500, "output_lower_bound": 0}}
 
 
 def test_models_are_reported_separately_and_sorted(tmp_path):
@@ -82,6 +82,64 @@ def test_a_transcript_that_cannot_be_read_is_skipped(tmp_path):
     assert pl.usage_by_model([tmp_path / "missing.jsonl"]) == {}
 
 
+# --- output counts that are lower bounds: a message whose final usage entry never reached the transcript
+
+
+def snapshot(message_id, model, output, **usage):
+    """A record taken as a message started: a small output count, and stop_reason null."""
+    return assistant_record(message_id, model, output, stop_reason=None, **usage)
+
+
+def test_a_message_with_only_snapshots_is_flagged_and_its_input_and_cache_counts_stay_exact(tmp_path):
+    path = write_transcript(
+        tmp_path / "reviewer.jsonl",
+        [
+            snapshot("m_lost", SONNET, output=8, inp=3, cache_write=500, cache_read=40_000),  # the record that ends this message never came
+            snapshot("m_lost", SONNET, output=150, inp=3, cache_write=500, cache_read=40_000, block="tool_use"),
+            snapshot("m_kept", SONNET, output=8, inp=4, cache_write=200, cache_read=50_000),
+            assistant_record("m_kept", SONNET, output=1200, inp=4, cache_write=200, cache_read=50_000, block="tool_use", stop_reason="tool_use"),
+            assistant_record("m_haiku", HAIKU, output=30, inp=1, cache_write=10, cache_read=100, stop_reason="end_turn"),
+        ],
+    )
+    assert pl.usage_by_model([path]) == {
+        HAIKU: {"output": 30, "fresh_input": 11, "cache_read": 100, "output_lower_bound": 0},
+        SONNET: {"output": 1350, "fresh_input": 707, "cache_read": 90_000, "output_lower_bound": 1},  # 150 of it is only what was known as m_lost began
+    }
+
+
+def test_the_flag_counts_messages_and_not_records(tmp_path):
+    path = write_transcript(tmp_path / "a.jsonl", [snapshot("m1", SONNET, output=n) for n in (1, 2, 3)] + [snapshot("m2", SONNET, output=9)])
+    assert pl.usage_by_model([path])[SONNET]["output_lower_bound"] == 2
+
+
+def test_a_final_record_in_another_transcript_makes_the_message_exact(tmp_path):
+    first = write_transcript(tmp_path / "a.jsonl", [snapshot("m", SONNET, output=8)])
+    second = write_transcript(tmp_path / "b.jsonl", [assistant_record("m", SONNET, output=90, stop_reason="end_turn")])
+    assert pl.usage_by_model([first])[SONNET]["output_lower_bound"] == 1
+    assert pl.usage_by_model([second])[SONNET]["output_lower_bound"] == 0
+    assert pl.usage_by_model([first, second])[SONNET] == {"output": 90, "fresh_input": 0, "cache_read": 0, "output_lower_bound": 0}
+
+
+@pytest.mark.parametrize("stop_reason", [None, "", 0, False, ["end_turn"]])
+def test_a_stop_reason_that_names_no_reason_is_no_final_record(tmp_path, stop_reason):
+    path = write_transcript(tmp_path / "a.jsonl", [assistant_record("m", SONNET, output=5, stop_reason=stop_reason)])
+    assert pl.usage_by_model([path])[SONNET]["output_lower_bound"] == 1
+
+
+def test_a_record_with_no_stop_reason_at_all_is_no_final_record_either(tmp_path):
+    record = assistant_record("m", SONNET, output=5)
+    del record["message"]["stop_reason"]
+    assert pl.usage_by_model([write_transcript(tmp_path / "a.jsonl", [record])])[SONNET]["output_lower_bound"] == 1
+
+
+def test_the_last_record_counts_because_a_messages_counters_only_grow(tmp_path):
+    path = write_transcript(
+        tmp_path / "a.jsonl",
+        [snapshot("m", SONNET, output=8, inp=2), snapshot("m", SONNET, output=40, inp=2), assistant_record("m", SONNET, output=555, inp=2, stop_reason="end_turn")],
+    )
+    assert pl.usage_by_model([path]) == {SONNET: {"output": 555, "fresh_input": 2, "cache_read": 0, "output_lower_bound": 0}}
+
+
 # --- the command, reading the transcripts the ledger points to
 
 
@@ -99,6 +157,35 @@ def test_tokens_reads_the_transcripts_named_in_the_ledger(run_cli, adopted, tran
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"by_model": EXPECTED}
     assert result.stderr == ""
+
+
+def test_tokens_prints_the_lower_bound_per_model_and_says_so_on_stderr(run_cli, adopted, tmp_path):
+    path = write_transcript(
+        tmp_path / "t.jsonl",
+        [snapshot("m1", SONNET, output=150, inp=2), snapshot("m2", SONNET, output=40), assistant_record("m3", SONNET, output=700), assistant_record("m4", HAIKU, output=5)],
+    )
+    write_ledger(adopted, [agent_row("a1", transcript=str(path))])
+    result = run_cli("tokens", RUN, cwd=adopted)
+    assert result.returncode == 0
+    by_model = json.loads(result.stdout)["by_model"]
+    assert by_model[SONNET] == {"output": 890, "fresh_input": 2, "cache_read": 0, "output_lower_bound": 2}
+    assert by_model[HAIKU]["output_lower_bound"] == 0
+    assert result.stderr == f"note: the output tokens of {SONNET} are a lower bound: 2 messages had no final usage entry, only the snapshot taken as a message starts\n"
+
+
+def test_tokens_with_every_final_entry_says_nothing_on_stderr(run_cli, adopted, tmp_path):
+    path = write_transcript(tmp_path / "t.jsonl", [snapshot("m1", SONNET, output=8), assistant_record("m1", SONNET, output=300), assistant_record("m2", HAIKU, output=5)])
+    write_ledger(adopted, [agent_row("a1", transcript=str(path))])
+    result = run_cli("tokens", RUN, cwd=adopted)
+    assert result.stderr == "" and {m: u["output_lower_bound"] for m, u in json.loads(result.stdout)["by_model"].items()} == {HAIKU: 0, SONNET: 0}
+
+
+def test_the_lower_bound_note_says_one_message_in_the_singular(adopted, tmp_path):
+    path = write_transcript(tmp_path / "t.jsonl", [snapshot("m1", HAIKU, output=8)])
+    write_ledger(adopted, [agent_row("a1", transcript=str(path))])
+    tokens, notes = pl.tokens_for_run(adopted, RUN)
+    assert tokens["by_model"][HAIKU]["output_lower_bound"] == 1
+    assert notes == [f"the output tokens of {HAIKU} are a lower bound: 1 message had no final usage entry, only the snapshot taken as a message starts"]
 
 
 def test_the_object_it_prints_is_what_the_pass_record_holds(run_cli, adopted, transcripts):
@@ -121,7 +208,7 @@ def test_without_a_reported_transcript_it_is_derived_from_the_session_transcript
     row = agent_row("xyz", session_id="S1", session_transcript=str(sessions / "S1.jsonl"))
     write_ledger(adopted, [row])
     result = run_cli("tokens", RUN, cwd=adopted)
-    assert json.loads(result.stdout) == {"by_model": {HAIKU: {"output": 8, "fresh_input": 2, "cache_read": 0}}}
+    assert json.loads(result.stdout) == {"by_model": {HAIKU: {"output": 8, "fresh_input": 2, "cache_read": 0, "output_lower_bound": 0}}}
 
 
 def test_the_reported_transcript_wins_over_the_derived_one(run_cli, adopted, tmp_path):

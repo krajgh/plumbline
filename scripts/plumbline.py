@@ -1806,7 +1806,10 @@ def _render_pass_record(d) -> list[str]:
     if isinstance(by_model, dict) and by_model:
         out += _table(
             ["Model", "Output", "Fresh input", "Cache read"],
-            [[m, _get(u, "output"), _get(u, "fresh_input"), _get(u, "cache_read")] for m, u in by_model.items()],
+            [
+                [m, f"at least {_get(u, 'output')}" if _get(u, "output_lower_bound") else _get(u, "output"), _get(u, "fresh_input"), _get(u, "cache_read")]
+                for m, u in by_model.items()
+            ],
             align={1, 2, 3},
         )
     else:
@@ -3061,8 +3064,16 @@ def usage_by_model(transcripts: list[Path]) -> dict:
     """Token usage per model from Claude Code transcripts. A transcript holds
     several records for one API message (one per streamed content block), each
     with the usage known when it was written, so the maximum of each counter per
-    message id is what counts. Output is output_tokens, fresh input is
-    input_tokens plus cache writes, and cache reads stand alone."""
+    message id is what counts: the counters only grow as a message streams, so
+    that is the last record's. Output is output_tokens, fresh input is
+    input_tokens plus cache writes, and cache reads stand alone.
+
+    The first records of a message carry a snapshot taken as it starts (a small
+    output_tokens, stop_reason null) and the last carries the real count
+    (stop_reason set). When the last never reached the transcript, the message
+    has only snapshots and its output is a lower bound: `output_lower_bound`
+    counts those messages per model. Input and cache counters are known as a
+    message starts, so they are exact either way."""
     best: dict[str, dict] = {}
     for path in transcripts:
         try:
@@ -3080,19 +3091,22 @@ def usage_by_model(transcripts: list[Path]) -> dict:
             message_id, model = message.get("id"), message.get("model")
             if not isinstance(message_id, str) or not message_id or model == "<synthetic>":
                 continue
-            entry = best.setdefault(message_id, {"model": None, **{name: 0 for name in USAGE_FIELDS}})
+            entry = best.setdefault(message_id, {"model": None, "final": False, **{name: 0 for name in USAGE_FIELDS}})
             if isinstance(model, str) and model:
                 entry["model"] = model
+            if isinstance(message.get("stop_reason"), str) and message["stop_reason"]:
+                entry["final"] = True  # the record that ends the message: its usage is the real count
             for name in USAGE_FIELDS:
                 value = message["usage"].get(name)
                 if isinstance(value, int) and not isinstance(value, bool) and value > entry[name]:
                     entry[name] = value
     by_model: dict[str, dict] = {}
     for entry in best.values():
-        totals = by_model.setdefault(entry["model"] or "unknown", {"output": 0, "fresh_input": 0, "cache_read": 0})
+        totals = by_model.setdefault(entry["model"] or "unknown", {"output": 0, "fresh_input": 0, "cache_read": 0, "output_lower_bound": 0})
         totals["output"] += entry["output_tokens"]
         totals["fresh_input"] += entry["input_tokens"] + entry["cache_creation_input_tokens"]
         totals["cache_read"] += entry["cache_read_input_tokens"]
+        totals["output_lower_bound"] += 0 if entry["final"] else 1
     return dict(sorted(by_model.items()))
 
 
@@ -3122,10 +3136,18 @@ def ledger_transcripts(root: Path, run_id: str) -> tuple[list[Path], list[str]]:
 
 
 def tokens_for_run(root: Path, run_id: str) -> tuple[dict, list[str]]:
-    """The run's `tokens` object, {"by_model": {...}}, and notes."""
+    """The run's `tokens` object, {"by_model": {...}}, and notes: the transcripts that could not be found, and each model whose output
+    count is a lower bound because some of its messages never got their final usage entry (see usage_by_model)."""
     existing_run_dir(root, run_id)
     transcripts, notes = ledger_transcripts(root, run_id)
-    return {"by_model": usage_by_model(transcripts)}, notes
+    by_model = usage_by_model(transcripts)
+    for model, usage in by_model.items():
+        if usage["output_lower_bound"]:
+            notes.append(
+                f"the output tokens of {model} are a lower bound: {_plural(usage['output_lower_bound'], 'message')} "
+                "had no final usage entry, only the snapshot taken as a message starts"
+            )
+    return {"by_model": by_model}, notes
 
 
 # ------------------------------------------- pass records and overrides
@@ -3773,7 +3795,8 @@ def cmd_pass(args) -> int:
     print(f"plumbline: pass recorded for {record['commit'][:7]} (run {args.run_id}, row {record['row']})")
     print(f"  wrote {rel_path(project.root, run_copy)} and {rel_path(project.root, pass_file)}")
     for model, usage in record["tokens"]["by_model"].items():
-        print(f"  tokens {model}: output {usage['output']}, fresh input {usage['fresh_input']}, cache read {usage['cache_read']}")
+        output = f"at least {usage['output']}" if usage.get("output_lower_bound") else str(usage["output"])  # some of its messages never got their final count
+        print(f"  tokens {model}: output {output}, fresh input {usage['fresh_input']}, cache read {usage['cache_read']}")
     return 0
 
 

@@ -149,6 +149,23 @@ def test_the_readmes_default_rounds_and_gates_are_the_default_pipelines():
     assert (stages["plan"]["on_fail"], stages["tests"]["on_fail"]) == ("plan", "tests")  # both run their own agent again
 
 
+def test_the_readme_says_tokens_flags_an_output_count_that_is_a_lower_bound_and_it_does(run_cli, repo, tmp_path):
+    from rundata import agent_row, assistant_record, write_ledger, write_transcript
+    from samples import sample
+
+    row = next(line for line in README.splitlines() if line.startswith("| `tokens RUN` |"))
+    assert "`output_lower_bound`: how many messages never got their final usage entry" in row and "a note on stderr says so" in row
+    assert "output_lower_bound is how many messages never got their final usage entry" in pl.load_schema("pass_record")["properties"]["tokens"]["description"]
+    assert "whose `output_lower_bound` is above 0 is at least that" in (REPO / "skills" / "run" / "SKILL.md").read_text(encoding="utf-8")
+    adopt(repo)
+    put(repo, "verify", {}, agent=False)  # the run directory
+    transcript = write_transcript(tmp_path / "t.jsonl", [assistant_record("m", "claude-test", output=8, stop_reason=None)])
+    write_ledger(repo, [agent_row("a1", transcript=str(transcript))])
+    result = run_cli("tokens", RUN, cwd=repo)
+    assert json.loads(result.stdout)["by_model"]["claude-test"]["output_lower_bound"] == 1 and "a lower bound" in result.stderr
+    assert sample("pass_record")["tokens"]["by_model"]["sonnet"].keys() >= {"output", "fresh_input", "cache_read"}
+
+
 def test_the_readme_says_how_the_agents_write_and_how_the_run_skill_launches_them():
     agents = section("Agents")
     assert "Every agent writes its record with the Write tool (Bash runs commands and reads), and a review agent writes it straight to the path its brief names" in agents

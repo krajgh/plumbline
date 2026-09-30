@@ -299,8 +299,10 @@ def gate_stages(run_cli, repo, stages, run_id=RUN) -> None:
 # --------------------------------------------- transcripts and the ledger
 
 
-def assistant_record(message_id, model, output, inp=0, cache_write=0, cache_read=0, block="text") -> dict:
-    """One transcript record of an assistant message, as Claude Code writes them: one per streamed content block."""
+def assistant_record(message_id, model, output, inp=0, cache_write=0, cache_read=0, block="text", stop_reason="end_turn") -> dict:
+    """One transcript record of an assistant message, as Claude Code writes them: one per streamed content block. The first records of a
+    message carry a snapshot of the usage taken as it started and `stop_reason` null (pass `stop_reason=None`); the last carries the
+    real count and the reason the message ended, which is what the default stands for."""
     content = {"type": "text", "text": "words"} if block == "text" else {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}
     return {
         "type": "assistant",
@@ -310,6 +312,7 @@ def assistant_record(message_id, model, output, inp=0, cache_write=0, cache_read
             "role": "assistant",
             "model": model,
             "content": [content],
+            "stop_reason": stop_reason,
             "usage": {
                 "input_tokens": inp,
                 "cache_creation_input_tokens": cache_write,
