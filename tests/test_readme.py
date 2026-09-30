@@ -202,6 +202,25 @@ def test_the_commands_table_section_states_the_defaults_and_the_guarded_files_of
     assert all(f"`{name}`" in text for name in pl.CONFIG_COMMANDS)
 
 
+def test_the_stubs_paragraph_says_where_stubs_go_and_that_the_change_never_holds_them(repo):
+    text = section("Runs, gates and the pass record")
+    stubs = re.search(r"\*\*Stubs\.\*\*(.*?)\n\n", text, re.S).group(1)
+    for phrase in (
+        "pytest exits 1, never 2", "under the run's `stubs/` directory", '`-o pythonpath="<stubs dir> ."`', "its `files_written` lists the stubs",
+        "the size measure does not count them, the hash of the change leaves them out, and no commit takes them", "The builder does not see the directory", "without the stubs",
+    ):
+        assert phrase in stubs, phrase
+    assert ".plumbline/runs/<run-id>/stubs/" in text and "on the import of a name the change has yet to add" in text
+    adopt_base(repo)  # what the paragraph says, done: a stub in the run is no part of the change
+    start_run(repo)
+    write(repo / "src" / "feature.py", "x = 1\n")
+    merge_base = git(repo, "merge-base", "main", "HEAD").strip()
+    before = pl.change_hash(repo, merge_base)
+    write(repo / ".plumbline" / "runs" / RUN / "stubs" / "newmod.py", "def add(a, b):\n    return 0\n" * 50)
+    assert pl.change_hash(repo, merge_base) == before
+    assert [f["path"] for f in pl.classify(repo, pl.load_project(repo).pipeline, "main")["files"]] == ["src/feature.py"]
+
+
 def test_a_measured_command_keeps_that_it_ran_and_not_what_it_printed_and_only_a_pytest_command_is_a_pytest_run(repo):
     result = pl.run_declared_command(repo, "echo assertion text; echo more >&2; exit 3", 5)
     assert set(result) == {"cmd", "exit_code", "seconds"} and result["exit_code"] == 3  # no output travels
@@ -463,6 +482,9 @@ def test_the_lane_the_test_harness_and_the_record_rules_of_the_readme_are_the_ho
     assert denied("test-writer", "tests/conftest.py") is None
     assert denied("planner", ".plumbline/runs/r1/plan.json") is None and denied("planner", ".plumbline/runs/r2/plan.json")
     assert denied("builder", "plumbline.toml") and denied("builder", "tests/test_x.py") and denied("builder", "src/app.py") is None
+    assert "the active run's `stubs/` directory (`.plumbline/runs/<run-id>/stubs/`, never another run's)" in section("Hooks")
+    assert denied("test-writer", ".plumbline/runs/r1/stubs/newmod.py") is None and denied("test-writer", ".plumbline/runs/r2/stubs/newmod.py")
+    assert denied("planner", ".plumbline/runs/r1/stubs/newmod.py") and denied("builder", ".plumbline/runs/r1/stubs/newmod.py")
     for own, other in (("prosecutor", "defender-1.json"), ("defender", "prosecutor-x.json"), ("detective", "defender-1.json")):
         assert denied(own, f".plumbline/runs/r1/review/round-1/{other}"), (own, other)
     assert denied("prosecutor", ".plumbline/runs/r1/review/round-1/prosecutor-security.json") is None

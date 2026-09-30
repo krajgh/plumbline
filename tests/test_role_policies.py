@@ -128,13 +128,13 @@ def test_the_builder_cannot_write_the_pipeline_file_of_the_repository(run_pre, a
     assert writes(run_pre, adopted, None, "pipelines/house.toml") is None  # the main session and the builder of the repository are free
 
 
-def test_the_test_writer_writes_test_paths_and_its_record_and_no_source(run_pre, started):
+def test_the_test_writer_writes_test_paths_its_stubs_and_its_record_and_no_source(run_pre, started):
     adopted = started
-    for path in ("tests/test_new.py", "tests/_stubs/app.py", "src/test_app.py", "web/app.spec.js", OWN_RECORD["test-writer"]):
+    for path in ("tests/test_new.py", "tests/helpers/data.py", "src/test_app.py", "web/app.spec.js", OWN_RECORD["test-writer"], ".plumbline/runs/r1/stubs/newmod.py"):
         assert writes(run_pre, adopted, "test-writer", path) is None, path
     reason = writes(run_pre, adopted, "test-writer", "src/app.py")
-    assert reason and "the test-writer writes its own record (.plumbline/runs/<run-id>/tests.json) and test paths; src/app.py is neither" in reason
-    assert "Put stubs under a test path" in reason
+    assert reason and "the test-writer writes its own record (.plumbline/runs/<run-id>/tests.json), test paths and stubs (.plumbline/runs/<run-id>/stubs/); src/app.py is neither" in reason
+    assert "Put the stubs of a brand-new module in the run's stubs directory" in reason
     for path in ("README.md", "plumbline.toml", "conftest.py", ".plumbline/runs/r1/build.json"):
         assert writes(run_pre, adopted, "test-writer", path), path
 
@@ -663,7 +663,7 @@ def test_written_operands_are_what_a_writer_writes_or_removes(argv, expected):
 
 def test_the_hook_roles_are_the_pipelines_roles():
     assert pre.ROLES == pl.AGENT_ROLES and pre.REVIEW_ROLES == ("prosecutor", "defender", "detective")
-    assert pre.CONFIG_COMMANDS == pl.CONFIG_COMMANDS and pre.PASS_DIR == pl.PASS_DIR and pre.RUNS_DIR == pl.RUNS_DIR
+    assert pre.CONFIG_COMMANDS == pl.CONFIG_COMMANDS and pre.PASS_DIR == pl.PASS_DIR and pre.RUNS_DIR == pl.RUNS_DIR and pre.STUBS_DIR == pl.STUBS_DIR == "stubs"
     assert set(pre.GIT_READ) == {"diff", "show", "log", "status", "rev-parse", "merge-base", "ls-files", "grep", "blame"}
 
 

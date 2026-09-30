@@ -357,7 +357,8 @@ def fake_pytest(code):
     [
         (1, None),
         (0, "the test command exited 0: every test passed, so none of them fails without the change it tests"),
-        (2, "the test command exited 2: pytest could not collect the tests (an import or syntax error), and a test that cannot run reproduces nothing"),
+        (2, "the test command exited 2: pytest could not collect the tests (an import or syntax error), and a test that cannot run reproduces nothing; "
+            "import what a test needs from the change inside the test function, so that a missing name fails that test when it runs"),
         (5, "the test command exited 5: pytest collected no tests"),
         (3, "the test command exited 3: pytest did not report failing tests (a failing test exits 1)"),
         (4, "the test command exited 4: pytest did not report failing tests (a failing test exits 1)"),
@@ -419,7 +420,7 @@ def test_the_typed_stub_check_must_agree_with_the_measured_run(run_cli, tested):
     put(tested, "tests", written_tests_record(ran=False, all_failed=False))
     failed_with(gate(run_cli, tested, "tests"), "the stub check did not run")
     put(tested, "tests", written_tests_record(ran=True, all_failed=False))  # the third stop of the test-writer: its last round
-    failed_with(gate(run_cli, tested, "tests"), "not every test failed on an assertion against the stubs", code=3)
+    failed_with(gate(run_cli, tested, "tests"), "stub_check says not every test failed when it ran", code=3)
 
 
 # --- the tests stage run again, once the code exists

@@ -182,6 +182,32 @@ def test_the_test_writer_runs_the_tests_against_a_stub_and_records_the_check():
     assert "a fix" in body  # in a fix the tests run against today's code
 
 
+def test_the_test_writer_runs_against_todays_code_and_imports_new_names_inside_the_tests():
+    body = agent("test-writer")[1]
+    assert "Import what a test needs from the change inside the test function, so that a name the change has yet to add fails that test when it runs (a pytest run exits 1) and does not stop the collection (exit 2)" in body
+    assert "A change to modules that already exist: run against today's code as it is. Each test fails when it runs, on the import of a new name or on an assertion." in body
+    assert "A fix: run against today's code. The tests must fail on an assertion, because the bug is there." in body
+
+
+def test_the_test_writer_puts_the_stubs_of_a_brand_new_module_in_the_runs_stubs_directory():
+    fields, body = agent("test-writer")
+    assert "the run's stubs directory" in body.split("## How you work")[0]  # what the brief gives
+    assert "A brand-new module: write the smallest stub that lets each test reach its assertion, as a file under the run's stubs directory (the path is in your brief)" in body
+    assert 'For pytest, that is the test command followed by `-o pythonpath="<the stubs directory> ."`' in body
+    assert "The stubs stay in the run, outside the change, and the source belongs to the builder" in body
+    assert "tests/_stubs" not in body and "PYTHONPATH" not in body and "under a test path" not in body  # the 0.4.1 advice put the stubs in the change
+    assert "`files_written` lists every file you wrote (the stubs too)" in body
+
+
+def test_the_test_writer_says_what_a_true_stub_check_means_in_each_kind_of_run():
+    body = agent("test-writer")[1]
+    assert "`all_failed_on_assertions` is true when every test failed when it ran (on an assertion or, outside a fix, on the import of a name the change has yet to add)" in body
+    assert "false when one passed or could not be collected (an import or syntax error at the top of a test file)" in body
+    description = pl.load_schema("tests_record")["properties"]["stub_check"]["description"]
+    assert "all_failed_on_assertions is true when that holds" in description and "In a fix every test must fail on an assertion" in description
+    assert "the stubs under the run's stubs directory included" in pl.load_schema("tests_record")["properties"]["files_written"]["description"]
+
+
 def test_the_planner_writes_at_size_l_a_split_proposal():
     assert "split_proposal" in agent("planner")[1]
 

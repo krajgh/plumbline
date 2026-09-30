@@ -165,6 +165,7 @@ WRITERS_ALL = {"tee", "rm", "unlink", "shred", "truncate", "touch", "mv"}  # eve
 WRITERS_LAST = {"cp", "install", "ln", "rsync"}  # the destination is written
 PASS_DIR = ".plumbline/pass"
 RUNS_DIR = ".plumbline/runs"
+STUBS_DIR = "stubs"  # .plumbline/runs/<run-id>/stubs/: where a role with the `stubs` write target puts the stubs of brand-new modules
 ACTIVE_FILE = "ACTIVE"  # .plumbline/runs/ACTIVE holds the id of the run the agents work in
 ACTIVE_REL = f"{RUNS_DIR}/{ACTIVE_FILE}".lower()
 
@@ -2449,6 +2450,28 @@ def own_record(pl, root: Path, pipeline: dict, role: str, rel: str) -> tuple[boo
     return True, None
 
 
+def own_stubs(pl, root: Path, role: str, rel: str) -> tuple[bool, str | None]:
+    """Is `rel` a file under the stubs directory of the active run? (True, None) when it is; (False, why) when it lies under another run's
+    stubs directory, or no run is in progress; (False, None) when it is not shaped like a file of any run's stubs directory."""
+    match = re.fullmatch(re.escape(RUNS_DIR) + r"/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/" + re.escape(STUBS_DIR) + r"/.+", rel)
+    if not match:
+        return False, None
+    active = active_run(pl, root)
+    if active is None:
+        return False, (
+            f"plumbline: no run is in progress, and the {role} puts stubs in the run's stubs directory. The main session starts a run with "
+            "`plumbline.py plan --intent <intent>` (/plumbline:run) before it launches the stage's agent."
+        )
+    if match.group(1) != active:
+        return False, f"plumbline: the {role} writes stubs in the active run's stubs directory ({RUNS_DIR}/{active}/{STUBS_DIR}/); {rel} belongs to run {match.group(1)}."
+    return True, None
+
+
+def _listed(items: list[str]) -> str:
+    """`a`, `a and b`, `a, b and c`."""
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
 def pipeline_paths(pl, project, root: Path) -> set[str]:
     """The pipeline file the repository names, as a path inside the repository (none, when it lies elsewhere)."""
     value = (project.config or {}).get("pipeline", pl.DEFAULT_PIPELINE)
@@ -2542,9 +2565,16 @@ def partition_reason(pl, root: Path, role: str, target: Path, real: Path) -> str
                 continue
             if why:
                 return why
+        if "stubs" in writes:
+            ok, why = own_stubs(pl, root, role, rel)
+            if ok:
+                continue
+            if why:
+                return why
         if rel == ".plumbline" or rel.lower().startswith(".plumbline/"):
             where = ", ".join(own) or "nowhere"
-            return f"plumbline: the {role} writes only its own record ({where}); {rel} is another of plumbline's files."
+            stubs = f" and stubs ({RUNS_DIR}/<run-id>/{STUBS_DIR}/)" if "stubs" in writes else ""
+            return f"plumbline: the {role} writes only its own record ({where}){stubs}; {rel} is another of plumbline's files."
         if rel.lower() in fixed:
             return f"plumbline: {rel} defines how the pipeline runs; it changes through the main session, and the {role} leaves it alone."
         if any(pl.glob_match(pattern, rel) for pattern in patterns):
@@ -2560,9 +2590,13 @@ def partition_reason(pl, root: Path, role: str, target: Path, real: Path) -> str
                 )
             return f"plumbline: {rel} configures how the tests run; it changes through the main session (the test-writer writes test files), and the {role} leaves it alone."
         elif "code" not in writes:
-            can = ["its own record (" + (own[0] if own else "under .plumbline/runs/") + ")"] + (["test paths"] if "tests" in writes else [])
-            hint = " Put stubs under a test path; the source is the builder's." if role == "test-writer" else ""
-            return f"plumbline: the {role} writes {' and '.join(can)}; {rel} is neither.{hint}"
+            can = ["its own record (" + (own[0] if own else "under .plumbline/runs/") + ")"]
+            if "tests" in writes:
+                can.append("test paths")
+            if "stubs" in writes:
+                can.append(f"stubs ({RUNS_DIR}/<run-id>/{STUBS_DIR}/)")
+            hint = " Put the stubs of a brand-new module in the run's stubs directory; the source is the builder's." if "stubs" in writes else ""
+            return f"plumbline: the {role} writes {_listed(can)}; {rel} is neither.{hint}"
     return None
 
 

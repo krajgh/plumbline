@@ -9,7 +9,7 @@ from helpers import DEFAULT_TOML, default_pipeline, write
 # The policies of the spec, written out here as the oracle.
 SPEC_ROLES = {
     "planner": {"writes": ["record"], "commands": ["git-read", "search", "graft"]},
-    "test-writer": {"writes": ["record", "tests"], "commands": ["test", "git-read", "search"]},
+    "test-writer": {"writes": ["record", "tests", "stubs"], "commands": ["test", "git-read", "search"]},
     "builder": {"writes": ["record", "code"], "commands": []},
     "verifier": {"writes": ["record"], "commands": ["test", "lint", "typecheck", "build", "git-read", "search", "plumbline-check"]},
     "prosecutor": {"writes": ["record"], "commands": ["git-read", "search", "graft"]},
@@ -32,8 +32,16 @@ def test_the_default_pipeline_carries_the_specs_role_policies_and_validates():
 
 
 def test_the_known_write_targets_and_command_classes_are_the_specs():
-    assert pl.KNOWN_WRITE_TARGETS == ("record", "tests", "code")
+    assert pl.KNOWN_WRITE_TARGETS == ("record", "tests", "stubs", "code")
     assert pl.KNOWN_COMMAND_CLASSES == ("test", "lint", "typecheck", "build", "git-read", "search", "plumbline-check", "graft")
+
+
+def test_the_test_writer_alone_has_the_stubs_write_target_and_the_policy_comment_documents_it():
+    roles = default_pipeline()["roles"]
+    assert [name for name, policy in roles.items() if "stubs" in policy["writes"]] == ["test-writer"]
+    text = DEFAULT_TOML.read_text(encoding="utf-8")
+    comment = text[text.index("# Role policies"):text.index("[roles.planner]")]
+    assert "stubs = the active run's stubs directory, .plumbline/runs/<run-id>/stubs/" in comment and "outside the change" in comment
 
 
 def test_the_roles_are_the_agents_that_end_with_a_record():
@@ -41,7 +49,8 @@ def test_the_roles_are_the_agents_that_end_with_a_record():
 
 
 BAD_ROLES = [
-    ("unknown-write-target", lambda d: d["roles"]["builder"]["writes"].append("everything"), "roles.builder: unknown write target 'everything' (known: record, tests, code)"),
+    ("unknown-write-target", lambda d: d["roles"]["builder"]["writes"].append("everything"), "roles.builder: unknown write target 'everything' (known: record, tests, stubs, code)"),
+    ("stubs-named-twice", lambda d: d["roles"]["test-writer"]["writes"].append("stubs"), "roles.test-writer: writes names 'stubs' more than once"),
     ("unknown-command", lambda d: d["roles"]["verifier"]["commands"].append("curl"), "roles.verifier: unknown command 'curl'"),
     ("unknown-role", lambda d: d["roles"].update(wizard={"writes": ["record"], "commands": []}), "roles.wizard: unknown role"),
     ("missing-role", lambda d: d["roles"].pop("detective"), "there is no policy for the agent 'detective'"),

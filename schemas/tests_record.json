@@ -1,5 +1,5 @@
 {
-  "description": "The test-writer's record: the tests written, which acceptance criteria each covers, and the result of running them against stubs.",
+  "description": "The test-writer's record: the tests written, which acceptance criteria each covers, and the result of running them before the change exists (against today's code, or against the stubs of a brand-new module).",
   "type": "object",
   "required": ["tests", "files_written", "stub_check"],
   "additionalProperties": false,
@@ -40,6 +40,7 @@
       }
     },
     "files_written": {
+      "description": "Every file the test-writer wrote, the stubs under the run's stubs directory included.",
       "type": "array",
       "items": {
         "type": "string",
@@ -47,7 +48,7 @@
       }
     },
     "stub_check": {
-      "description": "Run against stubs of the planned interfaces: every test should fail, and fail on an assertion rather than on an import or syntax error.",
+      "description": "Run against today's code, or against stubs of a brand-new module: every test should fail when it runs, on an assertion or (outside a fix) on the import of a name the change has yet to add, and not pass or fail at collection. In a fix every test must fail on an assertion. all_failed_on_assertions is true when that holds.",
       "type": "object",
       "required": ["ran", "all_failed_on_assertions", "detail"],
       "additionalProperties": false,

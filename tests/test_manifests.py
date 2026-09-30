@@ -265,6 +265,20 @@ def test_the_run_skill_briefs_the_defender_with_the_merge_base_and_the_hash():  
     assert "the merge base" in prompt and "`diff_sha256`" in prompt  # what the prompt expects, the brief gives
 
 
+def test_the_run_skill_briefs_the_test_writer_on_how_the_tests_run_and_where_the_stubs_go():
+    body = run_skill()
+    brief = between(body, "- test-writer:", "- builder: the plan record.")
+    for needed in (
+        "the plan's `stubs_dir`", "the tests run against today's code, with the new names imported inside the test functions",
+        "so that each test fails when it runs (on the import of a name the change has yet to add, or on an assertion) and not at collection",
+        "Stubs are for brand-new modules only: they go in `stubs_dir`, outside the change and hidden from the builder",
+        '(for pytest, the test command followed by `-o pythonpath="<stubs_dir> ."`)', "Its `files_written` lists the stubs too",
+    ):
+        assert needed in brief, needed
+    assert "the `stubs_dir` of the run" in between(body, "## 3. Start the run", "## 4. The stages")
+    assert "tests/_stubs" not in body
+
+
 def test_the_run_skill_briefs_the_detective_with_the_merge_base_the_spec_and_the_tests_record():  # C-24
     body = run_skill()
     detective = between(body, "4. **Detective.**", "5. `PLUMBLINE gate")

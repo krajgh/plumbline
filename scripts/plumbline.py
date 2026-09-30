@@ -126,7 +126,8 @@ AGENT_RECORDS = {
 AGENT_ROLES = tuple(AGENT_RECORDS)  # the roles a [roles.<name>] policy may describe
 REVIEW_PART_TYPES = ("findings_record", "defense_record", "gaps_record")
 # Role policies (see [roles.*] in pipeline/default.toml): where an agent may write, and what its Bash may run.
-KNOWN_WRITE_TARGETS = ("record", "tests", "code")
+KNOWN_WRITE_TARGETS = ("record", "tests", "stubs", "code")
+STUBS_DIR = "stubs"  # .plumbline/runs/<run-id>/stubs/: the stubs of brand-new modules, in the run and so outside the change
 CONFIG_COMMANDS = ("test", "lint", "typecheck", "build")  # the keys of [commands] in plumbline.toml
 KNOWN_COMMAND_CLASSES = (*CONFIG_COMMANDS, "git-read", "search", "plumbline-check", "graft")
 DEFAULT_INTENT = "feature"
@@ -1430,6 +1431,7 @@ def build_plan(pipeline: dict, record: dict, run_id: str, commands: dict | None 
         "merge_base": record["merge_base"],
         "note": effective.note,
         "record_dir": record_dir,
+        "stubs_dir": f"{record_dir}/{STUBS_DIR}",
         "commands": commands or {},
         "graft": graft,
         "supplied": [
@@ -2238,7 +2240,10 @@ def _measured_tests_problems(ctx: GateContext, revision: bool) -> list[str]:
         if code == 0:
             problems.append("the test command exited 0: every test passed, so none of them fails without the change it tests")
         elif code == 2:
-            problems.append("the test command exited 2: pytest could not collect the tests (an import or syntax error), and a test that cannot run reproduces nothing")
+            problems.append(
+                "the test command exited 2: pytest could not collect the tests (an import or syntax error), and a test that cannot run reproduces nothing; "
+                "import what a test needs from the change inside the test function, so that a missing name fails that test when it runs"
+            )
         elif code == 5:
             problems.append("the test command exited 5: pytest collected no tests")
         elif code != 1:
@@ -2250,7 +2255,9 @@ def _measured_tests_problems(ctx: GateContext, revision: bool) -> list[str]:
 
 def _stub_problems(tests: dict, ctx: GateContext, on_stubs: bool) -> list[str]:
     """The tests stage's checks in one place: coverage, at least one test, what the test-writer says its run showed, and
-    what the measured run showed. The tests run against stubs, or (for a fix) against today's code."""
+    what the measured run showed. The tests run against today's code (a change to modules that exist imports its new names
+    inside the tests, so each test fails when it runs) or, for a brand-new module, against its stubs; a fix runs against
+    today's code and must fail on an assertion."""
     problems = _acs_covered_problems(tests, ctx)
     if not tests["tests"]:
         problems.append("there are no tests")
@@ -2261,7 +2268,7 @@ def _stub_problems(tests: dict, ctx: GateContext, on_stubs: bool) -> list[str]:
             problems.append("the stub check did not run" if on_stubs else "the new tests were not run against today's code")
         elif not stub["all_failed_on_assertions"]:
             problems.append(
-                "not every test failed on an assertion against the stubs"
+                "stub_check says not every test failed when it ran (a test that passed, or that could not be collected, shows nothing)"
                 if on_stubs
                 else "not every new test fails on an assertion against today's code (one that passes there, or fails on an import or syntax error, reproduces nothing)"
             )

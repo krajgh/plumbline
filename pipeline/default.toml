@@ -42,7 +42,7 @@ id = "tests"
 role = "test-writer"
 reads = ["plan"]
 record = "tests_record"
-gate = "tests_fail_on_stub"     # measured: `gate` runs the repository's test command itself, which must fail on the stubs
+gate = "tests_fail_on_stub"     # measured: `gate` runs the repository's test command itself, which must fail while the code is missing (exit 1, at run time, never at collection)
 on_fail = "tests"               # the test-writer runs again with the gate's problems
 max_rounds = 3
 
@@ -120,6 +120,8 @@ note = "The planner proposes a split into changes of size M or smaller; nothing 
 
 # Role policies: what each agent may write and run. A PreToolUse hook enforces them for plumbline agents.
 #   writes:   record = the role's own records under .plumbline/runs/; tests = the tests type above;
+#             stubs = the active run's stubs directory, .plumbline/runs/<run-id>/stubs/: where the test-writer puts the
+#             stubs of brand-new modules, outside the change (never measured, never committed) and hidden from the builder;
 #             code = everything else, except .plumbline/, plumbline.toml and pipeline files
 #   commands: test, lint, typecheck and build are the repo's [commands] in plumbline.toml (command prefixes);
 #             git-read is read-only git (diff, show, log, status, rev-parse, merge-base, ls-files, grep, blame);
@@ -131,7 +133,7 @@ writes = ["record"]
 commands = ["git-read", "search", "graft"]
 
 [roles.test-writer]
-writes = ["record", "tests"]
+writes = ["record", "tests", "stubs"]
 commands = ["test", "git-read", "search"]
 
 [roles.builder]

@@ -211,9 +211,9 @@ def test_tests_fail_on_stub_fails_when_the_check_did_not_run(run_cli, tested):
     failed_with(gate(run_cli, tested, "tests"), "the stub check did not run")
 
 
-def test_tests_fail_on_stub_fails_when_a_test_failed_for_another_reason(run_cli, tested):
+def test_tests_fail_on_stub_fails_when_a_test_passed_or_could_not_be_collected(run_cli, tested):
     put(tested, "tests", written_tests_record(ran=True, all_failed=False))
-    failed_with(gate(run_cli, tested, "tests"), "not every test failed on an assertion against the stubs")
+    failed_with(gate(run_cli, tested, "tests"), "stub_check says not every test failed when it ran (a test that passed, or that could not be collected, shows nothing)")
 
 
 def test_tests_fail_on_stub_needs_at_least_one_test(run_cli, tested):  # C-27
