@@ -8,7 +8,7 @@ import pytest
 import plumbline as pl
 import pre_tool_use as pre
 from helpers import CLI, DEFAULT_TOML, commit_all, git, write
-from hookdata import bash_payload, denial, stop_payload, tool_payload
+from hookdata import bash_payload, denial, start_run, stop_payload, tool_payload
 from rundata import adopt, put
 
 ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")
@@ -22,6 +22,13 @@ def agent(role):
 def adopted(repo):
     adopt(repo)
     return repo
+
+
+@pytest.fixture
+def started(adopted):
+    """An adopted repository with run r1 in progress: an agent writes its record into the active run."""
+    start_run(adopted)
+    return adopted
 
 
 def configure(repo, text):
@@ -57,27 +64,27 @@ OWN_RECORD = {
     "builder": ".plumbline/runs/r1/build.json",
     "verifier": ".plumbline/runs/r1/verify.json",
     "prosecutor": ".plumbline/runs/r1/review/round-1/prosecutor-security.json",
-    "defender": ".plumbline/runs/r1/review/round-2/defender-1.json",
+    "defender": ".plumbline/runs/r1/review/round-1/defender-1.json",
     "detective": ".plumbline/runs/r1/review/round-1/detective.json",
 }
 
 
 @pytest.mark.parametrize("role", ROLES)
 @pytest.mark.parametrize("tool,key", [("Write", "file_path"), ("Edit", "file_path"), ("NotebookEdit", "notebook_path")])
-def test_every_agent_may_write_its_own_record(run_pre, adopted, role, tool, key):
-    assert writes(run_pre, adopted, role, OWN_RECORD[role], tool, key) is None
+def test_every_agent_may_write_its_own_record(run_pre, started, role, tool, key):
+    assert writes(run_pre, started, role, OWN_RECORD[role], tool, key) is None
 
 
-def test_the_review_agents_may_write_in_the_round_directories_of_the_test_review_too(run_pre, adopted):
-    for role in ("prosecutor", "defender", "detective"):
-        assert writes(run_pre, adopted, role, ".plumbline/runs/r1/test-review/round-1/x.json") is None
+def test_the_review_agents_may_write_in_the_round_directories_of_the_test_review_too(run_pre, started):
+    for role, name in (("prosecutor", "prosecutor-tests.json"), ("defender", "defender-2.json"), ("detective", "detective.json")):
+        assert writes(run_pre, started, role, f".plumbline/runs/r1/test-review/round-1/{name}") is None, role
 
 
 @pytest.mark.parametrize("role", ROLES)
 @pytest.mark.parametrize("other", ROLES)
 def test_an_agent_writes_only_its_own_record_never_another_agents(run_pre, adopted, role, other):
-    if role == other or (role in ("prosecutor", "defender", "detective") and other in ("prosecutor", "defender", "detective")):
-        return  # the review agents share a round directory: told apart by the brief, not by the path
+    if role == other:
+        return
     reason = writes(run_pre, adopted, role, OWN_RECORD[other])
     assert reason and f"the {role} writes" in reason and OWN_RECORD[other] in reason
 
@@ -116,12 +123,13 @@ def test_the_builder_cannot_write_the_pipeline_file_of_the_repository(run_pre, a
     write(adopted / "plumbline.toml", 'schema = 1\npipeline = "pipelines/house.toml"\n')
     commit_all(adopted, "own pipeline")
     reason = writes(run_pre, adopted, "builder", "pipelines/house.toml")
-    assert reason == "plumbline: pipelines/house.toml defines how the pipeline runs, and the builder leaves it alone."
+    assert reason == "plumbline: pipelines/house.toml defines how the pipeline runs; it changes through the main session, and the builder leaves it alone."
     assert writes(run_pre, adopted, "builder", "pipelines/other.toml") is None
     assert writes(run_pre, adopted, None, "pipelines/house.toml") is None  # the main session and the builder of the repository are free
 
 
-def test_the_test_writer_writes_test_paths_and_its_record_and_no_source(run_pre, adopted):
+def test_the_test_writer_writes_test_paths_and_its_record_and_no_source(run_pre, started):
+    adopted = started
     for path in ("tests/test_new.py", "tests/_stubs/app.py", "src/test_app.py", "web/app.spec.js", OWN_RECORD["test-writer"]):
         assert writes(run_pre, adopted, "test-writer", path) is None, path
     reason = writes(run_pre, adopted, "test-writer", "src/app.py")
@@ -146,7 +154,9 @@ def test_a_prosecutor_outside_plumbline_runs_is_denied(run_pre, adopted, tmp_pat
 
 def test_the_denial_names_where_the_agent_may_write(run_pre, adopted):
     assert "(.plumbline/runs/<run-id>/plan.json)" in writes(run_pre, adopted, "planner", "src/app.py")
-    assert "{test-review,review}/round-<n>/<name>.json" in writes(run_pre, adopted, "prosecutor", "src/app.py")
+    assert "{test-review,review}/round-<n>/prosecutor-<lens>.json" in writes(run_pre, adopted, "prosecutor", "src/app.py")
+    assert "{test-review,review}/round-<n>/defender-<n>.json" in writes(run_pre, adopted, "defender", "src/app.py")
+    assert "{test-review,review}/round-<n>/detective.json" in writes(run_pre, adopted, "detective", "src/app.py")
 
 
 @pytest.mark.parametrize("role", [*ROLES, None])
@@ -430,10 +440,13 @@ def test_running_as_another_user_is_denied(run_pre, configured):
 
 
 def test_wrappers_that_only_pass_through_are_seen_through(run_pre, configured):
-    for command in ("env FOO=1 git diff", "timeout 30 grep x README.md", "nice -n 5 ls", "time git status", "command git log", "nohup ls"):
+    for command in ("env git diff", "timeout 30 grep x README.md", "nice -n 5 ls", "time git status", "command git log", "nohup ls"):
         assert runs(run_pre, configured, "defender", command) is None, command
     for command in ("env FOO=1 rm x", "timeout 30 curl x", "nice -n 5 rm x"):
         assert runs(run_pre, configured, "defender", command), command
+    # an assignment in front of git or a search tool is refused (GIT_EXTERNAL_DIFF and the like make them run programs); a test command may carry one
+    assert runs(run_pre, configured, "defender", "env FOO=1 git diff")
+    assert runs(run_pre, configured, "verifier", "env CI=1 python3 -m pytest -q") is None
 
 
 def test_the_allow_list_is_not_applied_to_the_main_session(run_pre, configured):
@@ -732,3 +745,36 @@ def test_other_agents_may_use_a_worktree(run_pre, adopted):
 
 def test_the_worktree_rule_is_silent_where_plumbline_is_not_adopted(run_pre, repo):
     assert launch(run_pre, repo, agent("builder"), isolation="worktree") is None
+
+
+# ------------------------------------------------------------ compound commands: the head and the end run nothing, the body is checked
+
+
+def test_loops_and_conditionals_are_allowed_when_every_command_in_them_is(run_pre, configured):
+    for command in (
+        "for f in README.md src/app.py; do cat $f; done",
+        "for f in $(git diff --name-only); do head -5 $f; done",
+        "if git diff --quiet; then echo clean; else echo dirty; fi",
+        "if git diff --quiet; then echo clean; fi",
+        "case x in x) cat README.md;; esac",
+        "while false; do :; done",
+        "for f in a b; do git log --oneline -1 -- $f; done | head -3",
+        "for f in README.md; do cat $f; done 2>/dev/null",
+    ):
+        for role in ("verifier", "prosecutor", "defender"):
+            assert runs(run_pre, configured, role, command) is None, (role, command)
+
+
+def test_a_loop_or_conditional_that_runs_something_else_is_denied(run_pre, configured):
+    for command in (
+        "for f in a b; do rm $f; done",
+        "for x in $(rm y); do echo; done",
+        "if true; then rm x; fi",
+        "if rm x; then echo; fi",
+        "case x in x) rm y;; esac",
+        "for f in a; do cat $f > out; done",
+        "for f in a; do curl $f; done",
+        "select x in a; do rm x; done",
+        "for f in a; do git push; done",
+    ):
+        assert runs(run_pre, configured, "verifier", command), command

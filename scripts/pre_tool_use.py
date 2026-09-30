@@ -5,15 +5,21 @@ Reads the hook's JSON on stdin and, to deny a tool call, prints
 {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
 "permissionDecisionReason": ...}} and exits 0. It acts only inside a repository
 that has adopted plumbline (a plumbline.toml at its top level), except for the
-override rule:
+override rule. A repository is found from the directory a call runs in and from
+the paths the call names, so an agent whose working directory drifts is held all the same.
 
-  Bash (and PowerShell), for everyone
+  Bash, PowerShell and Monitor, for everyone
     - `plumbline.py override` is denied to the model, whoever runs it: the builder
-      types /plumbline:override, which runs the command itself.
-    - `git push` and `gh pr create` are denied unless HEAD has a pass record or
-      an override record (.plumbline/pass/<HEAD>.json or .override.json) that
-      validates and names HEAD; a pass record is not taken at its word (its run is
-      evaluated again). `--dry-run` and `--help` are not pushes.
+      types /plumbline:override, which runs the command itself. Abbreviated options
+      (`--rea`, `--proj`) count.
+    - `git push` and `gh pr create` are denied unless the commit a push publishes has
+      a pass record or an override record (.plumbline/pass/<sha>.json or .override.json)
+      that validates and names it; a pass record is not taken at its word (its run is
+      evaluated again). Every directory the command line may run in is checked (the
+      working directory and each cd, pushd or env -C target), a `.git` working
+      directory included; every ref a push names is checked, not only HEAD; `--all`,
+      `--mirror` and `--tags` are denied; deletions are not pushes; aliases (`-c
+      alias.p=push`, or from git config) are expanded. `--dry-run` and `--help` are not pushes.
     - `git commit` is denied when what it would commit adds a symlink, an
       absolute home path, or a key-shaped secret (sk-ant- followed by 20 or more
       characters).
@@ -21,30 +27,48 @@ override rule:
       run's ledger.jsonl is denied: only plumbline.py commands write them.
   Bash, for plumbline agents
     - every simple command must match the command classes of the agent's role
-      (the [roles.*] tables of the pipeline); a denial names what is allowed.
+      (the [roles.*] tables of the pipeline); a denial names what is allowed. The
+      read-only git and search classes take no leading VAR=value, and no git option
+      that runs a program or writes a file, in any abbreviation git accepts.
   Edit, Write and NotebookEdit
     - .plumbline/pass/ and every ledger.jsonl are denied to everyone.
     - a plumbline agent writes only what its role's write targets cover: its own
-      record, the tests type, or everything else except .plumbline/,
-      plumbline.toml and the pipeline file.
+      record (in the active run, and for the review roles in the current round of the
+      stage, in the file named for the role), the tests type, or everything else except
+      .plumbline/, plumbline.toml and the pipeline file; no agent writes .git/ (a linked
+      worktree's git directory included), .claude/, .github/, .husky/, .mcp.json,
+      CLAUDE.md, AGENTS.md, .gitattributes, .worktreeinclude or .pre-commit-config.yaml,
+      and an agent that writes code but not tests also leaves conftest.py, pytest.ini, tox.ini,
+      setup.cfg, noxfile.py and the files the repository's [commands] name to the main session.
   Agent
-    - launching a plumbline agent with `isolation: "worktree"` is denied: a run's records live in the
-      main checkout, never in an agent's worktree.
+    - a plumbline agent is launched in the main checkout (no `isolation`) and with the model
+      its definition pins; another agent is not briefed on .plumbline/ paths.
   Read, Grep and Glob, for the agent plumbline:builder only
-    - a path that matches the tests type of the pipeline, or is listed in the
-      newest run's tests record (that record included), is denied; so is a Grep
-      or Glob without an explicit path, and one whose path leads to a directory
-      holding tests.
+    - a path that matches the tests type of the pipeline, or is listed in the tests record
+      of any run, is denied; under .plumbline/ only the active run's intake, plan and the
+      builder's own record are read; test-run leftovers (.pytest_cache, junit*.xml, .coverage*,
+      htmlcov, .tox) and the agent transcripts under ~/.claude are denied; so is a Grep or Glob
+      without an explicit path, and one whose path leads to a directory holding any of these.
 
 Any error, and any repository without a plumbline.toml, allows the call:
-silently, with exit status 0. The command is parsed, not searched, so
-`echo git push` is not a push.
+silently, with exit status 0; each rule runs on its own, so one that meets input it cannot handle
+(PLUMBLINE_HOOK_DEBUG=1 lets the error through, for the tests) does not silence the others. The command
+is parsed, not searched, so `echo git push` is not a push and `g""it push` is one (once Python runs: the sh
+filter does not start it for that spelling). Without python3 the sh wrapper (pre_tool_use.sh) answers in its place.
 """
+import sys
+
+if sys.version_info < (3, 11):  # plumbline.py reads TOML with tomllib: answer "python3 not found" (the sh wrapper turns that into a deny where plumbline is adopted)
+    sys.stderr.write("plumbline needs Python 3.11 or newer\n")
+    sys.exit(127)
+
+import base64
 import json
 import os
 import re
-import sys
-from dataclasses import dataclass
+import shlex
+import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -52,37 +76,71 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 GIT_TIMEOUT = 20
 MAX_SCANNED_BYTES = 8_000_000
 MAX_LISTED = 8
+MAX_DIRS = 64  # the directories one command line may run in: more are not followed
+MAX_ANCHORS = 12  # the places an agent's call is looked up from, to find its repository
+PASS_READ_SECONDS = 10  # how long the pass records of a repository may take to answer (a hook has 30 s)
 
 # Written so that this file does not itself contain an absolute home path.
 HOME_PATH = re.compile(r"(?<![\w./~-])/(?:home|Users)/[A-Za-z0-9_][A-Za-z0-9._-]*/")
 SECRET = re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
 
-SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "ash", "mksh", "pdksh", "rbash", "fish", "csh", "tcsh"}
 KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}"}  # words that may come before a command
 # wrapper -> options that take a value
 WRAPPERS = {
-    "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U"},
+    "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U", "--user", "--group", "--host", "--prompt", "--chdir", "--close-from", "--role", "--type", "--other-user"},
     "doas": {"-u", "-C"},
-    "env": {"-u", "-C", "-S"},
+    "env": {"-u", "-C", "-S", "--unset", "--chdir", "--split-string", "--argv0"},
     "command": set(),
     "exec": {"-a"},
     "nohup": set(),
-    "time": {"-f", "-o"},
-    "nice": {"-n"},
+    "time": {"-f", "-o", "--format", "--output"},
+    "nice": {"-n", "--adjustment"},
     "setsid": set(),
-    "timeout": {"-k", "-s"},
+    "timeout": {"-k", "-s", "--kill-after", "--signal"},
+    "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+    "ionice": {"-c", "-n", "-p", "-P", "-u", "--class", "--classdata", "--pid", "--pgid", "--uid"},
+    "ssh-agent": {"-t", "-a", "-E", "-P"},
+    "taskset": set(),
+    "flock": {"-w", "-E", "--timeout", "--conflict-exit-code"},
+    "chrt": set(),
+    "unbuffer": set(),
+    "chronic": set(),
+    "busybox": set(),
+    "coproc": set(),
 }
-GIT_VALUE_OPTIONS = {"-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
+WRAPPER_POSITIONALS = {"timeout": 1, "taskset": 1, "flock": 1, "chrt": 1}  # words a wrapper takes before the command it runs: the duration, the mask, the lock file, the priority
+GIT_VALUE_OPTIONS = {"-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source"}
 COMMIT_LONG_VALUE = {
     "--message", "--file", "--reuse-message", "--reedit-message", "--template", "--author",
     "--date", "--cleanup", "--trailer", "--fixup", "--squash", "--pathspec-from-file",
 }
 COMMIT_SHORT_VALUE = "mFCct"
-HEAD_MOVERS = {"merge", "rebase", "cherry-pick", "revert", "pull", "am", "reset", "checkout", "switch"}
+HEAD_MOVERS = {"merge", "rebase", "cherry-pick", "revert", "pull", "am", "reset"}  # what a commit of the current branch, or a move of its tip, does
+REF_CHANGERS = ("checkout", "switch", "branch", "tag", "update-ref", "symbolic-ref", "worktree", "fetch")  # they make or point refs: what a later push names may not be what it names now
+MAX_SOURCES = 100  # the refs one push may name: each is looked up
+# Git's own commands: an alias never replaces one of these, so only another word can be an alias.
+GIT_BUILTINS = frozenset(
+    """add am annotate apply archive bisect blame branch bugreport bundle cat-file check-attr check-ignore check-mailmap
+    check-ref-format checkout checkout-index cherry cherry-pick citool clean clone column commit commit-graph commit-tree config
+    count-objects credential describe diagnose diff diff-files diff-index diff-tree difftool fast-export fast-import fetch
+    fetch-pack filter-branch fmt-merge-msg for-each-ref for-each-repo format-patch fsck gc get-tar-commit-id grep gui hash-object
+    help hook index-pack init interpret-trailers log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base
+    merge-file merge-index merge-tree mergetool mktag mktree multi-pack-index mv name-rev notes pack-objects pack-redundant
+    pack-refs patch-id prune prune-packed pull push range-diff read-tree rebase receive-pack reflog refs remote repack replace
+    request-pull rerere reset restore rev-list rev-parse revert rm scalar send-email send-pack shortlog show show-branch
+    show-index show-ref sparse-checkout stage stash status stripspace submodule switch symbolic-ref tag unpack-file
+    unpack-objects update-index update-ref update-server-info upload-archive upload-pack var verify-commit verify-pack
+    verify-tag version whatchanged worktree write-tree gitk""".split()
+)
 
 # The plumbline agents, and the review units' among them (which write under a review stage's round directories).
 ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")
 REVIEW_ROLES = ("prosecutor", "defender", "detective")
+# The file a review agent writes in a round directory, by role.
+REVIEW_FILES = {"prosecutor": r"prosecutor-[A-Za-z0-9._-]+\.json", "defender": r"defender-[A-Za-z0-9._-]+\.json", "detective": r"detective\.json"}
+REVIEW_FILE_NAMES = {"prosecutor": "prosecutor-<lens>.json", "defender": "defender-<n>.json", "detective": "detective.json"}
 # A command of the main session concerns plumbline besides git and gh only if it mentions one of these.
 CARES = re.compile(r"plumbline|override|ledger")
 
@@ -90,7 +148,9 @@ CARES = re.compile(r"plumbline|override|ledger")
 CONFIG_COMMANDS = ("test", "lint", "typecheck", "build")
 GIT_READ = ("diff", "show", "log", "status", "rev-parse", "merge-base", "ls-files", "grep", "blame")
 GIT_QUIET_FLAGS = {"--no-pager", "-P", "--no-optional-locks", "--literal-pathspecs", "--no-replace-objects"}
-GIT_WRITES_OR_RUNS = ("--output", "--open-files-in-pager", "-O")  # a file is written, or a program is run
+# Long options that run a program or write a file. Git accepts any unambiguous prefix of a long option, so a prefix of one of these is one.
+GIT_DANGEROUS_LONG = ("open-files-in-pager", "output", "ext-diff", "textconv", "exec", "upload-pack", "receive-pack")
+GIT_VALUE_SHORTS = "SGLefxX"  # short options that take a string: the rest of a bundle (or the next word) is their value, not more options
 SEARCH_TOOLS = ("grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "wc", "ls", "sed", "find")
 FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
 RG_RUNS = ("--pre", "--hostname-bin")  # ripgrep options that run a program
@@ -100,13 +160,87 @@ WRITERS_ALL = {"tee", "rm", "unlink", "shred", "truncate", "touch", "mv"}  # eve
 WRITERS_LAST = {"cp", "install", "ln", "rsync"}  # the destination is written
 PASS_DIR = ".plumbline/pass"
 RUNS_DIR = ".plumbline/runs"
+ACTIVE_FILE = "ACTIVE"  # .plumbline/runs/ACTIVE holds the id of the run the agents work in
+
+# Where no agent writes, whatever its role: git's own files, agent settings and instructions, repository automation.
+LANE_DIRS = {".git": "git", ".claude": "settings", ".github": "automation", ".husky": "automation"}
+LANE_FILES = {
+    ".mcp.json": "settings", "claude.md": "settings", "claude.local.md": "settings", "agents.md": "settings",
+    ".gitattributes": "automation", ".worktreeinclude": "automation", ".pre-commit-config.yaml": "automation",
+}
+TEST_CONFIG_FILES = ("conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "noxfile.py")  # how the tests run: not the builder's to change
+# What a test run leaves behind, and shows: the builder does not read it.
+TEST_OUTPUT = (
+    "**/.pytest_cache/**", "**/junit*.xml", "**/.coverage*", "**/htmlcov/**", "**/.tox/**", "**/coverage.xml", "**/lcov.info", "**/.nyc_output/**", "**/.hypothesis/**",
+    "**/test-results/**", "**/test-reports/**", "**/pytest-report*.xml", "**/pytest-report*.html",
+)
+
+TRANSCRIPTS = re.compile(r"(^|/)\.claude/projects(/|$)")  # where Claude Code keeps its transcripts, wherever the home directory is
+
+# The per-call caches (see decide): None while nothing is being decided, so that helpers used on their own see the disk as it is.
+_CACHE: dict | None = None
+
+
+def _scrub(value):
+    """The input without NUL characters: a shell drops them, and an operating system call refuses a path that holds one."""
+    if isinstance(value, str):
+        return value.replace("\0", "")
+    if isinstance(value, dict):
+        return {key: _scrub(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_scrub(item) for item in value]
+    return value
+
+
+def _guarded(rule, *args):
+    """Run one rule of the hook so that input it cannot handle (an odd path, a failing system call) does not take the other rules down
+    with it: the rule then says nothing. PLUMBLINE_HOOK_DEBUG=1 lets the error through, for the tests."""
+    try:
+        return rule(*args)
+    except Exception:
+        if os.environ.get("PLUMBLINE_HOOK_DEBUG"):
+            raise
+        return None
+
+
+def _isdir(path: Path) -> bool:
+    try:
+        return path.is_dir()
+    except (OSError, ValueError):  # a name too long for the file system, say
+        return False
+
+
+def _isfile(path: Path) -> bool:
+    try:
+        return path.is_file()
+    except (OSError, ValueError):
+        return False
+
+
+def _exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except (OSError, ValueError):
+        return False
+
+
+def _cached(key, compute):
+    if _CACHE is None:
+        return compute()
+    if key not in _CACHE:
+        _CACHE[key] = compute()
+    return _CACHE[key]
 
 
 # ------------------------------------------------------- parsing a command
 
 
+ANSI_ESCAPES = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+
+
 def _matching_paren(text: str, start: int) -> int:
-    """The index of the `)` that closes the `(` at `start` (len(text) when none does)."""
+    """The index of the `)` that closes the `(` at `start` (len(text) when none does). It knows quotes but not here-documents:
+    it serves only to skip past what is nested too deeply to follow."""
     depth, i, n = 0, start, len(text)
     while i < n:
         c = text[i]
@@ -129,6 +263,121 @@ def _matching_paren(text: str, start: int) -> int:
     return n
 
 
+def _ansi_c(text: str, i: int) -> tuple[str, int]:
+    """The body of a $'...' string that starts at `i` (after the opening quote), with its escapes decoded, and the index after the
+    closing quote. A backslash escapes a quote here, unlike in a plain single-quoted string."""
+    out: list[str] = []
+    n = len(text)
+    while i < n and text[i] != "'":
+        c = text[i]
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        d = text[i + 1]
+        if d in ANSI_ESCAPES:
+            out.append(ANSI_ESCAPES[d])
+            i += 2
+            continue
+        if d == "x":
+            digits, skip = re.match(r"[0-9A-Fa-f]{0,2}", text[i + 2 : i + 4]).group(), 2
+        elif d in "uU":
+            limit = 4 if d == "u" else 8
+            digits, skip = re.match(r"[0-9A-Fa-f]*", text[i + 2 : i + 2 + limit]).group(), 2
+        elif d in "01234567":
+            digits, skip = re.match(r"[0-7]{1,3}", text[i + 1 : i + 4]).group(), 1
+        elif d == "c" and i + 2 < n:
+            out.append(chr(ord(text[i + 2]) & 0x1F))
+            i += 3
+            continue
+        else:
+            out.append("\\" + d)
+            i += 2
+            continue
+        if not digits:
+            out.append("\\" + d)
+            i += 2
+            continue
+        try:
+            char = chr(int(digits, 8 if d in "01234567" else 16))
+        except (ValueError, OverflowError):
+            char = "?"
+        out.append(char if char != "\0" else "")
+        i += skip + len(digits)
+    return "".join(out), i + 1
+
+
+def _backtick(text: str, i: int) -> tuple[str, int]:
+    """The command inside the backticks that open at `i` (its escaped backticks, backslashes and dollars unescaped), and the index
+    after the closing backtick."""
+    out: list[str] = []
+    j, n = i + 1, len(text)
+    while j < n and text[j] != "`":
+        if text[j] == "\\" and j + 1 < n and text[j + 1] in "`\\$":
+            out.append(text[j + 1])
+            j += 2
+        else:
+            out.append(text[j])
+            j += 1
+    return "".join(out), j + 1
+
+
+def _heredoc_word(text: str, i: int) -> tuple[str, bool, int]:
+    """The delimiter word of a here-document, read at `i`, with its quoting removed; whether any of it was quoted (then the body is
+    not expanded); and the index after it. `EOF`, `'EOF'`, `"EOF"`, `\\EOF` and `E"O"F` all name the delimiter EOF."""
+    parts: list[str] = []
+    quoted, n = False, len(text)
+    while i < n and text[i] not in " \t\r\n;&|()<>":
+        c = text[i]
+        if c == "\\":
+            quoted = True
+            if i + 1 < n and text[i + 1] != "\n":
+                parts.append(text[i + 1])
+            i += 2
+        elif c == "'":
+            quoted = True
+            j = text.find("'", i + 1)
+            j = n if j < 0 else j
+            parts.append(text[i + 1 : j])
+            i = j + 1
+        elif c == '"':
+            quoted = True
+            j = i + 1
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n and text[j + 1] in '"\\$`':
+                    j += 1
+                parts.append(text[j])
+                j += 1
+            i = j + 1
+        elif c == "$" and text[i + 1 : i + 2] == "'":
+            quoted = True
+            body, i = _ansi_c(text, i + 2)
+            parts.append(body)
+        else:
+            parts.append(c)
+            i += 1
+    return "".join(parts), quoted, i
+
+
+def _substitutions(body: str, depth: int) -> list[tuple[list[str], list[tuple[str, str]]]]:
+    """The commands inside the $( ) and backticks of a here-document body that the shell expands (an unquoted delimiter)."""
+    commands: list[tuple[list[str], list[tuple[str, str]]]] = []
+    i, n = 0, len(body)
+    while i < n:
+        c = body[i]
+        if c == "\\":
+            i += 2
+        elif c == "$" and body[i + 1 : i + 2] == "(":
+            found, i = _parse_commands(body, i + 2, depth, True)
+            commands.extend(found)
+        elif c == "`":
+            content, i = _backtick(body, i)
+            commands.extend(split_commands_ex(content, depth))
+        else:
+            i += 1
+    return commands
+
+
 def split_commands(text: str, depth: int = 0) -> list[list[str]]:
     """The simple commands of a shell command line, each as a list of words:
     split at ; & | ( ) and newlines, quotes removed, redirections and here-document
@@ -140,15 +389,23 @@ def split_commands_ex(text: str, depth: int = 0) -> list[tuple[list[str], list[t
     """Like split_commands, but each command comes with its redirections as (operator, target) pairs,
     in the order written, so that a caller can see what a command line writes to. A redirection with
     no command (`> file`) is a command with no words."""
+    return _parse_commands(text, 0, depth, False)[0]
+
+
+def _parse_commands(text: str, start: int, depth: int, substitution: bool):
+    """Parse `text` from `start` into its simple commands. With `substitution` it stops after the `)` that closes a `$(`, which is
+    found by parsing (a quote or a parenthesis in a here-document body inside it is not one), and returns the index after it."""
     commands: list[tuple[list[str], list[tuple[str, str]]]] = []
+    n = len(text)
     if depth > 4:
-        return commands
+        return commands, ((_matching_paren(text, start - 1) + 1) if substitution else n)
     words: list[str] = []
     redirects: list[tuple[str, str]] = []
     word: list[str] | None = None
     pending: str | None = None  # the operator whose target is the next word
-    heredocs: list[tuple[str, bool]] = []
-    n, i = len(text), 0
+    heredocs: list[tuple[str, bool, bool]] = []  # (delimiter, tabs stripped, expanded)
+    parens = 0  # subshell parentheses open inside a substitution
+    i = start
 
     def end_word():
         nonlocal word, pending
@@ -173,6 +430,16 @@ def split_commands_ex(text: str, depth: int = 0) -> list[tuple[list[str], list[t
             word = []
         word.append(chunk)
 
+    def substitute(j: int) -> int:  # `$(` at j
+        found, k = _parse_commands(text, j + 2, depth + 1, True)
+        commands.extend(found)
+        return k
+
+    def backticks(j: int) -> int:  # a backtick at j
+        content, k = _backtick(text, j)
+        commands.extend(split_commands_ex(content, depth + 1))
+        return k
+
     while i < n:
         c = text[i]
         if c in " \t\r":
@@ -182,20 +449,35 @@ def split_commands_ex(text: str, depth: int = 0) -> list[tuple[list[str], list[t
             end_command()
             i += 1
             while heredocs:
-                delimiter, strip_tabs = heredocs.pop(0)
+                delimiter, strip_tabs, expands = heredocs.pop(0)
+                body_start, body_end = i, n
                 while i < n:
                     j = text.find("\n", i)
                     j = n if j < 0 else j
                     line = text[i:j]
-                    i = j + 1
                     if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                        body_end, i = i, j + 1
                         break
+                    i = j + 1
+                if expands:  # the shell expands an unquoted here-document: a $( ) or backticks in it run
+                    commands.extend(_substitutions(text[body_start:body_end], depth + 1))
         elif c == "#" and word is None:
             j = text.find("\n", i)
             i = n if j < 0 else j
-        elif c in ";&|()":
+        elif c in ";&|":
             end_command()
             i += 1
+        elif c == "(":
+            end_command()
+            parens += 1 if substitution else 0
+            i += 1
+        elif c == ")":
+            end_command()
+            i += 1
+            if substitution:
+                if parens == 0:
+                    return commands, i
+                parens -= 1
         elif c == "\\":
             if i + 1 < n and text[i + 1] != "\n":
                 add(text[i + 1])
@@ -215,31 +497,26 @@ def split_commands_ex(text: str, depth: int = 0) -> list[tuple[list[str], list[t
                     add(nxt if nxt in '"\\$`' else "\\" + nxt)
                     i += 2
                 elif d == "$" and text[i + 1 : i + 2] == "(":
-                    j = _matching_paren(text, i + 1)
-                    commands.extend(split_commands_ex(text[i + 2 : j], depth + 1))
+                    i = substitute(i)
                     add("$(...)")
-                    i = j + 1
                 elif d == "`":
-                    j = text.find("`", i + 1)
-                    j = n if j < 0 else j
-                    commands.extend(split_commands_ex(text[i + 1 : j], depth + 1))
+                    i = backticks(i)
                     add("`...`")
-                    i = j + 1
                 else:
                     add(d)
                     i += 1
             i += 1
         elif c == "$" and text[i + 1 : i + 2] == "(":
-            j = _matching_paren(text, i + 1)
-            commands.extend(split_commands_ex(text[i + 2 : j], depth + 1))
+            i = substitute(i)
             add("$(...)")
-            i = j + 1
+        elif c == "$" and text[i + 1 : i + 2] == "'":
+            body, i = _ansi_c(text, i + 2)
+            add(body)
+        elif c == "$" and text[i + 1 : i + 2] == '"':
+            i += 1  # $"..." is a double-quoted string
         elif c == "`":
-            j = text.find("`", i + 1)
-            j = n if j < 0 else j
-            commands.extend(split_commands_ex(text[i + 1 : j], depth + 1))
+            i = backticks(i)
             add("`...`")
-            i = j + 1
         elif c in "<>":
             if word is not None and "".join(word).isdigit():
                 word = None  # a file descriptor number, as in 2>&1
@@ -253,99 +530,310 @@ def split_commands_ex(text: str, depth: int = 0) -> list[tuple[list[str], list[t
                 i += 1 if strip_tabs else 0
                 while i < n and text[i] in " \t":
                     i += 1
-                delimiter: list[str] = []
-                while i < n and text[i] not in " \t\r\n;&|()<>":
-                    if text[i] in "'\"":
-                        i += 1
-                        continue
-                    delimiter.append(text[i])
-                    i += 1
-                heredocs.append(("".join(delimiter), strip_tabs))
+                delimiter, quoted, i = _heredoc_word(text, i)
+                heredocs.append((delimiter, strip_tabs, not quoted))
             else:
-                start = i
+                begin = i
                 while i < n and (text[i] in "<>&" or (text[i] == "|" and text[i - 1] == ">")):  # `>|` overrides noclobber
                     i += 1
-                pending = text[start:i]
+                pending = text[begin:i]
         else:
             add(c)
             i += 1
     end_command()
-    return commands
+    return commands, min(i, n)
 
 
-def strip_wrappers(argv: list[str]) -> list[str]:
-    """The command itself, without leading shell keywords (then, do, ...), VAR=value
-    words and wrappers such as sudo or env."""
+def _unwrap(argv: list[str]):
+    """Take a command apart: (the command itself, the VAR=value words before it, the directories `env -C` moves to, and a command line
+    that `env -S` holds). The command comes without leading shell keywords (then, do, ...), assignments and wrappers such as sudo or env."""
     argv = list(argv)
+    assigns: list[str] = []
+    chdirs: list[str] = []
     while argv:
         first = argv[0]
-        if first in KEYWORDS or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", first):
+        if first == "function" and len(argv) > 1:
+            argv = argv[2:]  # `function name {`
+            continue
+        if first in KEYWORDS:
+            argv = argv[1:]
+            continue
+        if ASSIGNMENT.fullmatch(first):
+            assigns.append(first)
             argv = argv[1:]
             continue
         name = os.path.basename(first)
         if name not in WRAPPERS:
             break
+        if name == "coproc" and len(argv) >= 3 and argv[2] == "{":
+            argv = argv[2:]  # `coproc NAME { command; }`: NAME is not the command
+            continue
         with_value = WRAPPERS[name]
         i = 1
         while i < len(argv):
             word = argv[i]
-            if word in with_value and i + 1 < len(argv):
+            if name == "env" and (word in ("-S", "--split-string") or word.startswith("--split-string=") or (word.startswith("-S") and len(word) > 2)):
+                # env -S 'command line' more words: the string is a command line, and the rest are its last words
+                if word in ("-S", "--split-string"):
+                    line, rest = (argv[i + 1] if i + 1 < len(argv) else ""), argv[i + 2 :]
+                elif word.startswith("--split-string="):
+                    line, rest = word.split("=", 1)[1], argv[i + 1 :]
+                else:
+                    line, rest = word[2:], argv[i + 1 :]
+                return [], assigns, chdirs, " ".join([line, *(shlex.quote(w) for w in rest)])
+            if name == "env" and word in ("-C", "--chdir") and i + 1 < len(argv):
+                chdirs.append(argv[i + 1])
                 i += 2
-            elif word.startswith("-") or (name == "env" and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", word)):
+            elif name == "env" and word.startswith("--chdir="):
+                chdirs.append(word.split("=", 1)[1])
+                i += 1
+            elif word in with_value and i + 1 < len(argv):
+                i += 2
+            elif word.startswith("-") or (name == "env" and ASSIGNMENT.fullmatch(word)):
+                if name == "env" and ASSIGNMENT.fullmatch(word):
+                    assigns.append(word)
                 i += 1
             else:
                 break
-        if name == "timeout" and i < len(argv):
-            i += 1  # the duration
+        i = min(len(argv), i + WRAPPER_POSITIONALS.get(name, 0))
+        if name == "flock" and argv[i : i + 1] in (["-c"], ["--command"]) and i + 1 < len(argv):
+            return [], assigns, chdirs, argv[i + 1]  # `flock FILE -c 'command line'`
         argv = argv[i:]
-    return argv
+    return argv, assigns, chdirs, None
+
+
+def strip_wrappers(argv: list[str]) -> list[str]:
+    """The command itself, without leading shell keywords (then, do, ...), VAR=value words and wrappers such as sudo or env."""
+    return _unwrap(argv)[0]
 
 
 @dataclass
 class Action:
-    kind: str  # push, pr-create, commit, add, head-moves
-    cwd: Path
+    kind: str  # push, pr-create, commit, add, head-moves, or the name of a command that changes refs (checkout, switch, branch, tag, update-ref, symbolic-ref)
+    cwd: Path  # where it runs when every earlier `cd` took effect
     args: list[str]
+    dirs: tuple[Path, ...] = ()  # every directory it may run in (see walk): empty means `cwd` alone
+    config: dict = field(default_factory=dict)  # the -c name=value pairs of the git command (a push reads push.default from them)
+    assigns: list = field(default_factory=list)  # the VAR=value words in front of it (GIT_CONFIG_GLOBAL and the like)
+    trees: list = field(default_factory=list)  # its --git-dir, --work-tree, GIT_DIR and GIT_WORK_TREE
+
+
+def _program(argv: list[str]) -> str:
+    """The name of the program a command runs: its file name, without a Windows `.exe`."""
+    if not argv:
+        return ""
+    name = os.path.basename(argv[0])
+    return name[:-4].lower() if name.lower().endswith(".exe") else name  # Windows does not tell GIT.EXE from git.exe
 
 
 def _join(cwd: Path, target: str) -> Path:
     return Path(os.path.normpath(os.path.join(cwd, os.path.expanduser(target))))
 
 
-def _is_dry_run(args: list[str]) -> bool:
-    for word in args:
-        if word in ("--dry-run", "--help", "-h"):
-            return True
-        if word.startswith("-") and not word.startswith("--") and "n" in word[1:]:
-            return True
-    return False
+@dataclass
+class GitCall:
+    """What a `git ...` command line says before its subcommand's own arguments."""
+
+    sub: str | None
+    args: list[str]
+    index: int  # where the subcommand sits in the argv
+    chdirs: list[str] = field(default_factory=list)  # the -C values, in order
+    trees: list[str] = field(default_factory=list)  # --git-dir, --work-tree, GIT_DIR and GIT_WORK_TREE: other places the command may act
+    config: dict = field(default_factory=dict)  # -c name=value and GIT_CONFIG_* pairs, names lower-cased
+    config_env: list[str] = field(default_factory=list)  # names --config-env sets from an environment variable whose value is not known here
 
 
-def git_action(argv: list[str], cwd: Path) -> Action | None:
-    directory, i = cwd, 1
+def _env_config(assigns: list[str]) -> dict:
+    """The config pairs that GIT_CONFIG_COUNT, GIT_CONFIG_KEY_<n> and GIT_CONFIG_VALUE_<n> assignments set."""
+    values = dict(a.split("=", 1) for a in assigns if "=" in a)
+    found = {}
+    try:
+        count = int(values.get("GIT_CONFIG_COUNT", "0"))
+    except ValueError:
+        count = 0
+    for n in range(max(0, min(count, 50))):
+        key = values.get(f"GIT_CONFIG_KEY_{n}")
+        if key:
+            found[key.lower()] = values.get(f"GIT_CONFIG_VALUE_{n}", "")
+    try:  # GIT_CONFIG_PARAMETERS is what `git -c` itself passes on: 'name=value' 'name=value'
+        for pair in shlex.split(values.get("GIT_CONFIG_PARAMETERS", "")):
+            name, _, value = pair.partition("=")
+            found[name.lower()] = value
+    except ValueError:
+        pass
+    return found
+
+
+def parse_git(argv: list[str], assigns: list[str] | tuple = ()) -> GitCall:
+    call = GitCall(None, [], len(argv))
+    call.config.update(_env_config(list(assigns)))
+    for assignment in assigns:
+        name, _, value = assignment.partition("=")
+        if name in ("GIT_DIR", "GIT_WORK_TREE") and value:
+            call.trees.append(value)
+    i = 1
     while i < len(argv):
         word = argv[i]
         if word == "-C" and i + 1 < len(argv):
-            directory = _join(directory, argv[i + 1])
+            call.chdirs.append(argv[i + 1])
             i += 2
+        elif word == "-c" and i + 1 < len(argv):
+            name, _, value = argv[i + 1].partition("=")
+            call.config[name.lower()] = value
+            i += 2
+        elif word in ("--git-dir", "--work-tree") and i + 1 < len(argv):
+            call.trees.append(argv[i + 1])
+            i += 2
+        elif word.startswith(("--git-dir=", "--work-tree=")):
+            call.trees.append(word.split("=", 1)[1])
+            i += 1
+        elif word == "--config-env" and i + 1 < len(argv):
+            call.config_env.append(argv[i + 1].partition("=")[0].lower())
+            i += 2
+        elif word.startswith("--config-env="):
+            call.config_env.append(word[len("--config-env=") :].partition("=")[0].lower())
+            i += 1
         elif word in GIT_VALUE_OPTIONS and i + 1 < len(argv):
             i += 2
         elif word.startswith("-"):
             i += 1
         else:
             break
-    if i >= len(argv):
+    if i < len(argv):
+        call.sub, call.args, call.index = argv[i], argv[i + 1 :], i
+    return call
+
+
+# `git push` takes its options like any git command: a long option may be shortened to any unambiguous prefix.
+PUSH_OPTIONS = {
+    "verbose": False, "quiet": False, "repo": True, "all": False, "branches": False, "mirror": False, "tags": False, "follow-tags": False,
+    "atomic": False, "dry-run": False, "porcelain": False, "delete": False, "prune": False, "thin": False, "force": False,
+    "force-with-lease": False, "force-if-includes": False, "receive-pack": True, "exec": True, "set-upstream": False, "push-option": True,
+    "signed": False, "verify": False, "recurse-submodules": True, "progress": False, "ipv4": False, "ipv6": False, "help": False,
+}
+PUSH_OPTIONS.update({f"no-{name}": False for name in [n for n, takes in PUSH_OPTIONS.items() if not takes]})
+
+
+@dataclass
+class PushSpec:
+    dry_run: bool = False
+    help: bool = False
+    delete: bool = False
+    many: str | None = None  # the option (--all, --mirror, --tags, --branches) that publishes more than one ref
+    repo_option: str | None = None  # --repo=<repository>: the repository when no word names it
+    repository: str | None = None
+    refspecs: list[str] = field(default_factory=list)
+
+
+def _push_option(name: str) -> str | None:
+    """The `git push` long option a (possibly shortened) name stands for, or None when it is unknown or ambiguous."""
+    if name in PUSH_OPTIONS:
+        return name
+    found = [option for option in PUSH_OPTIONS if option.startswith(name)] if name else []
+    return found[0] if len(found) == 1 else None
+
+
+def parse_push(args: list[str]) -> PushSpec:
+    """The arguments of `git push`: its flags, the repository, and the refspecs, with each option's value kept out of them."""
+    spec = PushSpec()
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        word = args[i]
+        i += 1
+        if word == "--":
+            positional.extend(args[i:])
+            break
+        if word.startswith("--"):
+            name, has_value = word[2:].split("=", 1)[0], "=" in word
+            option = _push_option(name)
+            if option is None:
+                continue
+            if option == "repo":
+                spec.repo_option = word.split("=", 1)[1] if has_value else (args[i] if i < len(args) else None)
+            if PUSH_OPTIONS[option] and not has_value:
+                i += 1  # its value is the next word
+            off = option.startswith("no-")  # `--no-dry-run` takes back an earlier `--dry-run`
+            base = option[3:] if off else option
+            if base == "dry-run":
+                spec.dry_run = not off
+            elif base == "help":
+                spec.help = not off
+            elif base == "delete":
+                spec.delete = not off
+            elif base in ("all", "branches", "mirror", "tags"):
+                if not off:
+                    spec.many = f"--{base}"
+                elif spec.many == f"--{base}":
+                    spec.many = None
+        elif word.startswith("-") and len(word) > 1:
+            for position, letter in enumerate(word[1:], 1):
+                if letter == "n":
+                    spec.dry_run = True
+                elif letter == "h":
+                    spec.help = True
+                elif letter == "d":
+                    spec.delete = True
+                elif letter == "o":
+                    if position == len(word) - 1:
+                        i += 1  # the push option is the next word
+                    break
+        else:
+            positional.append(word)
+    if positional:
+        spec.repository, spec.refspecs = positional[0], positional[1:]
+    return spec
+
+
+def _reset_moves(args: list[str]) -> bool:
+    """Does `git reset ...` move the branch HEAD is on? Not when it names paths (`git reset HEAD file`, `git reset -- file`), which only unstages them."""
+    flags = [a for a in args if a.startswith("-") and a != "--"]
+    words = [a for a in args if not a.startswith("-")]
+    if any(f in ("--soft", "--hard", "--mixed", "--merge", "--keep") for f in flags):
+        return True
+    if "-p" in flags or "--patch" in flags:
+        return False
+    if "--" in args:
+        return not args[args.index("--") + 1 :]
+    return len(words) < 2
+
+
+def git_action(argv: list[str], cwd: Path, call: GitCall | None = None) -> Action | None:
+    call = call or parse_git(argv)
+    directory = cwd
+    for target in call.chdirs:
+        directory = _join(directory, target)
+    if call.sub is None:
         return None
-    sub, args = argv[i], argv[i + 1 :]
-    if sub == "push":
-        return None if _is_dry_run(args) else Action("push", directory, args)
+    sub, args = call.sub, call.args
+    if sub in ("push", "send-pack") or (sub == "subtree" and args[:1] == ["push"]):  # each of them publishes commits
+        pushed = args[1:] if sub == "subtree" else args
+        spec = parse_push(pushed)
+        return None if spec.dry_run or spec.help else Action("push", directory, pushed, config=call.config)
     if sub == "commit":
         return Action("commit", directory, args)
     if sub in ("add", "stage"):
         return Action("add", directory, args)
-    if sub in HEAD_MOVERS:
+    if sub == "reset" and not _reset_moves(args):
+        return None
+    if sub in HEAD_MOVERS or (sub == "stash" and (not args or args[0] in ("push", "save", "create", "store"))):
         return Action("head-moves", directory, args)
+    if sub in REF_CHANGERS:
+        return Action(sub, directory, args)
+    if sub == "config":
+        words = _config_words(args)
+        if len(words) >= 2 and re.match(r"(push|remote|branch)\.", words[0], re.I):  # a setting a push reads
+            return Action("config-push", directory, args)
+    if sub == "remote" and args[:1] in (["add"], ["set-url"]) and any(a.startswith("--mirror") for a in args):  # a mirror remote pushes every ref
+        return Action("config-push", directory, args)
     return None
+
+
+# gh options whose value is the next word (in `gh pr create`): a value such as `--dry-run` is text, not the flag.
+GH_VALUE_OPTIONS = {
+    "-a", "--assignee", "-B", "--base", "-b", "--body", "-F", "--body-file", "-H", "--head", "-l", "--label", "-m", "--milestone",
+    "-p", "--project", "-r", "--reviewer", "-T", "--template", "-t", "--title", "-R", "--repo", "--recover",
+}
 
 
 def gh_action(argv: list[str], cwd: Path) -> Action | None:
@@ -359,39 +847,138 @@ def gh_action(argv: list[str], cwd: Path) -> Action | None:
         else:
             positionals.append(word)
             i += 1
-    if positionals == ["pr", "create"] and not (_is_dry_run(argv[i:]) or "--dry-run" in argv):
-        return Action("pr-create", cwd, [])
+    if positionals not in (["pr", "create"], ["pr", "new"]):  # `new` is gh's other name for `create`
+        return None
+    rest = argv[i:]
+    j = 0
+    while j < len(rest):
+        word = rest[j]
+        if word in ("--dry-run", "--help", "-h"):
+            return None
+        j += 2 if word in GH_VALUE_OPTIONS else 1
+    return Action("pr-create", cwd, [])
+
+
+def _closure(seed: Path, targets: list[str]) -> tuple[Path, ...]:
+    """The directories a command line may run in: where it starts, and where each cd, pushd or `env -C` target leads from any of them.
+    Whether a cd takes effect (an earlier `&&` or `||` may stop it, a subshell or a popd may undo it) is not followed: every place counts."""
+    seen = [seed]
+    for target in targets:
+        for base in list(seen):
+            new = _join(base, target)
+            if new not in seen and len(seen) < MAX_DIRS:
+                seen.append(new)
+    return tuple(seen)
+
+
+def _git_config(directory: Path, key: str, assigns=(), config: dict | None = None, git_dir: Path | None = None, all_values: bool = False):
+    """`git config --get key` (or --get-all), run in `directory` with what the command itself gives git: its -c pairs, its --git-dir, and the
+    GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM it sets. A single value (or None); with `all_values`, a list."""
+    env = dict(os.environ)
+    for assignment in assigns:
+        name, _, value = assignment.partition("=")
+        if name in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"):
+            env[name] = value
+    command = ["git", "--no-optional-locks"]
+    for name, value in (config or {}).items():
+        command += ["-c", f"{name}={value}"]
+    if git_dir is not None:
+        command += ["--git-dir", str(git_dir)]
+    command += ["-C", str(directory), "config", "--get-all" if all_values else "--get", key]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5, env=env)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return [] if all_values else None
+    if all_values:
+        return result.stdout.splitlines() if result.returncode == 0 else []
+    return result.stdout.rstrip("\n") if result.returncode == 0 else None
+
+
+def _places_of(directory: Path, trees: list[str]) -> list[tuple[Path, Path | None]]:
+    """(directory, git directory) pairs a git command's settings are read from: where it runs, and each --git-dir or --work-tree it names."""
+    places: list[tuple[Path, Path | None]] = [(directory, None)]
+    for tree in trees:
+        found = _join(directory, tree)
+        places.append((directory, found) if _isfile(found / "config") or found.name == ".git" else (found if _isdir(found) else directory, None))
+    return places
+
+
+def _alias_line(step: "Step", cwd: Path, defined: dict, trees: list[str] = ()) -> tuple[str | None, bool]:
+    """When a `git ...` step names an alias (from -c, GIT_CONFIG_*, --config-env, an earlier `git config alias.x ...` of the same line, or the
+    repository's and the user's git config), the command line it stands for, and whether that is a shell alias (`!...`)."""
+    call = parse_git(step.argv, step.assigns)
+    if call.sub is None or call.sub in GIT_BUILTINS:
+        return None, False  # an alias never hides one of git's own commands
+    key = f"alias.{call.sub}".lower()
+    value = call.config.get(key, defined.get(key))
+    if value is None and key in call.config_env:
+        value = "!git push"  # the value comes from an environment variable that cannot be read here: take the worst
+    if value is None:
+        directory = cwd
+        for target in call.chdirs:
+            directory = _join(directory, target)
+        for where, git_dir in _places_of(directory, [*call.trees, *trees]):
+            value = _git_config(where, key, step.assigns, call.config, git_dir)
+            if value is not None:
+                break
+    if value is None:
+        return None, False
+    if value.startswith("!"):
+        quoted = [shlex.quote(word) for word in call.args]
+        text = re.sub(r'"\$[@*]"|\$[@*]', lambda _m: " ".join(quoted), value[1:])  # git hands the arguments on as "$@": the command inside sees them
+        text = re.sub(r'"?\$([1-9])"?', lambda m: quoted[int(m.group(1)) - 1] if int(m.group(1)) <= len(quoted) else "", text)
+        return text + "".join(" " + word for word in quoted), True
+    words = (split_commands(value) or [[]])[0]
+    return " ".join(shlex.quote(word) for word in [*step.argv[: call.index], *words, *call.args]), False
+
+
+def _config_words(args: list[str]) -> list[str]:
+    """The key and value words of `git config ...`, without the options and their values (`-f FILE`, `--file FILE`)."""
+    return _split_args(args, value_options=("--file", "--blob", "--default", "--type", "--comment"), short_values="f")[1]
+
+
+def _defined_alias(call: GitCall) -> tuple[str, str] | None:
+    """The (key, value) of `git config [--global] [--add] alias.x value`, which defines an alias that a later command of the line may use."""
+    if call.sub != "config":
+        return None
+    words = _config_words(call.args)
+    if len(words) >= 2 and words[0].lower().startswith("alias."):
+        return words[0].lower(), words[1]
     return None
 
 
 def analyze(text: str, cwd: Path, depth: int = 0) -> list[Action]:
-    """The actions plumbline cares about in a command line, in order, each with the
-    directory it runs in (`cd` and `git -C` are followed)."""
+    """The actions plumbline cares about in a command line, in order, each with the directory it runs in (`cd` and `git -C` are
+    followed) and every directory it may run in."""
+    return actions_of(walk(text, cwd))
+
+
+def actions_of(steps: list["Step"]) -> list[Action]:
     actions: list[Action] = []
-    for argv in split_commands(text):
-        argv = strip_wrappers(argv)
-        if not argv:
-            continue
-        name = os.path.basename(argv[0])
-        if name in ("cd", "pushd"):
-            target = next((w for w in argv[1:] if not w.startswith("-")), None)
-            if target and not any(ch in target for ch in "$`") and target != "-":
-                cwd = _join(cwd, target)
-        elif name == "git":
-            action = git_action(argv, cwd)
+    for step in steps:
+        name = _program(step.argv)
+        argv = step.argv
+        if name.startswith("git-") and name[4:] in GIT_BUILTINS:  # the dashed form: `git-push` is `git push`
+            name, argv = "git", ["git", name[4:], *step.argv[1:]]
+        if name == "git":
+            call = parse_git(argv, step.assigns)
+            action = git_action(argv, step.cwd, call)
             if action:
+                action.assigns, action.trees = list(step.assigns), list(call.trees)
+                places = []
+                for base in step.dirs or (step.cwd,):
+                    directory = base
+                    for target in call.chdirs:
+                        directory = _join(directory, target)
+                    places.append(directory)
+                    places.extend(_join(directory, tree) for tree in call.trees)
+                action.dirs = tuple(dict.fromkeys(places))
                 actions.append(action)
         elif name == "gh":
-            action = gh_action(argv, cwd)
+            action = gh_action(argv, step.cwd)
             if action:
+                action.dirs = step.dirs or (step.cwd,)
                 actions.append(action)
-        elif name in SHELLS and depth < 3:
-            for i, word in enumerate(argv[1:], 1):
-                if word.startswith("-") and not word.startswith("--") and "c" in word[1:] and i + 1 < len(argv):
-                    actions += analyze(argv[i + 1], cwd, depth + 1)
-                    break
-        elif name == "eval" and depth < 3:
-            actions += analyze(" ".join(argv[1:]), cwd, depth + 1)
     return actions
 
 
@@ -429,17 +1016,61 @@ def commit_scope(args: list[str], added: bool) -> str:
 # ---------------------------------------------------------- what to allow
 
 
+def _existing(directory: Path) -> Path | None:
+    """`directory`, or its nearest ancestor that exists (a `cd` into a missing directory fails, and the command runs where the shell was)."""
+    while not _isdir(directory) and directory != directory.parent:
+        directory = directory.parent
+    return directory if _isdir(directory) else None
+
+
+def _adopted_above(directory: Path) -> Path | None:
+    """The nearest directory above `directory` (itself included) that holds a plumbline.toml next to a .git: how a repository is found
+    when git will not say (a working directory inside .git, or a repository owned by someone else)."""
+    real = Path(os.path.realpath(directory))
+    for candidate in (real, *real.parents):
+        if _isfile(candidate / "plumbline.toml") and _exists(candidate / ".git"):
+            return candidate
+    return None
+
+
 def adopted_root(pl, directory: Path) -> Path | None:
     """The top level of the repository `directory` is in, when it has adopted plumbline. A directory that does not
-    exist (a `cd` into it fails, and the command runs where the shell was) is looked up from the nearest one that does."""
-    while not directory.is_dir() and directory != directory.parent:
-        directory = directory.parent
-    root = pl.git_toplevel(directory, timeout=5) if directory.is_dir() else None
-    return root if root is not None and (root / pl.CONFIG_FILE).is_file() else None
+    exist (a `cd` into it fails, and the command runs where the shell was) is looked up from the nearest one that does. Where git
+    cannot say (a working directory inside .git, or a repository it does not trust), a plumbline.toml next to a .git above it counts."""
+
+    def compute():
+        start = _existing(directory)
+        if start is None:
+            return None
+        root = pl.git_toplevel(start, timeout=5)
+        if root is None:
+            root = _adopted_above(start)
+        return root if root is not None and _isfile(root / pl.CONFIG_FILE) else None
+
+    return _cached(("root", str(directory)), compute)
+
+
+def anchors_of(cwd: Path, *paths: Path) -> list[Path]:
+    """The places a call is looked up from: the working directory, the paths the call names, and the session's project directory."""
+    found = [cwd, *paths]
+    project = os.environ.get("CLAUDE_PROJECT_DIR")
+    if project:
+        found.append(Path(project))
+    return list(dict.fromkeys(found))[:MAX_ANCHORS]
+
+
+def adopted_roots(pl, places: list[Path]) -> list[Path]:
+    """The distinct repositories, of those the places lie in, that have adopted plumbline."""
+    roots: list[Path] = []
+    for place in places:
+        root = _guarded(adopted_root, pl, place)  # a place git or the file system will not describe says nothing about the others
+        if root is not None and root not in roots:
+            roots.append(root)
+    return roots
 
 
 def _git(pl, root: Path, *args: str):
-    return pl._git(root, *args, timeout=GIT_TIMEOUT)
+    return pl._git(root, "--no-optional-locks", *args, timeout=GIT_TIMEOUT)  # a look at the repository must not refresh its index
 
 
 def added_lines(patch: str):
@@ -487,39 +1118,365 @@ def commit_problems(pl, root: Path, scope: str, base: str | None = None) -> list
             if name.startswith(".plumbline/"):
                 continue  # plumbline's own working files
             path = root / name
-            if path.is_symlink():
-                problems.append(f"adds a symlink: {name}")
-            elif path.is_file() and path.stat().st_size <= MAX_SCANNED_BYTES:
-                data = path.read_bytes()
-                if b"\0" in data[:8192]:
-                    continue
-                for number, text in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
-                    if HOME_PATH.search(text):
-                        problems.append(f"adds an absolute home path: {name}:{number}")
-                    if SECRET.search(text):
-                        problems.append(f"adds a key-shaped secret: {name}:{number} (the value is not shown)")
+            try:
+                if path.is_symlink():
+                    problems.append(f"adds a symlink: {name}")
+                elif _isfile(path) and path.stat().st_size <= MAX_SCANNED_BYTES:
+                    data = path.read_bytes()
+                    if b"\0" in data[:8192]:
+                        continue
+                    for number, text in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
+                        if HOME_PATH.search(text):
+                            problems.append(f"adds an absolute home path: {name}:{number}")
+                        if SECRET.search(text):
+                            problems.append(f"adds a key-shaped secret: {name}:{number} (the value is not shown)")
+            except OSError:
+                continue  # a file that cannot be read is not one `git add` can take either
     return list(dict.fromkeys(problems))
 
 
-def push_reason(pl, root: Path, action: Action, head_moves: bool) -> str | None:
-    what = "open a pull request" if action.kind == "pr-create" else "push"
-    if head_moves:
+def _uncovered_message(what: str, label: str, sha: str, detail: str, action: Action) -> str:
+    opened = "opened for review" if action.kind == "pr-create" else "pushed"
+    if label == "HEAD":
         return (
-            f"plumbline: this command changes HEAD and then tries to {what}, so the commit it would publish cannot have a pass record yet. "
-            "Run the pipeline and commit first, record the pass with `plumbline.py pass <run>`, then push in a separate command."
+            f"plumbline: HEAD {sha[:7]} has no pass or override record, so it is not {opened} ({detail}). "
+            f"Run the pipeline (/plumbline:run), commit, and record the pass; or, if the builder decides to skip the pipeline, /plumbline:override. "
+            f"Then {what} again."
         )
-    result = _git(pl, root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
-    head = result.stdout.decode().strip()
-    if result.returncode != 0 or not head:
-        return None  # nothing to gate: git itself has nothing to push
-    how, detail = pl.coverage(root, head, pl.load_project(root))
-    if how:
-        return None
     return (
-        f"plumbline: HEAD {head[:7]} has no pass or override record, so it is not {'opened for review' if action.kind == 'pr-create' else 'pushed'} ({detail}). "
-        f"Run the pipeline (/plumbline:run), commit, and record the pass; or, if the builder decides to skip the pipeline, /plumbline:override. "
+        f"plumbline: {label} ({sha[:7]}) has no pass or override record, so it is not {opened} ({detail}). "
+        f"Check {label} out and run the pipeline there (/plumbline:run), commit, and record the pass; or, if the builder decides to skip the pipeline, /plumbline:override. "
         f"Then {what} again."
     )
+
+
+def _many_message(why: str) -> str:
+    return (
+        f"plumbline: {why} publishes several refs at once, and each commit needs its own pass or override record; "
+        "push one reviewed branch at a time (git push <remote> <branch>)."
+    )
+
+
+def _changes_message(what: str) -> str:
+    return (
+        f"plumbline: this command changes HEAD or a ref and then tries to {what}, so the commit it would publish cannot have a pass record yet. "
+        "Run the pipeline and commit first, record the pass with `plumbline.py pass <run>`, then push in a separate command."
+    )
+
+
+def _commit_of(pl, root: Path, name: str) -> str | None:
+    """The commit a push source names (a branch, a tag, HEAD, a sha, an expression such as main~2), or None when it names none."""
+    if not name or name.startswith("-"):
+        return None
+    result = _git(pl, root, "rev-parse", "--verify", "--quiet", name if name.startswith(":/") else f"{name}^{{commit}}")  # `:/text` takes all it is given as the text
+    sha = result.stdout.decode().strip()
+    return sha if result.returncode == 0 and sha else None
+
+
+def _refspec_sources(refspecs: list[str]) -> tuple[list[str], bool]:
+    """(sources, many): the sources of the refs a push updates, as the words written, and whether a refspec names many refs at once (a wildcard,
+    or a bare `:`, which means the branches that exist on both sides). A deletion (`:dst`) has no source."""
+    sources: list[str] = []
+    i = 0
+    while i < len(refspecs):
+        refspec = refspecs[i]
+        i += 1
+        if refspec == "tag" and i < len(refspecs):
+            sources.append(f"refs/tags/{refspecs[i]}")  # `tag <name>` is refs/tags/<name>
+            i += 1
+            continue
+        refspec = refspec.lstrip("+")
+        if refspec.startswith("^"):
+            continue  # a negative refspec excludes refs
+        if refspec == ":":
+            return sources, True
+        source = refspec.rpartition(":")[0] if ":" in refspec else refspec  # git parts source and destination at the last colon: `:/text` is a source
+        if not source:
+            continue  # `:dst` deletes dst
+        if any(ch in source for ch in "*?["):
+            return sources, True
+        sources.append(source)
+    return sources, False
+
+
+@dataclass
+class RefState:
+    """What the earlier commands of a command line did to the refs a later push may name: a commit moved the tips (`tips_moved`), HEAD points
+    somewhere else (`head`: an expression that names its commit, None when that cannot be told), a branch or tag was made (`created`, name to
+    the expression that names the commit it points to), or git's push settings were changed (`config_changed`)."""
+
+    tips_moved: bool = False
+    head: str | None = "HEAD"
+    created: dict = field(default_factory=dict)
+    config_changed: bool = False
+    new_dirs: list = field(default_factory=list)  # working trees the line makes (git worktree add): they do not exist yet, and are the repository's
+    new_root: Path | None = None
+
+
+def _split_args(args: list[str], value_options=(), short_values: str = "") -> tuple[list[str], list[str]]:
+    """The options and the other words of a command's arguments; an option in `value_options`, or a short bundle ending in a letter of
+    `short_values`, takes the next word as its value. Everything after `--` is a word."""
+    flags: list[str] = []
+    words: list[str] = []
+    i = 0
+    while i < len(args):
+        word = args[i]
+        i += 1
+        if word == "--":
+            flags.append("--")
+            words.extend(args[i:])
+            break
+        if word.startswith("-") and len(word) > 1:
+            flags.append(word)
+            if word in value_options or (not word.startswith("--") and word[-1] in short_values and "=" not in word):
+                i += 1
+        else:
+            words.append(word)
+    return flags, words
+
+
+def _create(state: RefState, name: str, expr: str | None, kind: str) -> None:
+    keys = {name}
+    if name.startswith("refs/heads/"):
+        keys.add(name[len("refs/heads/") :])
+    elif name.startswith("refs/tags/"):
+        keys.add(name[len("refs/tags/") :])
+    elif kind == "heads":
+        keys.add(f"refs/heads/{name}")
+    elif kind == "tags":
+        keys.add(f"refs/tags/{name}")
+    for key in keys:
+        state.created[key] = expr
+
+
+def _expr(state: RefState, word: str | None) -> str | None:
+    """The expression that names the commit `word` names after the earlier commands of the line: a ref they made, or the word itself."""
+    if word is None or word in ("HEAD", "@"):
+        return state.head
+    stripped = word[len("refs/") :] if word.startswith("refs/") else word
+    spellings = [word, stripped, f"refs/heads/{word}", f"refs/tags/{word}"]
+    spellings += [stripped[len(prefix) :] for prefix in ("heads/", "tags/") if stripped.startswith(prefix)]  # heads/x, tags/x
+    for spelling in spellings:
+        if spelling in state.created:
+            return state.created[spelling]
+    return word
+
+
+PLAIN_REF = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/-]*")  # a ref written as its plain name: no ^, ~, @{ }, : or spaces
+SWITCH_FLAGS = {
+    "-f", "--force", "-q", "--quiet", "--detach", "-d", "-m", "--merge", "--no-guess", "--guess", "--no-track", "-t", "--track", "--progress", "--no-progress",
+    "--ignore-other-worktrees", "--recurse-submodules", "--no-recurse-submodules", "--overwrite-ignore", "--no-overwrite-ignore",
+}
+BRANCH_READS = {
+    "-l", "--list", "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at",
+    "--sort", "--format", "--column", "--no-column", "-i", "--ignore-case", "-d", "-D", "--delete", "-u", "--set-upstream-to", "--unset-upstream",
+}
+TAG_READS = {"-l", "--list", "-d", "--delete", "-v", "--verify", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at"}
+
+
+def _ref_effects(pl, root: Path, action: Action, state: RefState) -> None:
+    """What a command that makes or points refs does to what a later push of the same line names, as far as its arguments say. What it cannot
+    tell, it marks as not known (`head` None, or a created ref with no expression): a push that depends on that is held back."""
+    kind, args = action.kind, action.args
+    if kind in ("checkout", "switch"):
+        create_flags = ("-b", "-B") if kind == "checkout" else ("-c", "-C", "--create", "--force-create")
+        create, words, unknown, pathspec, i = None, [], False, False, 0
+        while i < len(args):
+            word = args[i]
+            i += 1
+            if word == "--":
+                pathspec = kind == "checkout" and i < len(args)  # `git checkout other --` switches; with paths after it restores them. For `switch`, `--` only ends the options
+                if kind == "switch":
+                    continue
+                break
+            if word in create_flags:
+                create = args[i] if i < len(args) else None
+                i += 1
+            elif kind == "checkout" and word[:2] in ("-b", "-B") and len(word) > 2:
+                create = word[2:]
+            elif word in SWITCH_FLAGS:
+                continue
+            elif word.startswith("-"):
+                unknown = True  # `-` (the previous branch), --orphan, --patch ...
+            else:
+                words.append(word)
+        if unknown:
+            state.head = None
+        elif create:
+            start = words[0] if words else None
+            expr = _expr(state, start)
+            _create(state, create, expr, "heads")
+            if start:
+                state.head = expr
+        elif not pathspec and len(words) == 1:
+            expr = _expr(state, words[0])
+            if expr is not None and _commit_of(pl, root, expr) is not None:
+                state.head = expr
+            elif not _exists(action.cwd / words[0]):
+                state.head = None  # not a file either: a branch git makes from a remote one, or something it will refuse
+    elif kind == "branch":
+        flags, words = _split_args(args, value_options=("-u", "--set-upstream-to", "--sort", "--format", "--contains", "--merged", "--no-merged", "--points-at"), short_values="u")
+        if any(f in BRANCH_READS for f in flags):
+            return
+        if any(f in ("-m", "-M", "--move", "-c", "-C", "--copy") for f in flags):
+            old, new = (words[0], words[1]) if len(words) >= 2 else (None, words[0] if words else None)
+            if new:
+                _create(state, new, _expr(state, old), "heads")
+        elif words:
+            _create(state, words[0], _expr(state, words[1] if len(words) > 1 else None), "heads")
+    elif kind == "tag":
+        flags, words = _split_args(
+            args, value_options=("--message", "--file", "--local-user", "--cleanup", "--sort", "--format", "--column"), short_values="mFu"
+        )
+        if any(f in TAG_READS for f in flags):
+            return
+        if words:
+            _create(state, words[0], _expr(state, words[1] if len(words) > 1 else None), "tags")
+    elif kind == "update-ref":
+        flags, words = _split_args(args, value_options=(), short_values="m")
+        if "--stdin" in flags or (words and words[0] in ("HEAD", "@")):  # `update-ref HEAD x` moves the branch HEAD is on
+            state.tips_moved = True
+        elif "-d" not in flags and len(words) >= 2:
+            _create(state, words[0], _expr(state, words[1]), "auto")
+    elif kind == "worktree":
+        if args[:1] == ["add"]:
+            state.tips_moved = True  # a new working tree is a place where HEAD is somewhere else, and the branch it makes may be anywhere
+            _flags, words = _split_args(args[1:], value_options=("-b", "-B", "--reason"), short_values="bB")
+            if words:
+                state.new_dirs.append(_join(action.cwd, words[0]))
+                state.new_root = root
+    elif kind == "fetch":
+        _flags, words = _split_args(args, value_options=("--depth", "--upload-pack", "--negotiation-tip", "--refmap", "-j", "--jobs", "--deepen", "--shallow-since", "--shallow-exclude"))
+        for refspec in words[1:]:  # the first word is the repository; a refspec with a local destination makes or moves a ref there
+            destination = refspec.rpartition(":")[2].lstrip("+") if ":" in refspec else ""
+            if destination and not destination.startswith("refs/remotes/"):
+                _create(state, destination, None, "heads")
+    elif kind == "symbolic-ref":
+        flags, words = _split_args(args, value_options=(), short_values="m")
+        if not any(f in ("-d", "--delete", "--short", "-q", "--quiet") for f in flags) and len(words) >= 2 and words[0] == "HEAD":
+            state.head = _expr(state, words[1])
+
+
+class TookTooLong(BaseException):
+    """Not an Exception, and no OSError: the code that reads a record must not catch the alarm for a failed read."""
+
+
+def _within(seconds: int, run):
+    """Run `run()`, and raise TookTooLong when it takes longer (where SIGALRM exists): a pass record that is a named pipe blocks a read for good."""
+    import signal
+
+    if not hasattr(signal, "SIGALRM"):
+        return run()
+
+    def on_alarm(signum, frame):
+        raise TookTooLong
+
+    previous = signal.signal(signal.SIGALRM, on_alarm)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        return run()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _configured_push(pl, root: Path, spec: PushSpec, action: Action) -> tuple[str | None, list[str]]:
+    """What git's own settings make a push with no refspec publish: (a reason it publishes many refs, or None; the refspecs the remote is
+    configured to push). The settings are read as the command itself would see them: its -c pairs, its --git-dir, the config files
+    its environment names."""
+    git_dir = next((found for _where, found in _places_of(root, action.trees) if found is not None), None)
+
+    def value(key: str) -> str | None:
+        return _git_config(root, key, action.assigns, action.config, git_dir)
+
+    if (value("push.default") or "").lower() == "matching":
+        return "git's push.default=matching", []
+    remote = spec.repository or spec.repo_option
+    if remote is None:
+        branch = _git(pl, root, "symbolic-ref", "--short", "-q", "HEAD").stdout.decode("utf-8", "replace").strip()
+        remote = (
+            (branch and value(f"branch.{branch}.pushRemote")) or value("remote.pushDefault") or (branch and value(f"branch.{branch}.remote")) or "origin"
+        )
+    if "/" in remote or ":" in remote:
+        return None, []  # a URL or a path: no remote of that name holds settings
+    if (value(f"remote.{remote}.mirror") or "").lower() in ("true", "yes", "on", "1"):
+        return f"the mirror remote {remote}", []
+    configured = _git_config(root, f"remote.{remote}.push", action.assigns, action.config, git_dir, all_values=True)
+    return None, [line for line in configured if line.strip()]
+
+
+def push_reason(pl, root: Path, action: Action, state: RefState) -> str | None:
+    what = "open a pull request" if action.kind == "pr-create" else "push"
+    sources = ["HEAD"]
+    if action.kind == "push":
+        spec = parse_push(action.args)
+        if spec.many:
+            return _many_message(f"`git push {spec.many}`")
+        if spec.delete and spec.refspecs:
+            return None  # every named ref is deleted: no commit is published
+        refspecs = list(spec.refspecs)
+        if not refspecs:  # what a push with no refspec publishes is what the git settings say: the current branch, unless they say more
+            why, refspecs = _configured_push(pl, root, spec, action)
+            if why:
+                return _many_message(why)
+        found, many = _refspec_sources(refspecs)
+        if many:
+            return _many_message(
+                "a refspec with a wildcard, or a bare `:`," if spec.refspecs else "the push refspec configured for this remote (a wildcard, or a bare `:`)"
+            )
+        if refspecs and not found:
+            return None  # only deletions
+        sources = found or ["HEAD"]
+    if state.config_changed:
+        return (
+            f"plumbline: this command changes git's push settings (an alias, push.default, a remote's push) and then tries to {what}, so what the push "
+            "publishes cannot be read from them yet. Change the settings in one command and push in another."
+        )
+    if state.tips_moved:
+        return _changes_message(what)
+    result = _git(pl, root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    head = result.stdout.decode().strip()
+    if result.returncode > 1:  # git will not work in this repository from here: ownership, safe.directory. The push must not pass unseen.
+        why = (result.stderr.decode("utf-8", "replace").strip().splitlines() or ["git failed"])[0][:160]
+        return (
+            f"plumbline: git cannot read {root} from here ({why}), so HEAD's pass record cannot be checked. "
+            f"Let git use the repository (the ownership, or safe.directory in the git config), then {what} again."
+        )
+    if result.returncode != 0 or not head:
+        return None  # nothing to gate: git itself has nothing to push
+    project = _cached(("project", str(root)), lambda: pl.load_project(root))
+    if len(sources) > MAX_SOURCES:
+        return _many_message(f"a push that names {len(sources)} refs")
+    moved = bool(state.created) or state.head != "HEAD"
+    checked: list[tuple[str, str]] = []
+    for source in sources:
+        if moved and source not in ("HEAD", "@") and not PLAIN_REF.fullmatch(source):
+            return _changes_message(what)  # an expression such as pub^{} or HEAD~1 cannot be worked out from what the line has already changed
+        expr = _expr(state, source)
+        if expr is None:
+            return _changes_message(what)  # HEAD was pointed somewhere that cannot be told from here
+        sha = head if expr in ("HEAD", "@") else _commit_of(pl, root, expr)
+        label = source
+        if sha is None and not expr.startswith("-") and _git(pl, root, "rev-parse", "--verify", "--quiet", expr).returncode == 0:
+            return (
+                f"plumbline: {source} names something that is not a commit (a tree, a blob), and only reviewed commits are pushed; "
+                "push one reviewed branch at a time (git push <remote> <branch>)."
+            )
+        if sha is None:  # it names no commit that can be seen here (a variable, or a ref that is not there): HEAD stands in
+            if state.head is None:
+                return _changes_message(what)
+            sha = head if state.head in ("HEAD", "@") else _commit_of(pl, root, state.head)
+            label = "HEAD"
+        if sha is not None and sha not in [found for _, found in checked]:
+            checked.append((label, sha))
+    for label, sha in checked:
+        try:
+            how, detail = _within(PASS_READ_SECONDS, lambda: pl.coverage(root, sha, project))
+        except TookTooLong:
+            return f"plumbline: the pass records of {root} did not answer in time (is one of .plumbline/pass/ or the run's files a named pipe?), so the {what} is held back."
+        if not how:
+            return _uncovered_message(what, "HEAD" if sha == head else label, sha, detail, action)
+    return None
 
 
 def commit_reason(pl, root: Path, action: Action, added: bool) -> str | None:
@@ -530,65 +1487,140 @@ def commit_reason(pl, root: Path, action: Action, added: bool) -> str | None:
     return f"plumbline: this commit is held back. It {listed}. Remove them, stage the change again, and commit again."
 
 
-def gate_reason(pl, command: str, cwd: Path) -> str | None:
-    """The push gate and the commit checks."""
-    if "git" not in command and "gh" not in command:
-        return None
-    added = head_moves = False
-    for action in analyze(command, cwd):
-        root = adopted_root(pl, action.cwd)
-        if root is None:
-            continue
-        if action.kind == "add":
-            added = True
-        elif action.kind == "head-moves":
-            head_moves = True
-        elif action.kind == "commit":
-            reason = commit_reason(pl, root, action, added)
-            if reason:
-                return reason
-            head_moves = True
-        else:
-            reason = push_reason(pl, root, action, head_moves)
-            if reason:
-                return reason
+def _push_check(pl, root: Path, action: Action, state: RefState) -> str | None:
+    """The push gate is the one rule that must not fail open: what it cannot check, it holds back."""
+    try:
+        return push_reason(pl, root, action, state)
+    except Exception as error:
+        if os.environ.get("PLUMBLINE_HOOK_DEBUG"):
+            raise
+        return (
+            f"plumbline: the pass records of {root} could not be checked ({type(error).__name__}), so the push is held back. "
+            "Fix what the error names, or /plumbline:override if the builder decides to skip the pipeline, then push again."
+        )
+
+
+def gate_reason(pl, command: str, cwd: Path, steps: list["Step"] | None = None) -> str | None:
+    """The push gate and the commit checks. Each action is checked in every directory it may run in that has adopted plumbline."""
+    added = False
+    state = RefState()
+    for action in actions_of(steps if steps is not None else walk(command, cwd)):
+        places = list(action.dirs or (action.cwd,))
+        roots = adopted_roots(pl, places)
+        if not roots and state.new_root is not None and any(_inside(place, new) for place in places for new in state.new_dirs):
+            roots = [state.new_root]  # it does not exist yet: it is a working tree of the repository that makes it
+        for root in roots:
+            if action.kind == "add":
+                added = True
+            elif action.kind == "head-moves":
+                state.tips_moved = True
+            elif action.kind == "config-push":
+                state.config_changed = True
+            elif action.kind == "commit":
+                reason = _guarded(commit_reason, pl, root, action, added)
+                if reason:
+                    return reason
+                state.tips_moved = True
+            elif action.kind in REF_CHANGERS:
+                try:
+                    _ref_effects(pl, root, action, state)
+                except Exception:
+                    if os.environ.get("PLUMBLINE_HOOK_DEBUG"):
+                        raise
+                    state.tips_moved = True  # what it did cannot be told: a push after it is held back
+            else:
+                reason = _push_check(pl, root, action, state)
+                if reason:
+                    return reason
     return None
 
 
+def concerns_plumbline(command: str, cwd: str, steps: list["Step"]) -> bool:
+    """Could a command line of the main session concern plumbline: does it run git or gh, or mention plumbline, an override or a ledger?"""
+    if ".plumbline" in cwd or CARES.search(command):
+        return True
+    words = " ".join(word for step in steps for word in step.raw)
+    return bool(CARES.search(words)) or any(_program(step.argv) in ("git", "gh") or _program(step.argv).startswith("git-") for step in steps)
+
+
 def bash_reason(data: dict) -> str | None:
-    command = (data.get("tool_input") or {}).get("command")
+    tool_input = data.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
     cwd = data.get("cwd")
     if not isinstance(command, str) or not isinstance(cwd, str):
         return None
     role = agent_role(data)
-    if role is None and not CARES.search(command) and ".plumbline" not in cwd and "git" not in command and "gh" not in command:
+    steps = walk(command, Path(cwd))  # by what the shell will run, not by the letters typed: g""it is git
+    if role is None and not concerns_plumbline(command, cwd, steps):
         return None  # nothing here concerns plumbline
     import plumbline as pl
 
-    steps = list(walk(command, Path(cwd)))
-    reason = override_reason(pl, steps)
-    if reason is None and role is not None:
-        reason = role_command_reason(pl, role, steps, Path(cwd))
-    if reason is None:
-        reason = protected_command_reason(pl, steps)
-    return reason or gate_reason(pl, command, Path(cwd))
+    rules = [(override_reason, pl, steps)]
+    if role is not None:
+        rules.append((role_command_reason, pl, role, steps, Path(cwd)))
+    rules += [(protected_command_reason, pl, steps), (gate_reason, pl, command, Path(cwd), steps)]
+    for rule in rules:
+        reason = _guarded(*rule)
+        if reason:
+            return reason
+    return None
+
+
+# ----------------------------------------------------------- the active run
+
+
+def active_run(pl, root: Path) -> str | None:
+    """The run the agents work in: the one `.plumbline/runs/ACTIVE` names, when that run exists; otherwise (the file is missing, or names
+    a run that is gone) the newest run. None when there is no run at all."""
+
+    def compute():
+        try:
+            text = (root / RUNS_DIR / ACTIVE_FILE).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            text = ""
+        name = text.strip()
+        if name and pl.RUN_ID_PATTERN.fullmatch(name) and _isdir(root / RUNS_DIR / name):
+            return name
+        return pl.latest_run_id(root)
+
+    return _cached(("active", str(root)), compute)
+
+
+def current_round(pl, root: Path, run_id: str, stage_id: str) -> int:
+    """The round a review stage is in: the highest round-<n> directory it has, or 1 while it has none."""
+    rounds = [1]
+    try:
+        for entry in (root / RUNS_DIR / run_id / stage_id).iterdir():
+            match = re.fullmatch(r"round-([1-9][0-9]*)", entry.name)
+            if match and _isdir(entry):
+                rounds.append(int(match.group(1)))
+    except OSError:
+        pass
+    return max(rounds)
 
 
 # -------------------------------------------------- the builder's blindness
 
 
+def _pipeline_of(pl, root: Path) -> dict:
+    project = _cached(("project", str(root)), lambda: pl.load_project(root))
+    return project.pipeline or pl.load_toml(pl.PIPELINE_DIR / f"{pl.DEFAULT_PIPELINE}.toml")
+
+
 def tests_of(pl, root: Path) -> tuple[list[str], set[str]]:
-    """The tests type's path patterns, and the files the newest run's tests record
-    lists, that record included: it names the tests and what each one checks."""
-    project = pl.load_project(root)
-    pipeline = project.pipeline or pl.load_toml(pl.PIPELINE_DIR / f"{pl.DEFAULT_PIPELINE}.toml")
+    """The tests type's path patterns, and the files the tests records of every run list, those records included: they name
+    the tests and what each one checks."""
+    pipeline = _pipeline_of(pl, root)
     patterns = next((t["paths"] for t in pipeline.get("type", []) if t.get("id") == "tests"), [])
     listed: set[str] = set()
-    run_id = pl.latest_run_id(root)
-    if run_id is not None:
-        stage_ids = [s["id"] for s in pipeline.get("stage", []) if s.get("record") == "tests_record"] or ["tests"]
+    stage_ids = [s["id"] for s in pipeline.get("stage", []) if s.get("record") == "tests_record"] or ["tests"]
+    try:
+        run_dirs = sorted(d for d in (root / pl.RUNS_DIR).iterdir() if _isdir(d) and pl.RUN_ID_PATTERN.fullmatch(d.name))
+    except OSError:
+        run_dirs = []
+    for run_dir in run_dirs:
         for stage_id in stage_ids:
-            record_file = pl.run_dir(root, run_id) / f"{stage_id}.json"
+            record_file = run_dir / f"{stage_id}.json"
             listed.add(pl.rel_path(root, record_file))
             data, _problem = pl.load_json_file(record_file)
             if isinstance(data, dict):
@@ -600,8 +1632,44 @@ def tests_of(pl, root: Path) -> tuple[list[str], set[str]]:
     return list(patterns), listed
 
 
-def _test_file(pl, rel: str, patterns: list[str], listed: set[str]) -> bool:
-    return rel in listed or any(pl.glob_match(pattern, rel) for pattern in patterns)
+@dataclass
+class View:
+    """What the builder does not see: the tests, the records of a run but three, the leftovers of test runs, the agent transcripts."""
+
+    root: Path
+    patterns: list[str]
+    listed: set[str]
+    allowed: set[str]  # the .plumbline files the builder reads: the active run's intake and plan, and its own record
+    config_dirs: list[Path]  # where Claude Code keeps its transcripts
+
+
+def _claude_dirs(data: dict) -> list[Path]:
+    """The directories that hold the agent transcripts: ~/.claude, $CLAUDE_CONFIG_DIR, and what the event's transcript_path leads to."""
+    found = [Path(os.path.realpath(os.path.expanduser("~/.claude")))]
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    if configured:
+        found.append(Path(os.path.realpath(os.path.expanduser(configured))))
+    transcript = data.get("transcript_path")
+    if isinstance(transcript, str) and transcript:
+        parts = Path(os.path.realpath(transcript)).parts
+        if "projects" in parts:
+            index = len(parts) - 1 - parts[::-1].index("projects")
+            if index > 1:
+                found.append(Path(*parts[:index]))
+    return list(dict.fromkeys(found))
+
+
+def builder_view(pl, root: Path, data: dict) -> View:
+    pipeline = _pipeline_of(pl, root)
+    patterns, listed = tests_of(pl, root)
+    allowed: set[str] = set()
+    run = active_run(pl, root)
+    if run is not None:
+        stages = pipeline.get("stage", [])
+        names = [s["id"] for s in stages if s.get("record") in ("change_class", "spec")]
+        names += [s["id"] for s in stages if s.get("kind", "agent") == "agent" and s.get("role") == "builder"]
+        allowed = {f"{RUNS_DIR}/{run}/{name}.json" for name in names}
+    return View(root, patterns, listed, allowed, _claude_dirs(data))
 
 
 def _relative(root: Path, path: Path) -> str | None:
@@ -614,26 +1682,89 @@ def _relative(root: Path, path: Path) -> str | None:
     return None
 
 
-def exposed_test(pl, root: Path, target: Path, patterns: list[str], listed: set[str]) -> str | None:
-    """The repository-relative path of a test that reading or searching `target`
-    would show (the target itself, or a file below it), or None."""
-    names = {target, Path(os.path.realpath(target))}
-    for candidate in names:
+def hidden_kind(pl, view: View, rel: str) -> str | None:
+    """Why a file (repository-relative) is hidden from the builder: "test", "record" (one of plumbline's files it does not read),
+    "output" (what a test run leaves), or None."""
+    if rel in view.listed or any(pl.glob_match(pattern, rel) for pattern in view.patterns) or pl.glob_match("**/conftest.py", rel):
+        return "test"  # a conftest.py is test code wherever it lies
+    low = rel.lower()
+    if low == ".plumbline" or low.startswith(".plumbline/"):
+        return None if rel in view.allowed else "record"
+    if any(pl.glob_match(pattern, rel) for pattern in TEST_OUTPUT):
+        return "output"
+    return None
+
+
+def _inside(path: Path, directory: Path) -> bool:
+    return path == directory or directory in path.parents
+
+
+def exposed(pl, view: View, target: Path) -> tuple[str, str] | None:
+    """(what, kind) for something hidden from the builder that reading or searching `target` would show (the target itself, or a file
+    below it), or None. `what` is a repository-relative path or a directory; `kind` is as in hidden_kind, or "transcript" or "repository"."""
+    root = view.root
+    schemas = Path(os.path.realpath(pl.PLUGIN_ROOT / "schemas"))  # the record schemas the agents are told to read: the plugin may be installed under ~/.claude
+    for candidate in dict.fromkeys((target, Path(os.path.realpath(target)))):
+        if not _inside(candidate, schemas):
+            if TRANSCRIPTS.search(candidate.as_posix()):
+                return str(candidate), "transcript"
+            for config in view.config_dirs:
+                if _inside(candidate, config) or (_isdir(candidate) and _inside(config, candidate)):
+                    return str(config), "transcript"
         rel = _relative(root, candidate)
         if rel is None:
+            if _isdir(candidate) and _inside(Path(os.path.realpath(root)), Path(os.path.realpath(candidate))):
+                return str(candidate), "repository"  # a search from above the repository covers it
             continue
-        if candidate.is_dir():
-            result = _git(pl, root, "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", rel or ".")
-            if result.returncode != 0:
-                return rel or "."  # cannot list what is there: assume the worst
-            for name in filter(None, result.stdout.decode("utf-8", "replace").split("\0")):
-                if _test_file(pl, name, patterns, listed):
-                    return name
-            for name in sorted(listed):  # listed files that git does not show, such as those under an ignored .plumbline/
-                if (rel == "" or name.startswith(rel + "/")) and (root / name).exists():
-                    return name
-        elif _test_file(pl, rel, patterns, listed) or (not candidate.exists() and _test_file(pl, rel + "/x", patterns, listed)):
-            return rel
+        if not _isdir(candidate):
+            kind = hidden_kind(pl, view, rel)
+            if kind is None and not _exists(candidate):  # a path that is not there yet may become a directory of tests or test output
+                below = hidden_kind(pl, view, rel + "/x")
+                kind = below if below in ("test", "output") else None
+            if kind:
+                return rel, kind
+            continue
+        kind = hidden_kind(pl, view, rel + "/x") if rel else None
+        if kind in ("test", "output"):
+            return rel, kind  # everything below it is one
+        scope = rel or "."
+        listing = _git(pl, root, "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", scope)
+        if listing.returncode != 0:
+            return scope, "test"  # cannot list what is there: assume the worst
+        for name in filter(None, listing.stdout.decode("utf-8", "replace").split("\0")):
+            kind = hidden_kind(pl, view, name)
+            if kind:
+                return name, kind
+        ignored = _git(pl, root, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z", "--", scope)
+        for name in filter(None, ignored.stdout.decode("utf-8", "replace").split("\0")):
+            kind = hidden_kind(pl, view, name + "x" if name.endswith("/") else name)
+            if kind and not name.lower().startswith(".plumbline"):
+                return name.rstrip("/"), kind
+        found = _walk_plumbline(pl, view, candidate, rel)
+        if found:
+            return found
+        for name in sorted(view.listed):  # listed files that git does not show
+            if (rel == "" or name.startswith(rel + "/")) and _exists(root / name):
+                return name, "test"
+    return None
+
+
+def _walk_plumbline(pl, view: View, directory: Path, rel: str) -> tuple[str, str] | None:
+    """The first file of .plumbline/ below `directory` (which is `rel` in the repository) that the builder does not read: git does
+    not list ignored files, and .plumbline/ is ignored."""
+    low = rel.lower()
+    if rel == "":
+        start = view.root / ".plumbline"
+    elif low == ".plumbline" or low.startswith(".plumbline/"):
+        start = directory
+    else:
+        return None
+    for folder, _dirs, files in os.walk(start):
+        for name in files:
+            path = Path(folder) / name
+            file_rel = _relative(view.root, path)
+            if file_rel is not None and hidden_kind(pl, view, file_rel):
+                return file_rel, hidden_kind(pl, view, file_rel)
     return None
 
 
@@ -649,6 +1780,30 @@ def _static_prefix(pattern: str) -> str:
     return "/".join(prefix) if prefix != [""] else "/"
 
 
+def _blind_message(view: View, what: str, kind: str, tool: str | None = None, named: str | None = None) -> str:
+    shown = ", ".join(sorted(Path(p).name for p in view.allowed)) or "nothing"
+    if kind == "test":
+        if tool:
+            return f"plumbline: the builder works blind to the tests, and a {tool} of {named} would show them (for example {what}). Search a directory without tests."
+        return f"plumbline: the builder works blind to the tests, and {what} is one. Build from the spec and the source."
+    if kind == "record":
+        return (
+            f"plumbline: under .plumbline/ the builder reads the active run's {shown} and nothing else; {what} is another of plumbline's files. "
+            "Build from the spec (the plan record) and the source."
+        )
+    if kind == "output":
+        return f"plumbline: {what} is what a test run leaves behind, and the builder works blind to the tests. Build from the spec and the source."
+    if kind == "transcript":
+        return (
+            f"plumbline: {what} holds the agent transcripts, which show the tests, and the builder works blind to them. "
+            "Build from the spec and the source."
+        )
+    return (
+        f"plumbline: a {tool or 'search'} of {named or what} would cover the whole repository, tests and plumbline's records included, and the builder works blind to them. "
+        "Search a directory of source, for example src/."
+    )
+
+
 def builder_reason(data: dict) -> str | None:
     if data.get("agent_type") != "plumbline:builder":
         return None
@@ -657,31 +1812,35 @@ def builder_reason(data: dict) -> str | None:
         return None
     import plumbline as pl
 
-    root = adopted_root(pl, Path(cwd))
-    if root is None:
-        return None
-    patterns, listed = tests_of(pl, root)
+    here = Path(cwd)
     if tool == "Read":
         named = tool_input.get("file_path")
         if not isinstance(named, str) or not named:
             return None
-        hit = exposed_test(pl, root, _join(Path(cwd), named), patterns, listed)
-        if hit:
-            return f"plumbline: the builder works blind to the tests, and {hit} is one. Build from the spec and the source."
-        return None
-    if tool in ("Grep", "Glob"):
+        targets = [(_join(here, named), named)]
+    elif tool in ("Grep", "Glob"):
         named = tool_input.get("path")
         if not isinstance(named, str) or not named.strip():
+            if adopted_root(pl, here) is None:
+                return None
             return (
                 f"plumbline: the builder works blind to the tests, so {tool} needs an explicit path that is not a test path (for example src/). "
                 "A search of the whole repository would show the tests."
             )
-        target = _join(Path(cwd), named)
+        target = _join(here, named)
         if tool == "Glob" and isinstance(tool_input.get("pattern"), str):
             target = _join(target, _static_prefix(tool_input["pattern"]))
-        hit = exposed_test(pl, root, target, patterns, listed)
-        if hit:
-            return f"plumbline: the builder works blind to the tests, and a {tool} of {named} would show them (for example {hit}). Search a directory without tests."
+        targets = [(target, named)]
+    else:
+        return None
+    for root in adopted_roots(pl, anchors_of(here, *[t for t, _ in targets])):
+        view = _guarded(builder_view, pl, root, data)
+        if view is None:
+            continue
+        for target, named in targets:
+            hit = _guarded(exposed, pl, view, target)
+            if hit:
+                return _blind_message(view, hit[0], hit[1], tool if tool != "Read" else None, named)
     return None
 
 
@@ -695,27 +1854,120 @@ class Step:
     raw: list[str]  # the words as written
     argv: list[str]  # the command itself: no VAR=value words, wrappers or shell keywords
     redirects: list[tuple[str, str]]  # (operator, target)
-    cwd: Path
+    cwd: Path  # where it runs when every earlier cd took effect
+    assigns: list[str] = field(default_factory=list)  # the VAR=value words that came before the command
+    dirs: tuple[Path, ...] = ()  # every directory the command line may run in, this command included
 
 
-def walk(text: str, cwd: Path, depth: int = 0):
-    """Every simple command of a command line, those inside `$( )`, backticks, `bash -c` and `eval`
-    included, each with the directory it runs in (`cd` is followed)."""
+def _shell_command(argv: list[str]) -> str | None:
+    """The command string of `sh -c ...`: the first word after the options that follow `-c` (`bash -c -e 'cmd'`, `sh -c -- 'cmd'`, `bash -c -O extglob 'cmd'`)."""
+    for i, word in enumerate(argv[1:], 1):
+        if word.startswith("-") and not word.startswith("--") and "c" in word[1:]:
+            j = i + 1
+            while j < len(argv):
+                option = argv[j]
+                if option == "--":
+                    j += 1
+                    break
+                if option in ("-o", "+o", "-O", "+O"):
+                    j += 2  # these take a value
+                elif option[:1] in "-+" and len(option) > 1:
+                    j += 1
+                else:
+                    break
+            return argv[j] if j < len(argv) else None
+    return None
+
+
+def _nested_line(name: str, argv: list[str]) -> str | None:
+    """The command line a program takes as a string to run (`trap 'cmd' EXIT`, `cmd /c cmd`, `iex 'cmd'`, `pwsh -Command 'cmd'`), or None."""
+    lower = name.lower()
+    rest = argv[1:]
+    if lower == "trap":
+        words = [w for w in rest if w not in ("-p", "-l", "--")]
+        return words[0] if len(words) >= 2 and words[0] != "-" else None
+    if lower in ("iex", "invoke-expression"):
+        return " ".join(rest) or None
+    if lower == "cmd":
+        for i, word in enumerate(rest):
+            if word.lower() in ("/c", "/k", "/r"):
+                return " ".join(rest[i + 1 :]) or None
+    if lower in ("powershell", "pwsh"):
+        for i, word in enumerate(rest):
+            low = word.lower()
+            if len(word) >= 2 and low.startswith("-c") and "-command".startswith(low):
+                return " ".join(rest[i + 1 :]) or None
+            if len(word) >= 2 and low.startswith("-e") and "-encodedcommand".startswith(low) and i + 1 < len(rest):
+                try:
+                    return base64.b64decode(rest[i + 1]).decode("utf-16-le") or None
+                except ValueError:
+                    return None
+    if lower == "watch":  # it joins its words into one command line
+        i = 0
+        while i < len(rest):
+            if rest[i] in ("-n", "--interval"):
+                i += 2
+            elif rest[i].startswith("-") and len(rest[i]) > 1:
+                i += 1
+            else:
+                return " ".join(rest[i:]) or None
+    return None
+
+
+def walk(text: str, cwd: Path, depth: int = 0, _line: dict | None = None) -> list[Step]:
+    """Every simple command of a command line, those inside `$( )`, backticks, `bash -c`, `eval`, `env -S` and git aliases
+    included, each with the directory it runs in (`cd` is followed) and with every directory the line may run in."""
+    top = _line is None
+    line = {"targets": [], "aliases": {}, "trees": []} if top else _line
+    targets: list[str] = line["targets"]
+    steps: list[Step] = []
+    seed = cwd
     for words, redirects in split_commands_ex(text):
-        argv = strip_wrappers(words)
-        yield Step(words, argv, redirects, cwd)
-        name = os.path.basename(argv[0]) if argv else ""
-        if name in ("cd", "pushd"):
+        argv, assigns, chdirs, nested = _unwrap(words)
+        steps.append(Step(words, argv, redirects, cwd, assigns))
+        targets.extend(chdirs)
+        name = _program(argv)
+        exported = argv[1:] if name in ("export", "declare", "typeset") else []
+        for word in (*assigns, *exported):  # GIT_DIR=... set on one command, or exported for the ones after it, points a later `git push` at that repository
+            variable, _, value = word.partition("=")
+            if variable in ("GIT_DIR", "GIT_WORK_TREE") and value:
+                targets.append(value)
+                line["trees"].append(value)
+        if nested is None and depth < 3:
+            nested = _nested_line(name, argv)
+        if nested is not None:
+            if depth < 3:
+                steps.extend(walk(nested, cwd, depth + 1, line))
+        elif name in ("cd", "pushd"):
             target = next((w for w in argv[1:] if not w.startswith("-")), None)
+            if target is None and name == "cd":
+                target = "~"
             if target and not any(ch in target for ch in "$`") and target != "-":
+                targets.append(target)
                 cwd = _join(cwd, target)
         elif name in SHELLS and depth < 3:
-            for i, word in enumerate(argv[1:], 1):
-                if word.startswith("-") and not word.startswith("--") and "c" in word[1:] and i + 1 < len(argv):
-                    yield from walk(argv[i + 1], cwd, depth + 1)
-                    break
+            command = _shell_command(argv)
+            if command is not None:
+                steps.extend(walk(command, cwd, depth + 1, line))
         elif name == "eval" and depth < 3:
-            yield from walk(" ".join(argv[1:]), cwd, depth + 1)
+            words = argv[1:]
+            steps.extend(walk(" ".join(words[1:] if words[:1] == ["--"] else words), cwd, depth + 1, line))
+        elif name == "git":
+            defined = _defined_alias(parse_git(argv, assigns))
+            if defined:
+                line["aliases"][defined[0]] = defined[1]
+            if depth < 3:
+                expansion, shell = _alias_line(steps[-1], cwd, line["aliases"], line["trees"])
+                if expansion is not None:
+                    inner = walk(expansion, cwd, depth + 1, line)
+                    steps.extend(inner)
+                    if shell and not any(a.kind == "push" for a in actions_of(inner)) and re.search(r"\bpush\b", expansion):
+                        steps.append(Step(["git", "push"], ["git", "push"], [], cwd))  # a shell alias that mentions push is one
+    if top:
+        dirs = _closure(seed, targets)
+        for step in steps:
+            step.dirs = dirs
+    return steps
 
 
 def agent_role(data: dict) -> str | None:
@@ -743,14 +1995,29 @@ def plumbline_cli(pl, argv: list[str]) -> str | None:
     return argv[i + 1]
 
 
+# The options of `plumbline.py override`: argparse accepts any unambiguous prefix of a long option, so `--rea` is `--reason`.
+OVERRIDE_OPTIONS = ("reason", "run", "project", "help")
+
+
+def override_option(word: str) -> str | None:
+    """The `plumbline.py override` option a word stands for (`--reason`, `--rea=x`, `--proj`), or None."""
+    if not word.startswith("--") or len(word) < 3:
+        return None
+    name = word[2:].split("=", 1)[0]
+    if name in OVERRIDE_OPTIONS:
+        return name
+    found = [option for option in OVERRIDE_OPTIONS if option.startswith(name)] if name else []
+    return found[0] if len(found) == 1 else None
+
+
 def runs_override(step: Step) -> bool:
     """Does this command run `plumbline.py override`? By its script name, by the pair of words `override` and
-    `--reason` (which catches a script path held in a variable), or by inline code that names both."""
+    `--reason` (which catches a script path held in a variable; any abbreviation of the option counts), or by inline code that names both."""
     words = step.raw
     for i, word in enumerate(words):
         if os.path.basename(word) == "plumbline.py" and words[i + 1 : i + 2] == ["override"]:
             return True
-    if "override" in words and any(w == "--reason" or w.startswith("--reason=") for w in words):
+    if "override" in words and any(override_option(w) == "reason" for w in words):
         return True
     interpreter = os.path.basename(step.argv[0]) if step.argv else ""
     return bool(re.fullmatch(r"(python[\d.]*|node|ruby|perl|php)", interpreter)) and any("plumbline" in w and "override" in w for w in step.argv[1:])
@@ -758,19 +2025,33 @@ def runs_override(step: Step) -> bool:
 
 def override_reason(pl, steps: list[Step]) -> str | None:
     """`plumbline.py override` is denied to every agent and to the main session, wherever the command would act:
-    in the directory it runs in, or in the one `--project` names, when that repository has adopted plumbline
+    in a directory the line may run in, or in the one `--project` names, when that repository has adopted plumbline
     (elsewhere the command refuses by itself, and this hook stays silent)."""
     for step in steps:
         if not runs_override(step):
             continue
-        places = [step.cwd] + [_join(step.cwd, step.raw[i + 1]) for i, w in enumerate(step.raw[:-1]) if w == "--project"]
-        places += [_join(step.cwd, w.split("=", 1)[1]) for w in step.raw if w.startswith("--project=")]
-        if any(adopted_root(pl, place) is not None for place in places):
+        bases = list(dict.fromkeys((step.cwd, *step.dirs)))
+        places = list(bases)
+        for i, w in enumerate(step.raw):
+            if override_option(w) != "project":
+                continue
+            value = w.split("=", 1)[1] if "=" in w else (step.raw[i + 1] if i + 1 < len(step.raw) else None)
+            if value:
+                places += [_join(base, value) for base in bases]
+        if adopted_roots(pl, places):
             return (
                 "plumbline: `plumbline.py override` is the builder's command, and the builder types it: /plumbline:override followed by the reason. "
                 "An agent, or the main session, does not run it. To skip the pipeline for this commit, ask the builder to type /plumbline:override."
             )
     return None
+
+
+def _target_directory(args: list[str]) -> list[str]:
+    """The directory `-t DIR`, `-tDIR`, `--target-directory DIR` or `--target-directory=DIR` names."""
+    found = [args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-t", "--target-directory")]
+    found += [a.split("=", 1)[1] for a in args if a.startswith("--target-directory=")]
+    found += [a[2:] for a in args if a.startswith("-t") and not a.startswith("--") and len(a) > 2 and "=" not in a]
+    return found
 
 
 def written_operands(argv: list[str]) -> list[str]:
@@ -782,7 +2063,7 @@ def written_operands(argv: list[str]) -> list[str]:
     if name in WRITERS_ALL:
         return operands
     if name in WRITERS_LAST:
-        into = [args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-t", "--target-directory")]
+        into = _target_directory(args)
         return into + operands[-1:]
     if name == "dd":
         return [a[3:] for a in args if a.startswith("of=")]
@@ -791,31 +2072,104 @@ def written_operands(argv: list[str]) -> list[str]:
     return []
 
 
+def _copy_plan(step: Step) -> tuple[str, list[str], list[str]] | None:
+    """(destination, sources, flags) of `cp`, `mv`, `install`, `ln` and `rsync` when the destination is a directory, else None."""
+    name = os.path.basename(step.argv[0]) if step.argv else ""
+    if name not in WRITERS_LAST and name != "mv":
+        return None
+    args = step.argv[1:]
+    operands = [a for a in args if not a.startswith("-") or a == "-"]
+    into = _target_directory(args)
+    if into:
+        destination, sources = into[0], operands
+    elif len(operands) >= 2:
+        destination, sources = operands[-1], operands[:-1]
+    else:
+        return None
+    if not (destination.endswith("/") or _isdir(_join(step.cwd, destination))):
+        return None
+    return destination, sources, [a for a in args if a.startswith("-")]
+
+
+def landing_places(step: Step) -> list[str]:
+    """Where `cp`, `mv`, `install`, `ln` and `rsync` put each source when the destination is a directory: `cp -r /tmp/pass .plumbline/` writes
+    `.plumbline/pass`, which no operand names."""
+    plan = _copy_plan(step)
+    if plan is None:
+        return []
+    destination, sources, _flags = plan
+    return [destination.rstrip("/") + "/" + os.path.basename(source.rstrip("/")) for source in sources if os.path.basename(source.rstrip("/"))]
+
+
+UNKNOWN_SOURCE = re.compile(r"[*?\[]|/\.$|/$")  # a glob, or the contents of a directory (`dir/.`, `dir/`): the names that land are not written down
+
+
+def _option_values(args: list[str], short: str, long: str) -> list[str]:
+    """The values of an option given as `-C DIR`, `-CDIR`, `--directory DIR` or `--directory=DIR`."""
+    found = [args[i + 1] for i, a in enumerate(args[:-1]) if a in (f"-{short}", f"--{long}")]
+    found += [a.split("=", 1)[1] for a in args if a.startswith(f"--{long}=")]
+    found += [a[2:] for a in args if a.startswith(f"-{short}") and not a.startswith("--") and len(a) > 2 and "=" not in a]
+    return found
+
+
+def unknown_landings(step: Step) -> tuple[list[str], list[str]]:
+    """(directories that get files whose names the command line does not show, files a download is written to): a copy of a glob or of a
+    directory's contents, an unpacked archive, a patch, a download."""
+    name = os.path.basename(step.argv[0]) if step.argv else ""
+    args = step.argv[1:]
+    plan = _copy_plan(step)
+    if plan is not None:
+        destination, sources, flags = plan
+        if any(UNKNOWN_SOURCE.search(source) for source in sources) or any(f in ("-T", "--no-target-directory") or (f.startswith("-") and not f.startswith("--") and "T" in f[1:]) for f in flags):
+            return [destination], []
+        return [], []
+    if name == "tar":
+        first = args[0] if args else ""
+        extracting = any(a in ("--extract", "--get") or (a.startswith("-") and not a.startswith("--") and "x" in a[1:]) for a in args) or bool(re.fullmatch(r"[a-zA-Z]*x[a-zA-Z]*", first))
+        return (_option_values(args, "C", "directory") or ["."] if extracting else []), []
+    if name == "unzip":
+        return _option_values(args, "d", "d") or ["."], []
+    if name == "patch":
+        return _option_values(args, "d", "directory") or ["."], []
+    if name == "curl":
+        directories = [a.split("=", 1)[1] for a in args if a.startswith("--output-dir=")] + [args[i + 1] for i, a in enumerate(args[:-1]) if a == "--output-dir"]
+        return directories, _option_values(args, "o", "output")
+    if name == "wget":
+        return _option_values(args, "P", "directory-prefix"), _option_values(args, "O", "output-document")
+    return [], []
+
+
 def written_targets(step: Step) -> list[str]:
-    """Where a command writes to: its output redirections (not fd duplications like `2>&1`) and its writer operands."""
+    """Where a command writes to: its output redirections (not fd duplications like `2>&1`), its writer operands, where a copy or a move into
+    a directory lands, and, for what lands under names the line does not show, the places the protected files would be."""
     targets = [
         target
         for op, target in step.redirects
         if ">" in op and not (op.endswith("&") and re.fullmatch(r"\d+|-", target))
     ]
-    return targets + written_operands(step.argv)
+    directories, files = unknown_landings(step)
+    for directory in directories:
+        base = directory.rstrip("/") or "/"
+        targets += [f"{base}/pass/x", f"{base}/x/ledger.jsonl", f"{base}/ledger.jsonl"]
+    return targets + files + written_operands(step.argv) + landing_places(step)
 
 
 def protected_rel(pl, roots: dict, path: Path) -> str | None:
     """The repository-relative path, when `path` (or where it really leads) is under .plumbline/pass/ or is a
     run's ledger.jsonl in a repository that has adopted plumbline: those are written only by plumbline.py."""
     for candidate in dict.fromkeys((path, Path(os.path.realpath(path)))):
-        if ".plumbline" not in str(candidate) and candidate.name != "ledger.jsonl":
+        if ".plumbline" not in str(candidate).lower() and candidate.name != "ledger.jsonl":
             continue  # cannot be one of them: no need to look for the repository
         directory = candidate.parent
-        while not directory.is_dir() and directory != directory.parent:
+        while not _isdir(directory) and directory != directory.parent:
             directory = directory.parent
         if directory not in roots:
             roots[directory] = adopted_root(pl, directory)
         root = roots[directory]
         rel = _relative(root, candidate) if root is not None else None
-        if rel is not None and (
-            rel == PASS_DIR or rel.startswith(PASS_DIR + "/") or re.fullmatch(re.escape(RUNS_DIR) + r"/[^/]+/ledger\.jsonl", rel)
+        low = rel.lower() if rel is not None else None
+        if low is not None and (
+            low == PASS_DIR or low.startswith(PASS_DIR + "/") or re.fullmatch(re.escape(RUNS_DIR) + r"/[^/]+/ledger\.jsonl", low)
         ):
             return rel
     return None
@@ -833,9 +2187,10 @@ def protected_command_reason(pl, steps: list[Step]) -> str | None:
     for step in steps:
         for target in written_targets(step):
             if target:
-                rel = protected_rel(pl, roots, _join(step.cwd, target))
-                if rel:
-                    return protected_message(rel)
+                for base in dict.fromkeys((step.cwd, *step.dirs)):
+                    rel = protected_rel(pl, roots, _join(base, target))
+                    if rel:
+                        return protected_message(rel)
     return None
 
 
@@ -848,6 +2203,23 @@ def _prefix_matches(argv: list[str], prefixes: list[str]) -> bool:
         head = [argv[0] if "/" in want[0] else os.path.basename(argv[0])] + argv[1:]  # a bare name matches wherever the program lives
         if head[: len(want)] == want:
             return True
+    return False
+
+
+def _dangerous_git_option(word: str) -> bool:
+    """Is this argument of a git-read command an option that runs a program or writes a file (--output, -O, --ext-diff, --textconv, ...)?
+    Git takes any unambiguous prefix of a long option, so a prefix of one of them is that option; a short option can hide in a bundle."""
+    if word.startswith("--"):
+        name = word[2:].split("=", 1)[0]
+        if name == "text":
+            return False  # `--text` (treat files as text) is an option in its own right; `--textconv` is the one that runs a program
+        return bool(name) and any(option.startswith(name) for option in GIT_DANGEROUS_LONG)
+    if word.startswith("-") and len(word) > 1:
+        for letter in word[1:]:
+            if letter == "O":
+                return True
+            if letter in GIT_VALUE_SHORTS:
+                break  # the rest of the bundle is that option's value
     return False
 
 
@@ -866,7 +2238,8 @@ def _git_read_only(argv: list[str]) -> bool:
     if i >= len(argv) or argv[i] not in GIT_READ:
         return False
     rest = argv[i + 1 :]
-    return not any(a.startswith(GIT_WRITES_OR_RUNS) for a in (rest[: rest.index("--")] if "--" in rest else rest))
+    options = rest[: rest.index("--")] if "--" in rest else rest
+    return not any(_dangerous_git_option(a) for a in options)
 
 
 def _sed_read_only(args: list[str]) -> bool:
@@ -907,20 +2280,22 @@ def _search_only(argv: list[str]) -> bool:
     return True
 
 
-def _allowed_by_class(pl, project, classes: list[str], argv: list[str]) -> bool:
+def _class_matches(pl, project, classes: list[str], argv: list[str]) -> list[str]:
+    """The command classes of a role's policy that this command belongs to."""
     name = os.path.basename(argv[0])
+    found = []
     for kind in classes:
         if kind in CONFIG_COMMANDS and _prefix_matches(argv, project.commands.get(kind, [])):
-            return True
-        if kind == "git-read" and name == "git" and _git_read_only(argv):
-            return True
-        if kind == "search" and _search_only(argv):
-            return True
-        if kind == "plumbline-check" and plumbline_cli(pl, argv) == "check-diff":
-            return True
-        if kind == "graft" and project.graft_enabled and name == "graft":
-            return True
-    return False
+            found.append(kind)
+        elif kind == "git-read" and name == "git" and _git_read_only(argv):
+            found.append(kind)
+        elif kind == "search" and _search_only(argv):
+            found.append(kind)
+        elif kind == "plumbline-check" and plumbline_cli(pl, argv) == "check-diff":
+            found.append(kind)
+        elif kind == "graft" and project.graft_enabled and name == "graft":
+            found.append(kind)
+    return found
 
 
 def _allowed_summary(project, role: str, classes: list[str]) -> str:
@@ -947,13 +2322,30 @@ def _allowed_summary(project, role: str, classes: list[str]) -> str:
     return "; ".join(parts)
 
 
+def _anchor_paths(steps: list[Step]) -> list[Path]:
+    """Places an agent's command line names: the directories it runs in, and every absolute path among its words (`git -C /repo`, `--git-dir=/x`)."""
+    found: list[Path] = []
+    for step in steps:
+        found.append(step.cwd)
+        for word in step.raw:
+            value = word.split("=", 1)[1] if word.startswith("-") and "=" in word else word
+            if value.startswith(("/", "~/")):
+                found.append(Path(os.path.expanduser(value)))
+    return list(dict.fromkeys(found))
+
+
 def role_command_reason(pl, role: str, steps: list[Step], cwd: Path) -> str | None:
     """Every simple command of an agent's Bash line must be of a class its role allows, and nothing may be
     redirected into a file (the write targets cover Edit, Write and NotebookEdit; Bash is for running things)."""
-    root = adopted_root(pl, cwd)
-    if root is None:
-        return None
-    project = pl.load_project(root)
+    for root in adopted_roots(pl, anchors_of(cwd, *_anchor_paths(steps))):
+        reason = _role_command_reason(pl, role, steps, root)
+        if reason:
+            return reason
+    return None
+
+
+def _role_command_reason(pl, role: str, steps: list[Step], root: Path) -> str | None:
+    project = _cached(("project", str(root)), lambda: pl.load_project(root))
     policy = project.roles.get(role)
     if not isinstance(policy, dict):
         return None
@@ -970,14 +2362,23 @@ def role_command_reason(pl, role: str, steps: list[Step], cwd: Path) -> str | No
                     f"plumbline: the {role}'s Bash does not write files (`{shown}` redirects into {target}). "
                     "Write your record with the Write tool; Bash may redirect only to /dev/null."
                 )
-        if not step.argv and all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", w) or w in KEYWORDS for w in step.raw):
+        if step.raw and (step.raw[0] in ("for", "select", "case") or (len(step.raw) == 1 and step.raw[0] in ("fi", "done", "esac"))):
+            continue  # the head or the end of a compound command: nothing runs here, and what it wraps is checked as commands of its own
+        if not step.argv and all(ASSIGNMENT.fullmatch(w) or w in KEYWORDS for w in step.raw):
             continue  # nothing but variable assignments and shell keywords: no command runs
         if step.argv and os.path.basename(step.argv[0]) in NO_EFFECT:
             continue
         if step.raw and os.path.basename(step.raw[0]) in ("sudo", "doas"):
             return f"plumbline: the {role} does not run commands as another user (`{shown}`)."
-        if step.argv and (_allowed_by_class(pl, project, classes, step.argv) or plumbline_cli(pl, step.argv) == "check-record"):
-            continue
+        if step.argv:
+            kinds = _class_matches(pl, project, classes, step.argv)
+            if kinds and step.assigns and all(kind in ("git-read", "search") for kind in kinds):
+                return (
+                    f"plumbline: the {role}'s read-only git and search tools run as they are, with no VAR=value before them "
+                    f"(an environment variable can make git or grep run a program), so `{shown}` is refused. Run it without the assignment."
+                )
+            if kinds or plumbline_cli(pl, step.argv) == "check-record":
+                continue
         return f"plumbline: the {role}'s Bash may run only {_allowed_summary(project, role, classes)}. `{shown}` is none of these."
     return None
 
@@ -986,21 +2387,46 @@ def own_record_paths(pipeline: dict, role: str) -> list[str]:
     """Where an agent of `role` writes its record, as patterns for a message."""
     if role in REVIEW_ROLES:
         stages = [s["id"] for s in pipeline.get("stage", []) if s.get("kind") == "review"]
-        return [f"{RUNS_DIR}/<run-id>/{stages[0] if len(stages) == 1 else '{' + ','.join(stages) + '}'}/round-<n>/<name>.json"] if stages else []
+        name = REVIEW_FILE_NAMES[role]
+        return [f"{RUNS_DIR}/<run-id>/{stages[0] if len(stages) == 1 else '{' + ','.join(stages) + '}'}/round-<n>/{name}"] if stages else []
     return [f"{RUNS_DIR}/<run-id>/{s['id']}.json" for s in pipeline.get("stage", []) if s.get("kind", "agent") == "agent" and s.get("role") == role]
 
 
-def is_own_record(pipeline: dict, role: str, rel: str) -> bool:
-    match = re.fullmatch(re.escape(RUNS_DIR) + r"/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/(.+)", rel)
+def own_record(pl, root: Path, pipeline: dict, role: str, rel: str) -> tuple[bool, str | None]:
+    """Is `rel` a record this agent writes? (True, None) when it is, in the active run and, for the review roles, in the current round of
+    its stage; (False, why) when it is shaped like one of the agent's records but lies in another run or round; (False, None) when it is not shaped like one."""
+    match = re.fullmatch(re.escape(RUNS_DIR) + r"/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/(.+)", rel)
     if not match:
-        return False
-    rest = match.group(1)
+        return False, None
+    run, rest = match.groups()
     stages = pipeline.get("stage", [])
-    if any(s.get("kind", "agent") == "agent" and s.get("role") == role and rest == f"{s['id']}.json" for s in stages):
-        return True
-    return role in REVIEW_ROLES and any(
-        s.get("kind") == "review" and re.fullmatch(re.escape(s["id"]) + r"/round-[1-9][0-9]*/[A-Za-z0-9][A-Za-z0-9._-]*\.json", rest) for s in stages
-    )
+    rounds: tuple[str, int] | None = None
+    if not any(s.get("kind", "agent") == "agent" and s.get("role") == role and rest == f"{s['id']}.json" for s in stages):
+        if role not in REVIEW_ROLES:
+            return False, None
+        for s in stages:
+            found = s.get("kind") == "review" and re.fullmatch(re.escape(s["id"]) + r"/round-([1-9][0-9]*)/" + REVIEW_FILES[role], rest)
+            if found:
+                rounds = (s["id"], int(found.group(1)))
+                break
+        if rounds is None:
+            return False, None
+    active = active_run(pl, root)
+    if active is None:
+        return False, (
+            f"plumbline: no run is in progress, and the {role} writes its record in one. The main session starts a run with "
+            "`plumbline.py plan --intent <intent>` (/plumbline:run) before it launches the stage's agent."
+        )
+    if run != active:
+        return False, f"plumbline: the {role} writes its record in the active run ({active}); {rel} belongs to run {run}."
+    if rounds is not None:
+        current = current_round(pl, root, run, rounds[0])
+        if rounds[1] != current:
+            return False, (
+                f"plumbline: the {role} writes in the current round of {rounds[0]} (round-{current}); {rel} is in round-{rounds[1]}. "
+                "The main session creates a new round's directory before the round's agents start."
+            )
+    return True, None
 
 
 def pipeline_paths(pl, project, root: Path) -> set[str]:
@@ -1013,33 +2439,106 @@ def pipeline_paths(pl, project, root: Path) -> set[str]:
     return {rel} if rel else set()
 
 
+def git_dirs(root: Path) -> set[Path]:
+    """Where a repository's git data lives: its .git, and for a linked worktree also the directory that .git file points to and the main
+    repository's git directory (the common one)."""
+    dot = root / ".git"
+    found = {Path(os.path.realpath(dot))}
+    try:
+        if _isfile(dot):
+            match = re.match(r"gitdir:\s*(.+)", dot.read_text(encoding="utf-8", errors="replace"))
+            if match:
+                gitdir = Path(os.path.realpath(_join(root, match.group(1).strip())))
+                found.add(gitdir)
+                try:
+                    found.add(Path(os.path.realpath(_join(gitdir, (gitdir / "commondir").read_text(encoding="utf-8").strip()))))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return found
+
+
+def git_lane_message(role: str, shown: str) -> str:
+    return f"plumbline: {shown} is git's own configuration and hooks. Git commands run by the main session change it, and the {role} leaves it alone."
+
+
+def lane_reason(role: str, rel: str) -> str | None:
+    """A denial when `rel` is one of the files no agent writes: git's own, agent settings and instructions, repository automation.
+    They match at any depth (a nested repository has its own .git; CLAUDE.md files are read from subdirectories)."""
+    parts = [p.lower() for p in rel.split("/")]
+    kind = next((LANE_DIRS[p] for p in parts if p in LANE_DIRS), None) or LANE_FILES.get(parts[-1])
+    if kind is None:
+        return None
+    if kind == "git":
+        return git_lane_message(role, rel)
+    what = "holds agent settings and instructions" if kind == "settings" else "is repository automation (CI, hooks, attributes)"
+    return f"plumbline: {rel} {what}. CI and agent settings change through the main session, and the {role} leaves it alone."
+
+
+def command_files(project, root: Path) -> dict[Path, str]:
+    """The existing files of the repository that the [commands] strings name (`sh run_tests.sh`, `pytest --config=pytest.ini`), each with
+    the command that names it: what runs the tests is not the builder's to change."""
+    found: dict[Path, str] = {}
+    for prefixes in project.commands.values():
+        for prefix in prefixes:
+            for words in split_commands(prefix):
+                for word in words:
+                    for value in {word, word.split("=", 1)[1] if "=" in word else ""}:
+                        if value and not value.startswith("-"):
+                            path = _join(root, value)
+                            if _isfile(path):
+                                found[Path(os.path.realpath(path))] = prefix
+    return found
+
+
 def partition_reason(pl, root: Path, role: str, target: Path, real: Path) -> str | None:
     """Is a write by an agent of `role` to `target` inside the role's write targets? Where the path leads, through
     symbolic links, must be inside them too."""
-    project = pl.load_project(root)
+    project = _cached(("project", str(root)), lambda: pl.load_project(root))
     policy = project.roles.get(role)
     if not isinstance(policy, dict):
         return None
     writes = [w for w in policy.get("writes", []) if isinstance(w, str)]
     pipeline = project.pipeline or pl.load_toml(pl.PIPELINE_DIR / f"{pl.DEFAULT_PIPELINE}.toml")
     patterns = next((t["paths"] for t in pipeline.get("type", []) if t.get("id") == "tests"), [])
-    fixed = pipeline_paths(pl, project, root) | {pl.CONFIG_FILE}
+    fixed = {name.lower() for name in pipeline_paths(pl, project, root) | {pl.CONFIG_FILE}}  # compared without case: a filesystem may not tell them apart
     own = own_record_paths(pipeline, role)
+    gitdirs = git_dirs(root)
+    keeps_tests_out = "code" in writes and "tests" not in writes  # writes code, not tests: the test harness is not its either
+    named = command_files(project, root) if keeps_tests_out else {}
     for candidate in dict.fromkeys((target, real)):
         rel = _relative(root, candidate)
+        if any(_inside(candidate, gitdir) for gitdir in gitdirs):  # git's data, wherever it lies: a linked worktree's is outside the repository
+            return git_lane_message(role, rel if rel is not None else str(candidate))
         if rel is None:
             return f"plumbline: the {role} writes inside the repository, and {candidate} is outside it."
-        if "record" in writes and is_own_record(pipeline, role, rel):
-            continue
-        if rel == ".plumbline" or rel.startswith(".plumbline/"):
+        lane = lane_reason(role, rel)
+        if lane:
+            return lane
+        if "record" in writes:
+            ok, why = own_record(pl, root, pipeline, role, rel)
+            if ok:
+                continue
+            if why:
+                return why
+        if rel == ".plumbline" or rel.lower().startswith(".plumbline/"):
             where = ", ".join(own) or "nowhere"
             return f"plumbline: the {role} writes only its own record ({where}); {rel} is another of plumbline's files."
-        if rel in fixed:
-            return f"plumbline: {rel} defines how the pipeline runs, and the {role} leaves it alone."
+        if rel.lower() in fixed:
+            return f"plumbline: {rel} defines how the pipeline runs; it changes through the main session, and the {role} leaves it alone."
         if any(pl.glob_match(pattern, rel) for pattern in patterns):
             if "tests" not in writes:
                 hint = " The test-writer writes them; build from the spec." if role == "builder" else ""
                 return f"plumbline: {rel} is a test path, and the {role} does not write tests.{hint}"
+        elif keeps_tests_out and (os.path.basename(rel).lower() in TEST_CONFIG_FILES or real in named):
+            command = named.get(real)
+            if command:
+                return (
+                    f"plumbline: {rel} is run by the repository's test tooling ([commands]: {command}); "
+                    f"it changes through the main session, and the {role} leaves it alone."
+                )
+            return f"plumbline: {rel} configures how the tests run; it changes through the main session (the test-writer writes test files), and the {role} leaves it alone."
         elif "code" not in writes:
             can = ["its own record (" + (own[0] if own else "under .plumbline/runs/") + ")"] + (["test paths"] if "tests" in writes else [])
             hint = " Put stubs under a test path; the source is the builder's." if role == "test-writer" else ""
@@ -1047,19 +2546,56 @@ def partition_reason(pl, root: Path, role: str, target: Path, real: Path) -> str
     return None
 
 
+def pinned_model(pl, role: str) -> str | None:
+    """The model an agent's definition pins (`model:` in the front matter of agents/<role>.md), or None."""
+    try:
+        text = (pl.PLUGIN_ROOT / "agents" / f"{role}.md").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return None
+    for line in text.split("\n")[1:]:
+        if line.strip() == "---":
+            break
+        match = re.match(r"model:\s*['\"]?([^'\"\s]+)", line)
+        if match:
+            return match.group(1)
+    return None
+
+
 def agent_launch_reason(data: dict) -> str | None:
-    """A run's records live in the main checkout, so a plumbline agent is not launched into a worktree of its own."""
+    """A plumbline agent is launched in the main checkout (records live there), with the model its definition pins; an agent that is
+    not one of plumbline's is not briefed on the run's files, which the stage agents write and read."""
     tool_input, cwd = data.get("tool_input"), data.get("cwd")
-    if not isinstance(tool_input, dict) or tool_input.get("isolation") != "worktree":
+    if not isinstance(tool_input, dict) or not isinstance(cwd, str) or not cwd:
         return None
     subagent = tool_input.get("subagent_type")
-    if not isinstance(subagent, str) or not subagent.startswith("plumbline:") or not isinstance(cwd, str) or not cwd:
-        return None
+    plumbline_agent = isinstance(subagent, str) and subagent.startswith("plumbline:")
+    if plumbline_agent:
+        if tool_input.get("isolation") is None and tool_input.get("model") is None:
+            return None
+    else:
+        text = f"{tool_input.get('prompt', '')}\n{tool_input.get('description', '')}"
+        if not re.search(r"\.plumbline[/\\]", text, re.I):
+            return None
     import plumbline as pl
 
-    if adopted_root(pl, Path(cwd)) is None:
+    if not adopted_roots(pl, anchors_of(Path(cwd))):
         return None
-    return f"plumbline: a run's records live in the main checkout, so {subagent} runs there. Launch it without `isolation`."
+    if not plumbline_agent:
+        who = subagent if isinstance(subagent, str) and subagent else "a general agent"
+        return (
+            f"plumbline: plumbline stages run through the plumbline:* agents, so a brief about .plumbline/ goes to the stage's agent "
+            f"(plumbline:planner, test-writer, builder, verifier, prosecutor, defender or detective), not to {who}."
+        )
+    if tool_input.get("isolation") is not None:
+        return f"plumbline: a run's records live in the main checkout, so {subagent} runs there. Launch it without `isolation`."
+    role = subagent[len("plumbline:") :]
+    pinned = pinned_model(pl, role) if role in ROLES else None
+    model = tool_input.get("model")
+    if pinned and model is not None and (not isinstance(model, str) or model.strip().lower() != pinned.lower()):
+        return f"plumbline: {subagent} is pinned to the {pinned} model. Launch it without `model`, or with `model: {pinned}`."
+    return None
 
 
 def write_reason(data: dict) -> str | None:
@@ -1067,23 +2603,25 @@ def write_reason(data: dict) -> str | None:
     tool_input, cwd = data.get("tool_input"), data.get("cwd")
     if not isinstance(tool_input, dict) or not isinstance(cwd, str) or not cwd:
         return None
-    named = next((tool_input[k] for k in ("file_path", "notebook_path") if isinstance(tool_input.get(k), str) and tool_input[k]), None)
-    if named is None:
-        return None
+    named = [tool_input[k] for k in ("file_path", "notebook_path") if isinstance(tool_input.get(k), str) and tool_input[k]]
     role = agent_role(data)
-    target = _join(Path(cwd), named)
-    real = Path(os.path.realpath(target))
-    if role is None and ".plumbline" not in f"{target}{real}" and target.name != "ledger.jsonl" and real.name != "ledger.jsonl":
-        return None  # nothing here concerns plumbline: not even the repository is looked up
-    import plumbline as pl
+    for one in named:  # whichever of the two keys the tool takes, both are looked at
+        target = _join(Path(cwd), one)
+        real = Path(os.path.realpath(target))
+        if role is None and ".plumbline" not in f"{target}{real}".lower() and target.name != "ledger.jsonl" and real.name != "ledger.jsonl":
+            continue  # nothing here concerns plumbline: not even the repository is looked up
+        import plumbline as pl
 
-    rel = protected_rel(pl, {}, target)
-    if rel:
-        return protected_message(rel)
-    if role is None:
-        return None
-    root = adopted_root(pl, Path(cwd))
-    return partition_reason(pl, root, role, target, real) if root is not None else None
+        rel = _guarded(protected_rel, pl, {}, target)
+        if rel:
+            return protected_message(rel)
+        if role is None:
+            continue
+        for root in adopted_roots(pl, anchors_of(Path(cwd), target, real)):
+            reason = _guarded(partition_reason, pl, root, role, target, real)
+            if reason:
+                return reason
+    return None
 
 
 # ------------------------------------------------------------- the hook
@@ -1091,24 +2629,33 @@ def write_reason(data: dict) -> str | None:
 
 def decide(data) -> str | None:
     """The reason to deny this tool call, or None to allow it."""
+    global _CACHE
     if not isinstance(data, dict):
         return None
+    data = _scrub(data)
     tool = data.get("tool_name")
-    if tool in ("Bash", "PowerShell"):
-        return bash_reason(data)
-    if tool in ("Read", "Grep", "Glob"):
-        return builder_reason(data)
-    if tool in ("Edit", "Write", "NotebookEdit"):
-        return write_reason(data)
-    if tool in ("Agent", "Task"):  # the tool has been called both
-        return agent_launch_reason(data)
-    return None
+    _CACHE = {}
+    try:
+        if tool in ("Bash", "PowerShell", "Monitor"):
+            return bash_reason(data)
+        if tool in ("Read", "Grep", "Glob"):
+            return builder_reason(data)
+        if tool in ("Edit", "Write", "NotebookEdit"):
+            return write_reason(data)
+        if tool in ("Agent", "Task"):  # the tool has been called both
+            return agent_launch_reason(data)
+        return None
+    finally:
+        _CACHE = None
 
 
 def main() -> int:
+    os.environ["GIT_OPTIONAL_LOCKS"] = "0"  # whatever git the hook starts, directly or through plumbline.py, leaves the index alone
     try:
-        reason = decide(json.load(sys.stdin))
+        reason = decide(json.loads(sys.stdin.buffer.read().decode("utf-8-sig", "replace")))  # the event is UTF-8 (a byte order mark too) whatever the locale says
     except BaseException:  # a hook must never crash, and must not hold anything up
+        if os.environ.get("PLUMBLINE_HOOK_DEBUG"):
+            raise
         return 0
     if reason:
         sys.stdout.write(
@@ -1125,5 +2672,7 @@ if __name__ == "__main__":
     try:
         code = main()
     except BaseException:
+        if os.environ.get("PLUMBLINE_HOOK_DEBUG"):
+            raise
         code = 0
     sys.exit(code)
