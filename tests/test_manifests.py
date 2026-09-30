@@ -323,6 +323,13 @@ def test_the_run_skill_says_what_the_rounds_and_exit_3_mean_and_where_plan_and_t
     assert "`plan` and `tests` go back to their own agent" in failing
 
 
+def test_the_run_skill_says_where_a_problem_of_the_tests_and_verify_gates_comes_from():
+    failing = between(run_skill(), "## 6. When a gate fails", "## 7. Reduce")
+    assert "starts with where it comes from: `the agent's record` (what the agent typed) or `the measured run` (what `gate` saw when it ran the repository's commands)" in failing
+    assert "A problem of the record goes back to the agent that wrote it" in failing and "`no test command is declared`" in failing
+    assert pl._typed(["x"]) == ["the agent's record: x"] and pl._measured(["x"]) == ["the measured run: x"]  # the words the skill quotes
+
+
 def test_the_run_skill_says_gate_opens_each_later_rounds_directory_and_asks_for_no_step_of_the_main_session():  # the hook's round and the CLI's meet here
     body = run_skill()
     units = between(body, "## 5. Review units", "Start each round with")

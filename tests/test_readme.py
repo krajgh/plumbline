@@ -202,6 +202,24 @@ def test_the_commands_table_section_states_the_defaults_and_the_guarded_files_of
     assert all(f"`{name}`" in text for name in pl.CONFIG_COMMANDS)
 
 
+def test_the_readme_says_each_problem_of_a_measured_gate_starts_with_its_source_and_the_code_does_that():
+    gates = section("Runs, gates and the pass record")
+    assert "Each problem of a measured gate starts with its source, so that a failure says which part failed" in gates
+    assert "`the agent's record` (what the agent typed, read against the spec and the files it names) or `the measured run` (what `gate` saw when it ran the commands)" in gates
+    assert pl._typed(["x"]) == ["the agent's record: x"] and pl._measured(["x"]) == ["the measured run: x"]
+
+
+def test_the_readme_says_a_size_problem_names_the_files_that_contribute_most_and_check_diff_does(repo, run_cli):
+    text = section("Runs, gates and the pass record")
+    assert "names the files that contribute most to the size: up to 5, each with its changed lines, untracked files included" in text
+    assert "a problem that names the files contributing most to the size" in README and pl.MAX_NAMED_FILES == 5
+    adopt_base(repo)
+    start_run(repo)
+    write(repo / "src" / "big.py", "x = 1\n" * 450)
+    result = run_cli("check-diff", "--run", RUN, cwd=repo)
+    assert result.returncode == 1 and "The files that contribute most: src/big.py (450 lines)." in json.loads(result.stdout)["problems"][0]
+
+
 def test_the_stubs_paragraph_says_where_stubs_go_and_that_the_change_never_holds_them(repo):
     text = section("Runs, gates and the pass record")
     stubs = re.search(r"\*\*Stubs\.\*\*(.*?)\n\n", text, re.S).group(1)

@@ -330,7 +330,7 @@ def test_a_command_declared_differently_after_the_run_is_caught_at_pass(run_cli,
     write(repo / "plumbline.toml", (repo / "plumbline.toml").read_text().replace(exits(0), exits(4)))
     commit_all(repo, "the test command is another")
     result = run_cli("pass", RUN, cwd=repo)
-    assert result.returncode == 1 and f"the test command is declared as `{exits(4)}`, but the measured run did not run it: evaluate the gate again" in result.stdout
+    assert result.returncode == 1 and f"the measured run: the test command is declared as `{exits(4)}`, but it was not run: evaluate the gate again" in result.stdout
 
 
 # --- the tests stage: the test command runs, and must fail
@@ -512,12 +512,12 @@ def test_a_verify_run_of_more_tests_passes_the_inventory(repo):
 
 def test_a_verify_run_of_fewer_tests_fails_the_inventory(repo):  # TC-PERSIST
     inventory_repo(repo, counts(10, failures=2), counts(8))
-    assert "the verify run ran 8 tests, fewer than the 10 the tests stage's run ran: a test went missing" in inventory_problems(repo)
+    assert inventory_problems(repo) == ["the measured run: the verify run ran 8 tests, fewer than the 10 the tests stage's run ran: a test went missing"]
 
 
 def test_a_verify_run_that_skips_more_tests_fails_the_inventory(repo):  # TC-PERSIST
     inventory_repo(repo, counts(10, failures=2, skipped=1), counts(10, skipped=3))
-    assert "the verify run skipped 3 tests, more than the 1 the tests stage's run skipped: a test was marked skipped" in inventory_problems(repo)
+    assert inventory_problems(repo) == ["the measured run: the verify run skipped 3 tests, more than the 1 the tests stage's run skipped: a test was marked skipped"]
 
 
 def test_the_inventory_is_compared_only_when_both_runs_have_one(repo):

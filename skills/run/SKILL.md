@@ -39,7 +39,7 @@ State the intent you infer and the reason, in one sentence, and ask the builder 
 
 plumbline measures a change that already exists: its type and its size (S up to 50 changed lines, M up to 400, L more) select the row. When nothing has changed yet, as with a feature, a fix or a refactor on a clean tree, estimate the change and declare the row yourself: `--row code.M` for a code change of size M, a bare type such as `--row docs` for a flat row. Say your estimate with the intent, and let the builder correct both.
 
-The declared row is an estimate, and plumbline measures the change again: `check-diff --run` reports what it measures as, and `pass` refuses a run whose row lacks a stage the measured row selects. A change that measures larger than declared needs a new run for the measured row (`plan --intent <intent> --row <measured row>`). A change that measures as size L ends before reduce: the planner proposes a split into changes of size M or smaller, and each of those gets its own run.
+The declared row is an estimate, and plumbline measures the change again: `check-diff --run` reports what it measures as, and `pass` refuses a run whose row lacks a stage the measured row selects. A change that measures larger than declared needs a new run for the measured row (`plan --intent <intent> --row <measured row>`); the problem names the files that contribute most to the size. A change that measures as size L ends before reduce: the planner proposes a split into changes of size M or smaller, and each of those gets its own run.
 
 ## 3. Start the run
 
@@ -89,6 +89,8 @@ Start each round with `PLUMBLINE check-diff --run <run_id>`: it prints the `merg
 - `verify` and `review` go back to `build`. Send the builder the failing criteria and error types, and the "for the builder" text of the surviving findings, and run the stages from there again, in order: `build`, then `verify`, then `review` again as a new round, the one whose directory `gate` opened.
 - The surviving findings under "for the test-writer" go to the test-writer, which revises the tests; then run `tests`, `verify` and `review` again. Once the build exists, the tests stage records its run of the test command and no longer expects the tests to fail.
 - A review of the tests goes back to `tests`.
+
+Each problem of the tests and verify gates starts with where it comes from: `the agent's record` (what the agent typed) or `the measured run` (what `gate` saw when it ran the repository's commands). A problem of the record goes back to the agent that wrote it. A problem of the measured run is about the change or the tests, except when it says the commands could not run (`no test command is declared`): that one is yours to settle in `plumbline.toml`.
 
 `gate` exits 3 when the stage has used its rounds. When it exits 3, or when `on_fail` is `main`, stop: bring the findings and the failing criteria to the builder, and ask how to go on. The builder decides whether to start a new run or to override: `/plumbline:override` is the builder's command, typed by the builder.
 

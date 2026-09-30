@@ -50,6 +50,7 @@ def test_a_change_of_1800_lines_declared_code_s_measures_as_l_and_gets_no_pass(r
     result = pass_of(run_cli, adopted)
     assert result.returncode == 1
     assert "this row ends before reduce: split the change (it measures as code.L, 1800 changed lines, and nothing is built at that size)" in result.stdout
+    assert "The files that contribute most: src/big.py (1800 lines)." in result.stdout
     assert "the change" in result.stdout and not (adopted / ".plumbline" / "pass").exists()
 
 
@@ -188,6 +189,82 @@ def test_check_diff_of_a_run_says_a_size_l_change_ends_before_reduce(run_cli, ad
     result, data = check_diff(run_cli, adopted)
     assert result.returncode == 1 and data["row"]["measured"] == "code.L"
     assert any("this row ends before reduce: split the change (it measures as code.L" in p for p in data["problems"])
+
+
+# --- a size problem names the files that contribute most
+
+
+def test_a_change_that_outgrew_its_row_names_the_five_files_that_contribute_most_untracked_ones_included(run_cli, adopted):
+    plan(run_cli, adopted, "feature", "code.S")
+    for name, count in (("a", 60), ("b", 50), ("c", 40), ("d", 30), ("e", 25), ("f", 20), ("g", 10)):  # 235 changed lines, none of it committed
+        write(adopted / "src" / f"big_{name}.py", numbered(count))
+    result, data = check_diff(run_cli, adopted)
+    assert result.returncode == 1 and data["row"]["measured"] == "code.M"
+    [problem] = [p for p in data["problems"] if "the change measures as code.M" in p]
+    assert problem.endswith(
+        "(`plan --intent feature --row code.M`). The files that contribute most: src/big_a.py (60 lines), src/big_b.py (50 lines), src/big_c.py (40 lines), "
+        "src/big_d.py (30 lines), src/big_e.py (25 lines) and 2 files more."
+    )
+
+
+def test_a_size_l_change_names_its_biggest_files_in_the_check_and_in_the_refusal_of_pass(run_cli, adopted):
+    plan(run_cli, adopted, "review-only", "code.S")
+    write(adopted / "src" / "big.py", numbered(450))
+    write(adopted / "src" / "small.py", numbered(3))
+    result, data = check_diff(run_cli, adopted)
+    [problem] = [p for p in data["problems"] if p.startswith("this row ends before reduce")]
+    assert problem == (
+        "this row ends before reduce: split the change (it measures as code.L, 453 changed lines, and nothing is built at that size)."
+        " The files that contribute most: src/big.py (450 lines), src/small.py (3 lines)."
+    )
+    commit_all(adopted, "the big change")
+    verify_now(adopted)
+    assert run_cli("gate", RUN, "verify", cwd=adopted).returncode == 0
+    put(adopted, "review", review_record(diff=now_hash(adopted)))
+    refused = pass_of(run_cli, adopted)
+    assert refused.returncode == 1 and problem in refused.stdout
+
+
+def test_a_modified_file_counts_its_added_and_removed_lines(run_cli, adopted):
+    plan(run_cli, adopted, "feature", "code.S")
+    write(adopted / "src" / "app.py", numbered(70))  # the base holds two lines of it: 70 added, 2 removed
+    write(adopted / "src" / "extra.py", numbered(40))
+    _result, data = check_diff(run_cli, adopted)
+    [problem] = [p for p in data["problems"] if "the change measures as code.M" in p]
+    assert problem.endswith("The files that contribute most: src/app.py (72 lines), src/extra.py (40 lines).")
+
+
+def test_generated_files_and_stubs_in_the_run_are_not_named_because_they_do_not_count(run_cli, adopted):
+    plan(run_cli, adopted, "feature", "code.S")
+    write(adopted / "uv.lock", numbered(300))  # a generated file
+    write(adopted / ".plumbline" / "runs" / RUN / "stubs" / "newmod.py", numbered(300))  # a stub, in the run
+    write(adopted / "src" / "new_module.py", numbered(100))
+    _result, data = check_diff(run_cli, adopted)
+    [problem] = [p for p in data["problems"] if "the change measures as code.M" in p]
+    assert problem.endswith("The files that contribute most: src/new_module.py (100 lines).")
+    assert "uv.lock" not in problem and "newmod" not in problem
+
+
+def record_of(*files):
+    """A change_class record with these (path, added, removed, generated) files."""
+    return {"files": [{"path": path, "type": "code", "added": added, "removed": removed, "generated": generated, "symlink": False} for path, added, removed, generated in files]}
+
+
+def test_biggest_files_orders_by_changed_lines_breaks_ties_by_path_and_names_at_most_five():
+    files = [(f"src/{name}.py", count, 0, False) for name, count in (("z", 5), ("a", 5), ("m", 9), ("b", 1), ("c", 7), ("d", 6), ("e", 2))]
+    assert pl.biggest_files(record_of(*files)) == (
+        " The files that contribute most: src/m.py (9 lines), src/c.py (7 lines), src/d.py (6 lines), src/a.py (5 lines), src/z.py (5 lines) and 2 files more."
+    )
+    assert pl.biggest_files(record_of(*files), limit=7).endswith("src/e.py (2 lines), src/b.py (1 line).")
+    six = record_of(*files[:2], ("x", 1, 0, False), ("y", 1, 0, False), ("w", 1, 0, False), ("v", 1, 0, False))
+    assert pl.biggest_files(six).endswith("and 1 file more.")
+
+
+def test_biggest_files_leaves_out_generated_files_and_files_with_no_counted_lines():
+    record = record_of(("uv.lock", 300, 0, True), ("logo.png", 0, 0, False), ("src/a.py", 1, 1, False))
+    assert pl.biggest_files(record) == " The files that contribute most: src/a.py (2 lines)."
+    assert pl.biggest_files(record_of(("uv.lock", 300, 0, True), ("logo.png", 0, 0, False))) == ""
+    assert pl.biggest_files(record_of()) == ""
 
 
 def test_check_diff_of_a_run_of_a_row_without_reduce_says_so(run_cli, adopted):

@@ -2111,6 +2111,22 @@ def _gate_spec_complete(spec: dict, ctx: GateContext | None) -> list[str]:
     return problems
 
 
+# ---- where a problem comes from
+#
+# The gates of the tests and verify stages have two parts: what the agent's record says (typed), and what `gate` saw when it
+# ran the repository's commands (measured). Each problem they report starts by saying which part it comes from, so that a
+# failure can be read without the record and the ledger side by side.
+
+def _typed(problems: list[str]) -> list[str]:
+    """Problems found in the agent's record: what it says, and what it says against the spec and the files it names."""
+    return [f"the agent's record: {problem}" for problem in problems]
+
+
+def _measured(problems: list[str]) -> list[str]:
+    """Problems found by the measured run: what `gate` saw when it ran the repository's commands on the change."""
+    return [f"the measured run: {problem}" for problem in problems]
+
+
 # ---- the tests
 
 def _test_names(name: str) -> list[str]:
@@ -2230,7 +2246,7 @@ def _measured_tests_problems(ctx: GateContext, revision: bool) -> list[str]:
         return problems
     test = next((c for c in entry["commands"] if c["name"] == "test"), None)
     if test is None:
-        return problems + ["the measured run has no test command"]
+        return problems + ["no test command was run"]
     code, command = test["exit_code"], test["cmd"]
     if test.get("timed_out"):
         return problems
@@ -2257,7 +2273,7 @@ def _stub_problems(tests: dict, ctx: GateContext, on_stubs: bool) -> list[str]:
     """The tests stage's checks in one place: coverage, at least one test, what the test-writer says its run showed, and
     what the measured run showed. The tests run against today's code (a change to modules that exist imports its new names
     inside the tests, so each test fails when it runs) or, for a brand-new module, against its stubs; a fix runs against
-    today's code and must fail on an assertion."""
+    today's code and must fail on an assertion. Each problem says which part it comes from: the agent's record or the measured run."""
     problems = _acs_covered_problems(tests, ctx)
     if not tests["tests"]:
         problems.append("there are no tests")
@@ -2270,9 +2286,9 @@ def _stub_problems(tests: dict, ctx: GateContext, on_stubs: bool) -> list[str]:
             problems.append(
                 "stub_check says not every test failed when it ran (a test that passed, or that could not be collected, shows nothing)"
                 if on_stubs
-                else "not every new test fails on an assertion against today's code (one that passes there, or fails on an import or syntax error, reproduces nothing)"
+                else "stub_check says not every new test fails on an assertion against today's code (one that passes there, or fails on an import or syntax error, reproduces nothing)"
             )
-    return problems + _measured_tests_problems(ctx, revision)
+    return _typed(problems) + _measured(_measured_tests_problems(ctx, revision))
 
 
 def _gate_tests_fail_on_stub(tests: dict, ctx: GateContext) -> list[str]:
@@ -2363,7 +2379,7 @@ def _measured_verify_problems(verify: dict, ctx: GateContext) -> list[str]:
     problems = _run_entry_problems(entry)
     commands = entry["commands"]
     if not commands:
-        problems.append("the measured run ran no commands")
+        problems.append("no commands were run")
     problems += [f"the {c['name']} command exited {c['exit_code']} ({c['cmd']})" for c in commands if c["exit_code"] != 0 and not c.get("timed_out")]
     if entry.get("diff_sha256") != verify["diff_sha256"]:
         problems.append(
@@ -2373,14 +2389,15 @@ def _measured_verify_problems(verify: dict, ctx: GateContext) -> list[str]:
     for name in CONFIG_COMMANDS:
         declared = ctx.project.commands.get(name)
         if declared and not any(c["name"] == name and c["cmd"] == declared[0] for c in commands):
-            problems.append(f"the {name} command is declared as `{declared[0]}`, but the measured run did not run it: evaluate the gate again")
+            problems.append(f"the {name} command is declared as `{declared[0]}`, but it was not run: evaluate the gate again")
     return problems + _inventory_problems(ctx, entry)
 
 
 def _gate_verify_green(verify: dict, ctx: GateContext) -> list[str]:
     """The verifier's record says green and agrees with itself; the repository's own commands, run by `gate`, all exited 0 on
-    the change the record covers; no guarded file changed while they ran; the inventory of tests did not shrink."""
-    return _typed_verify_problems(verify) + _measured_verify_problems(verify, ctx) + tests_touched_problems(ctx.project, ctx.run)
+    the change the record covers; no guarded file changed while they ran; the inventory of tests did not shrink. Each problem says
+    which part it comes from: the agent's record or the measured run."""
+    return _typed(_typed_verify_problems(verify)) + _measured(_measured_verify_problems(verify, ctx) + tests_touched_problems(ctx.project, ctx.run))
 
 
 # ---- the review
@@ -2712,7 +2729,8 @@ def evaluate_stage(
             if measure and gate in MEASURED_GATES:
                 if run is None and gate == "verify_green":
                     raise PlumblineError(f"{run_problem}: the change cannot be measured")
-                _entry, problems = measure_stage(project, run, run_id, stage)
+                _entry, kept_from_running = measure_stage(project, run, run_id, stage)
+                problems = _measured(kept_from_running)  # the commands could not run at all: the measured part has nothing to show
                 ledger = read_ledger(root, run_id)  # with the run that was just entered
             if not problems:
                 problems = GATE_CHECKS[gate](data, GateContext(project, run_id, stage, run, ledger, measure))
@@ -3172,10 +3190,28 @@ def missing_stages(project: Project, run: Run, measured: dict | None) -> list[st
     return [sid for sid in effective_row(project.pipeline, measured["row"], run.intent).stages if sid not in have]
 
 
+MAX_NAMED_FILES = 5  # how many files a problem about the size of a change names
+
+
+def biggest_files(record: dict, limit: int = MAX_NAMED_FILES) -> str:
+    """A sentence naming the files of a measured change (a change_class record) that contribute the most changed lines, up to `limit`,
+    each with its count, or "" when none counts. The size is the sum over the same files: untracked files are in it as added lines, and
+    generated files are not."""
+    counted = sorted(
+        ((f["added"] + f["removed"], f["path"]) for f in record["files"] if not f["generated"] and f["added"] + f["removed"] > 0),
+        key=lambda item: (-item[0], item[1]),
+    )
+    if not counted:
+        return ""
+    named = ", ".join(f"{path} ({_plural(lines, 'line')})" for lines, path in counted[:limit])
+    rest = f" and {_plural(len(counted) - limit, 'file')} more" if len(counted) > limit else ""
+    return f" The files that contribute most: {named}{rest}."
+
+
 def row_problems(project: Project, run: Run, measured: dict | None) -> list[str]:
     """What the measured row asks for that the run does not have. The row selects stages once the intent is applied: a change
     that measures larger than it was declared selects stages the run lacks, and a change of a size that ends before reduce
-    (nothing is built at size L) cannot be passed at all."""
+    (nothing is built at size L) cannot be passed at all. Each problem names the files that contribute most to the size."""
     if measured is None:
         return []
     by_id = {s["id"]: s for s in project.pipeline["stage"]}
@@ -3183,12 +3219,16 @@ def row_problems(project: Project, run: Run, measured: dict | None) -> list[str]
     stages = effective_row(project.pipeline, label, run.intent).stages
     problems = []
     if not any(by_id[sid]["record"] == "pass_record" for sid in stages):
-        problems.append(f"this row ends before reduce: split the change (it measures as {label}, {measured['lines']} changed lines, and nothing is built at that size)")
+        problems.append(
+            f"this row ends before reduce: split the change (it measures as {label}, {measured['lines']} changed lines, and nothing is built at that size)."
+            + biggest_files(measured)
+        )
     missing = missing_stages(project, run, measured)
     if missing:
         problems.append(
             f"the change measures as {label}, which selects {', '.join(missing)}; run '{run.run_id}' (row {run.row}) has no such stage"
-            f"{'' if len(missing) == 1 else 's'}: start a new run for this row (`plan --intent {run.intent} --row {label}`)"
+            f"{'' if len(missing) == 1 else 's'}: start a new run for this row (`plan --intent {run.intent} --row {label}`)."
+            + biggest_files(measured)
         )
     return problems
 

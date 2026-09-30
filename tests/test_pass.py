@@ -82,7 +82,7 @@ def test_pass_refuses_when_a_gate_fails_and_says_which(run_cli, ready):
     put(ready, "verify", verify_record(green=False))
     result = do_pass(run_cli, ready)
     assert result.returncode == 1
-    assert "error: stage 'verify' (gate verify_green): the verify record is not green (failing: AC-1)" in result.stdout
+    assert "error: stage 'verify' (gate verify_green): the agent's record: the verify record is not green (failing: AC-1)" in result.stdout
     assert not pass_file(ready).exists() and not run_path(ready, RUN, "reduce.json").exists()
 
 
