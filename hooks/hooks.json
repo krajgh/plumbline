@@ -13,7 +13,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash|PowerShell|Read|Grep|Glob|Edit|Write|NotebookEdit|Agent",
+        "matcher": "Bash|PowerShell|Monitor|Read|Grep|Glob|Edit|Write|NotebookEdit|Agent",
         "hooks": [
           {
             "type": "command",

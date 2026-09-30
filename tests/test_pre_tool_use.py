@@ -385,7 +385,7 @@ def test_the_builder_may_read_everything_else(run_pre, adopted, name):
     assert denial(run_pre(read_of(adopted, name), adopted)) is None, name
 
 
-def test_a_file_the_newest_runs_tests_record_lists_is_denied_even_if_it_is_not_matched_by_the_type(run_pre, adopted):
+def test_a_file_a_tests_record_lists_is_denied_even_if_it_is_not_matched_by_the_type(run_pre, adopted):
     write(adopted / "tools" / "helper.py", "x = 1\n")
     assert denial(run_pre(read_of(adopted, "tools/helper.py"), adopted)) is None
     record = written_tests_record()
@@ -414,7 +414,7 @@ def test_a_test_listed_by_file_name_in_the_tests_array_counts_too(run_pre, adopt
     assert denial(run_pre(read_of(adopted, "check/cases.py"), adopted))
 
 
-def test_only_the_newest_runs_tests_record_is_used(run_pre, adopted):
+def test_the_tests_records_of_every_run_are_used_not_only_the_newest_runs(run_pre, adopted):
     write(adopted / "tools" / "helper.py", "x = 1\n")
     old = written_tests_record()
     old["files_written"] = ["tools/helper.py"]
@@ -422,8 +422,10 @@ def test_only_the_newest_runs_tests_record_is_used(run_pre, adopted):
     old_dir = adopted / ".plumbline" / "runs" / "old-run"
     for path in [old_dir, *old_dir.iterdir()]:
         os.utime(path, (1_000_000_000, 1_000_000_000))
-    put(adopted, "tests", written_tests_record(), "new-run")
-    assert denial(run_pre(read_of(adopted, "tools/helper.py"), adopted)) is None
+    put(adopted, "tests", written_tests_record(), "new-run")  # the newest run lists other files; the old run's list still counts
+    reason = denial(run_pre(read_of(adopted, "tools/helper.py"), adopted))
+    assert reason and "tools/helper.py is one" in reason
+    assert denial(run_pre(read_of(adopted, "src/app.py"), adopted)) is None
 
 
 def test_a_symlink_into_the_tests_is_followed(run_pre, adopted):

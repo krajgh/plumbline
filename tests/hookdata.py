@@ -62,3 +62,44 @@ def denial(result):
     assert output["hookEventName"] == "PreToolUse" and output["permissionDecision"] == "deny"
     assert isinstance(output["permissionDecisionReason"], str) and output["permissionDecisionReason"]
     return output["permissionDecisionReason"]
+
+
+# --- helpers for the hook-holds tests (plain functions; the fixtures live in the test files)
+
+
+def start_run(repo, run_id="r1", activate=True):
+    """A run has begun in `repo`: its intake record exists and, with `activate`, .plumbline/runs/ACTIVE names it."""
+    from rundata import intake_record, put
+
+    put(repo, "intake", intake_record("code.S"), run_id)
+    if activate:
+        activate_run(repo, run_id)
+    return run_id
+
+
+def activate_run(repo, run_id):
+    """What `plumbline.py plan --intent` writes: the run id and a newline."""
+    path = repo / ".plumbline" / "runs" / "ACTIVE"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(run_id + "\n", encoding="utf-8")
+
+
+def add_origin(repo, tmp_path):
+    """A local bare repository as `origin` of `repo`, holding `main`, for pushes that really happen. Returns its path."""
+    import subprocess
+
+    from helpers import git
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-q", "origin", "main")
+    return origin
+
+
+def remote_ref(origin, ref):
+    """The commit a ref of the bare repository `origin` points to, or None."""
+    import subprocess
+
+    result = subprocess.run(["git", "-C", str(origin), "rev-parse", "--verify", "--quiet", ref], capture_output=True, text=True)
+    return result.stdout.strip() or None
