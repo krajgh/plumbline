@@ -108,6 +108,34 @@ def test_on_fail_stays_a_stage_id_when_the_row_includes_it(run_cli, repo):
     assert stage(p, "review")["lenses"] == ["correctness", "tests"]  # the code.S row's lenses replace the stage's
 
 
+def test_a_rows_on_fail_replaces_the_stages_own_in_the_printed_plan(run_cli, docs_only):
+    write(docs_only / "plumbline.toml", 'schema = 1\n\n[matrix.docs]\nstages = ["intake", "plan", "build", "verify", "review", "reduce"]\non_fail = { review = "plan" }\n')
+    p = plan(run_cli, docs_only, "--row", "docs")  # plumbline.toml is itself a change, of the config type: the row is declared
+    assert p["row"] == "docs"
+    assert stage(p, "review")["on_fail"] == "plan"  # the row's, in place of the stage's own "build"
+    assert stage(p, "verify")["on_fail"] == "build"  # nothing of the row's for it: its own, and build is in the row
+
+
+def test_the_default_docs_row_prints_main_for_verify_and_review_because_the_row_says_so(run_cli, docs_only):
+    p = plan(run_cli, docs_only)
+    assert [(s["id"], s["on_fail"]) for s in p["stages"] if s["id"] in ("verify", "review")] == [("verify", "main"), ("review", "main")]
+    assert pl.effective_row(pl.load_project(docs_only).pipeline, "docs").on_fail == {"verify": "main", "review": "main"}
+
+
+def test_a_repositorys_row_with_a_bad_on_fail_is_refused_and_one_without_it_is_noted(run_cli, docs_only):
+    row = 'schema = 1\n\n[matrix.docs]\nstages = ["intake", "verify", "review", "reduce"]\n'
+    write(docs_only / "plumbline.toml", row + 'on_fail = { build = "main" }\n')
+    bad = run_cli("validate-pipeline", "--project", docs_only, cwd=docs_only)
+    assert bad.returncode == 1 and "error: row 'docs': on_fail names stage 'build', which the row does not include" in bad.stdout
+    assert run_cli("plan", "--base", "main", cwd=docs_only).returncode == 2  # an invalid configuration starts nothing
+    write(docs_only / "plumbline.toml", row)
+    implicit = run_cli("validate-pipeline", "--project", docs_only, cwd=docs_only)
+    assert implicit.returncode == 0 and implicit.stdout.count("note: row 'docs': stage ") == 2 and "fails over to main" in implicit.stdout
+    write(docs_only / "plumbline.toml", row + 'on_fail = { verify = "main", review = "main" }\n')
+    explicit = run_cli("validate-pipeline", "--project", docs_only, cwd=docs_only)
+    assert explicit.returncode == 0 and "note: row" not in explicit.stdout and "valid (0 errors, 0 notes)" in explicit.stdout
+
+
 def test_absent_optional_reads_have_no_path(run_cli, docs_only):
     p = plan(run_cli, docs_only)
     reads = {r["name"]: r for r in stage(p, "review")["reads"]}

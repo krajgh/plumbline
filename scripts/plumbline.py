@@ -686,11 +686,41 @@ def validate_pipeline(pl: dict) -> tuple[list[str], list[str]]:
     return errors, notes
 
 
+def _check_row_on_fail(where, table, stages, index, present, errors) -> None:
+    """A row's `on_fail` table: for a stage of the row, where a failed gate sends the run in this row, in place of the stage's own on_fail.
+    A key names a stage of the row that has max_rounds (a stage that goes back needs its cap). A value is `main` or a stage of the row,
+    under the rules of a stage's own on_fail: an earlier agent stage, or (for an agent stage) the stage itself."""
+    if not isinstance(table, dict) or not all(isinstance(value, str) for value in table.values()):
+        errors.append(f"{where}: on_fail must map stage ids to a stage of the row, or 'main'")
+        return
+    for sid, target in table.items():
+        if sid not in present:
+            errors.append(f"{where}: on_fail names stage {sid!r}, which the row does not include")
+            continue
+        stage = stages[index[sid]]
+        if "max_rounds" not in stage:
+            errors.append(f"{where}: on_fail names stage {sid!r}, which has no max_rounds (a stage that goes back needs its cap)")
+        if target == "main":
+            continue
+        if target not in present:
+            errors.append(f"{where}: on_fail for stage {sid!r} names {target!r}, which the row does not include (name a stage of the row, or 'main')")
+        elif target == sid:
+            if stage.get("kind", "agent") != "agent":
+                errors.append(f"{where}: on_fail for the review stage {sid!r} cannot name itself; it names the agent stage to go back to, or 'main'")
+        elif present.index(target) > present.index(sid):
+            errors.append(
+                f"{where}: on_fail for stage {sid!r} names {target!r}, which comes later in the row "
+                "(name an earlier stage, this stage itself to run its agent again, or 'main')"
+            )
+        elif stages[index[target]].get("kind", "agent") != "agent":
+            errors.append(f"{where}: on_fail for stage {sid!r} names {target!r}, which is a review stage; it must name an agent stage or 'main'")
+
+
 def _check_row(label, row, stages, index, input_names, bad_reads, errors, notes) -> None:
     where = f"row '{label}'"
     for key in row:
-        if key not in ("stages", "lenses", "note"):
-            errors.append(f"{where}: unknown key {key!r} (a row has stages, lenses and note)")
+        if key not in ("stages", "lenses", "note", "on_fail"):
+            errors.append(f"{where}: unknown key {key!r} (a row has stages, lenses, note and on_fail)")
     if "note" in row and not isinstance(row["note"], str):
         errors.append(f"{where}: note must be a string")
     names = row["stages"]
@@ -712,6 +742,9 @@ def _check_row(label, row, stages, index, input_names, bad_reads, errors, notes)
             f"{where}: stages must appear in the pipeline's definition order "
             f"(expected {', '.join(ordered)}; a row selects stages, it never reorders them)"
         )
+    if "on_fail" in row:
+        _check_row_on_fail(where, row["on_fail"], stages, index, present, errors)
+    overridden = set(row["on_fail"]) if isinstance(row.get("on_fail"), dict) else set()  # the stages whose on_fail the row sets
 
     position = {sid: i for i, sid in enumerate(present)}
     for sid in present:
@@ -721,9 +754,12 @@ def _check_row(label, row, stages, index, input_names, bad_reads, errors, notes)
             if name in position and position[name] < position[sid]:
                 continue
             errors.append(f"{where}: stage '{sid}' reads '{name}', which is neither an input nor an earlier stage of this row")
-        target = stages[index[sid]].get("on_fail")
-        if target is not None and target != "main" and target not in position:
-            notes.append(f"{where}: stage '{sid}' has on_fail '{target}', which this row does not include; it fails over to main")
+        target = stages[index[sid]].get("on_fail")  # where the row sets one for this stage, it replaces this (and is checked above)
+        if sid not in overridden and target is not None and target != "main" and target not in position:
+            notes.append(
+                f"{where}: stage '{sid}' has on_fail '{target}', which this row does not include; it fails over to main "
+                f"(on_fail = {{ {sid} = \"main\" }} in the row says so)"
+            )
 
     if "lenses" in row:
         lenses = row["lenses"]
@@ -1224,6 +1260,7 @@ class EffectiveRow:
     lenses: list[str] | None  # for the review of the diff
     gates: dict[str, str]  # stage id -> the gate that replaces its own
     note: str | None
+    on_fail: dict[str, str] = field(default_factory=dict)  # stage id -> where a failed gate sends the run in this row, in place of the stage's own on_fail
 
 
 def effective_row(pipeline: dict, label: str, intent_id: str = DEFAULT_INTENT) -> EffectiveRow:
@@ -1234,6 +1271,7 @@ def effective_row(pipeline: dict, label: str, intent_id: str = DEFAULT_INTENT) -
     skip = set(intent.get("skip", []))
     lenses = list(row.get("lenses") or [])  # the intent's lenses add to the row's: a refactor of a workflow file keeps the security lens
     lenses += [lens for lens in intent.get("lenses") or [] if lens not in lenses]
+    on_fail = row.get("on_fail")
     return EffectiveRow(
         label=label,
         intent=intent_id,
@@ -1242,14 +1280,17 @@ def effective_row(pipeline: dict, label: str, intent_id: str = DEFAULT_INTENT) -
         lenses=lenses or None,
         gates=dict(intent.get("gates", {})),
         note=row.get("note"),
+        on_fail={sid: target for sid, target in on_fail.items() if isinstance(target, str)} if isinstance(on_fail, dict) else {},
     )
 
 
 def effective_stage(stage: dict, effective: EffectiveRow) -> dict:
-    """The stage as this run has it: a copy, with the intent's gate in place of its own."""
+    """The stage as this run has it: a copy, with the intent's gate in place of its own, and the row's on_fail in place of its own."""
     stage = dict(stage)
     if stage["id"] in effective.gates:
         stage["gate"] = effective.gates[stage["id"]]
+    if stage["id"] in effective.on_fail:
+        stage["on_fail"] = effective.on_fail[stage["id"]]
     return stage
 
 

@@ -95,17 +95,24 @@ gate = "all_gates_passed"
 
 # Rows: which stages run for which change. A row selects stages; it never reorders them.
 # Reordering means reordering the [[stage]] blocks above.
+# A row may set on_fail = { <stage> = "<a stage of the row, or main>" }: where a failed gate of that stage sends the run in
+# this row, in place of the stage's own on_fail. The docs, config and tests rows have no build stage, so their verify and review
+# send the run to the main session, which brings the problems to the builder. A stage whose own on_fail names a stage the row
+# lacks, with no on_fail of the row to say otherwise, fails over to main all the same, and validate-pipeline notes it.
 [matrix.docs]
 stages = ["intake", "verify", "review", "reduce"]
 lenses = ["docs"]
+on_fail = { verify = "main", review = "main" }
 
 [matrix.config]
 stages = ["intake", "verify", "review", "reduce"]
 lenses = ["security", "boundaries"]
+on_fail = { verify = "main", review = "main" }
 
 [matrix.tests]
 stages = ["intake", "verify", "review", "reduce"]
 lenses = ["tests"]
+on_fail = { verify = "main", review = "main" }
 
 [matrix.code.S]
 stages = ["intake", "plan", "tests", "build", "verify", "review", "reduce"]

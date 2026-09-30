@@ -37,7 +37,7 @@ def test_the_default_pipeline_has_the_five_intents_of_the_spec_and_validates():
     assert intents["review-only"] == {"skip": ["plan", "tests", "test-review", "build"]}
     errors, notes = pl.validate_pipeline(default_pipeline())
     assert errors == []
-    assert len(notes) == 6 and all("fails over to main" in n for n in notes)  # the intents add no notes
+    assert notes == []  # the intents add no notes, and the rows that have no build stage say where a failure goes
 
 
 def test_reproduces_on_head_joins_the_known_gates():

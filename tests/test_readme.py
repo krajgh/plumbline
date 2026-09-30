@@ -149,6 +149,15 @@ def test_the_readmes_default_rounds_and_gates_are_the_default_pipelines():
     assert (stages["plan"]["on_fail"], stages["tests"]["on_fail"]) == ("plan", "tests")  # both run their own agent again
 
 
+def test_the_readme_documents_the_rows_on_fail_and_the_default_pipeline_validates_with_no_notes():
+    text = section("The pipeline file")
+    assert 'A row\'s `on_fail` is a table, such as `on_fail = { verify = "main", review = "main" }`' in text
+    assert "each size sets its own" in text and "so that it validates with no notes" in text
+    assert "an earlier agent stage, or for an agent stage itself" in text and "`validate-pipeline` notes that" in text
+    assert PIPELINE["matrix"]["docs"]["on_fail"] == {"verify": "main", "review": "main"}
+    assert pl.validate_pipeline(PIPELINE) == ([], [])
+
+
 def test_the_intents_lenses_join_the_rows_and_the_readme_says_so():
     assert "add lenses to the review of the diff (`lenses`, joined to the row's own)" in README
     assert pl.effective_row(PIPELINE, "code.S", "refactor").lenses == ["correctness", "tests", "boundaries"]

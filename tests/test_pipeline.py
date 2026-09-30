@@ -15,18 +15,24 @@ def check(mutate):
     return pl.validate_pipeline(d)
 
 
-def test_default_pipeline_validates_with_only_fail_over_notes():
+def test_default_pipeline_validates_with_no_errors_and_no_notes():
     errors, notes = pl.validate_pipeline(default_pipeline())
-    assert errors == []
-    # docs, config and tests rows leave out build, so verify and review fail over to main
-    assert len(notes) == 6
-    assert all("fails over to main" in n for n in notes)
+    assert errors == [] and notes == []
+
+
+def test_the_docs_config_and_tests_rows_say_where_a_failed_verify_or_review_goes():
+    # they leave out build, the stage verify and review go back to, so the rows send the run to the main session themselves
+    matrix = default_pipeline()["matrix"]
+    for name in ("docs", "config", "tests"):
+        assert matrix[name]["on_fail"] == {"verify": "main", "review": "main"}, name
+        assert "build" not in matrix[name]["stages"]
+    assert not any("on_fail" in matrix["code"][size] for size in "SML")  # the code rows include build, so the stages' own on_fail stands
 
 
 def test_default_pipeline_via_the_cli(run_cli, tmp_path):
     result = run_cli("validate-pipeline", cwd=tmp_path)
     assert result.returncode == 0
-    assert "pipeline 'default': valid (0 errors, 6 notes)" in result.stdout
+    assert "pipeline 'default': valid (0 errors, 0 notes)" in result.stdout and "note:" not in result.stdout
 
 
 def test_every_record_named_by_the_default_pipeline_has_a_schema():
@@ -111,12 +117,92 @@ def test_a_later_stage_is_still_no_on_fail_target_and_the_message_names_the_retr
 
 
 def test_on_fail_target_outside_its_row_is_a_note_not_an_error():
-    errors, notes = pl.validate_pipeline(default_pipeline())
+    errors, notes = check(lambda d: d["matrix"]["docs"].pop("on_fail"))  # the row does not say where a failure goes
     assert errors == []
+    assert len(notes) == 2 and all(n.startswith("row 'docs': ") for n in notes)
     assert any(
         "row 'docs': stage 'review' has on_fail 'build', which this row does not include; it fails over to main" in n
         for n in notes
     )
+    assert 'on_fail = { review = "main" } in the row says so' in next(n for n in notes if "stage 'review'" in n)
+
+
+# --- a row's on_fail: where a failed gate goes in that row, in place of the stage's own
+
+
+def test_a_rows_on_fail_takes_the_place_of_the_stages_own_and_is_not_noted():
+    errors, notes = check(lambda d: d["matrix"]["docs"].update(on_fail={"verify": "main", "review": "main"}))
+    assert errors == [] and notes == []
+    errors, notes = check(lambda d: d["matrix"]["docs"].update(on_fail={"verify": "main"}))  # one stage covered, the other not
+    assert errors == [] and len(notes) == 1 and "row 'docs': stage 'review' has on_fail 'build'" in notes[0]
+
+
+def test_a_row_may_send_a_failure_to_main_to_an_earlier_agent_stage_of_the_row_or_to_the_stages_own_agent():
+    def mutate(d):
+        d["matrix"]["code"]["S"]["on_fail"] = {"plan": "main", "tests": "main", "verify": "verify", "review": "tests"}
+
+    assert check(mutate) == ([], [])
+
+
+# (id, mutation, text that must appear in some error)
+BAD_ON_FAIL_ROWS = [
+    ("key-not-a-stage-of-the-row", lambda d: d["matrix"]["docs"]["on_fail"].update(build="main"), "row 'docs': on_fail names stage 'build', which the row does not include"),
+    ("key-not-a-stage-at-all", lambda d: d["matrix"]["docs"]["on_fail"].update(ghost="main"), "row 'docs': on_fail names stage 'ghost', which the row does not include"),
+    ("value-not-a-stage-of-the-row", lambda d: d["matrix"]["docs"]["on_fail"].update(verify="build"),
+     "row 'docs': on_fail for stage 'verify' names 'build', which the row does not include (name a stage of the row, or 'main')"),
+    ("value-not-a-stage-at-all", lambda d: d["matrix"]["docs"]["on_fail"].update(verify="ghost"), "on_fail for stage 'verify' names 'ghost', which the row does not include"),
+    ("value-a-later-stage", lambda d: d["matrix"]["docs"]["on_fail"].update(verify="review"), "on_fail for stage 'verify' names 'review', which comes later in the row"),
+    ("value-a-review-stage", lambda d: d["matrix"]["code"]["M"].update(on_fail={"review": "test-review"}),
+     "row 'code.M': on_fail for stage 'review' names 'test-review', which is a review stage; it must name an agent stage or 'main'"),
+    ("a-review-stage-names-itself", lambda d: d["matrix"]["docs"]["on_fail"].update(review="review"), "on_fail for the review stage 'review' cannot name itself"),
+    ("stage-without-max-rounds", lambda d: d["matrix"]["code"]["S"].update(on_fail={"build": "plan"}),
+     "row 'code.S': on_fail names stage 'build', which has no max_rounds (a stage that goes back needs its cap)"),
+    ("not-a-table", lambda d: d["matrix"]["docs"].update(on_fail="main"), "row 'docs': on_fail must map stage ids to a stage of the row, or 'main'"),
+    ("a-list", lambda d: d["matrix"]["docs"].update(on_fail=["verify"]), "row 'docs': on_fail must map stage ids to a stage of the row, or 'main'"),
+    ("a-value-that-is-not-a-string", lambda d: d["matrix"]["docs"].update(on_fail={"verify": 1}), "row 'docs': on_fail must map stage ids to a stage of the row, or 'main'"),
+    ("set-on-the-split-row-itself", lambda d: d["matrix"]["code"].update(on_fail={"verify": "main"}), "row 'code': unexpected key 'on_fail' (a row split by size has only S, M and L)"),
+]
+
+
+@pytest.mark.parametrize("mutate,expected", [(m, e) for _, m, e in BAD_ON_FAIL_ROWS], ids=[i for i, _, _ in BAD_ON_FAIL_ROWS])
+def test_a_bad_on_fail_of_a_row_is_an_error(mutate, expected):
+    errors, _ = check(mutate)
+    assert any(expected in e for e in errors), f"expected {expected!r} in {errors}"
+
+
+def test_a_bad_on_fail_adds_no_note_of_its_own_and_the_row_still_reports_its_other_errors():
+    errors, notes = check(lambda d: d["matrix"]["docs"].update(on_fail={"verify": "build", "review": "main"}, lenses=["vibes"]))
+    assert any("row 'docs': unknown lens 'vibes'" in e for e in errors) and any("names 'build'" in e for e in errors)
+    assert notes == []  # the error says it; a stage the row names is never also noted as failing over implicitly
+
+
+def test_the_key_on_fail_of_a_row_is_known_to_the_row_key_check():
+    errors, _ = check(lambda d: d["matrix"]["docs"].update(colour="red"))
+    assert any("unknown key 'colour' (a row has stages, lenses, note and on_fail)" in e for e in errors)
+
+
+def test_a_rows_on_fail_reaches_the_runtime_through_the_effective_row_and_stage_and_leaves_the_pipeline_alone():
+    pipeline = default_pipeline()
+    by_id = {s["id"]: s for s in pipeline["stage"]}
+    docs, code = pl.effective_row(pipeline, "docs"), pl.effective_row(pipeline, "code.S")
+    assert docs.on_fail == {"verify": "main", "review": "main"} and code.on_fail == {}
+    assert pl.effective_stage(by_id["review"], docs)["on_fail"] == "main"
+    assert pl.effective_stage(by_id["review"], code)["on_fail"] == "build"
+    assert by_id["review"]["on_fail"] == "build"  # the stage's own is untouched: another row may still use it
+
+
+def test_the_plan_prints_the_rows_on_fail_and_the_intent_that_skips_its_target_fails_over_to_main():
+    from samples import sample
+
+    pipeline = default_pipeline()
+    pipeline["matrix"]["docs"] = {"stages": ["intake", "plan", "build", "verify", "review", "reduce"], "on_fail": {"review": "plan"}}
+    record = {**sample("change_class"), "row": "docs", "intent": "feature"}
+    plan = {s["id"]: s for s in pl.build_plan(pipeline, record, "demo")["stages"]}
+    assert plan["review"]["on_fail"] == "plan"  # the row's, in place of the stage's own build
+    assert plan["verify"]["on_fail"] == "build" and plan["plan"]["on_fail"] == "plan"  # no on_fail of the row for these: their own
+    record["intent"] = "spec-supplied"  # skips plan, which the row's on_fail names
+    skipped = {s["id"]: s for s in pl.build_plan(pipeline, record, "demo")["stages"]}
+    assert skipped["review"]["on_fail"] == "main" and skipped["verify"]["on_fail"] == "build"
 
 
 def test_a_new_row_that_leaves_out_the_on_fail_target_only_adds_a_note():
