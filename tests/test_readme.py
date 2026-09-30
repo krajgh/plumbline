@@ -149,6 +149,16 @@ def test_the_readmes_default_rounds_and_gates_are_the_default_pipelines():
     assert (stages["plan"]["on_fail"], stages["tests"]["on_fail"]) == ("plan", "tests")  # both run their own agent again
 
 
+def test_the_readme_says_how_the_agents_write_and_how_the_run_skill_launches_them():
+    agents = section("Agents")
+    assert "Every agent writes its record with the Write tool (Bash runs commands and reads), and a review agent writes it straight to the path its brief names" in agents
+    assert "the round directory is there already, or Write makes it" in agents
+    assert "launch each stage's agent without `model`, because each is pinned in its definition" in section("Skills")
+    for role in pl.AGENT_ROLES:
+        body = (REPO / "agents" / f"{role}.md").read_text(encoding="utf-8")
+        assert "with the Write tool" in body, role
+
+
 def test_the_readme_documents_the_rows_on_fail_and_the_default_pipeline_validates_with_no_notes():
     text = section("The pipeline file")
     assert 'A row\'s `on_fail` is a table, such as `on_fail = { verify = "main", review = "main" }`' in text

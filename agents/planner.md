@@ -30,6 +30,8 @@ A `spec`, described by `${CLAUDE_PLUGIN_ROOT}/schemas/spec.json` (read it before
 - `risks`: what could go wrong, and the choices you made where the request was silent.
 - `split_proposal`: at size L, a list of changes each of size M or smaller, one string each; otherwise `null`.
 
+Write the record with the Write tool, straight to the path in your brief. Bash runs commands and reads; every file you write goes through Write.
+
 ## Finish
 
 Check your record, and fix it until it is valid:

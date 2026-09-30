@@ -265,6 +265,18 @@ def test_the_run_skill_briefs_the_defender_with_the_merge_base_and_the_hash():  
     assert "the merge base" in prompt and "`diff_sha256`" in prompt  # what the prompt expects, the brief gives
 
 
+def test_the_run_skill_launches_every_plumbline_agent_without_a_model_because_each_is_pinned():
+    body = run_skill()
+    paragraph = between(body, "**Launch every plumbline agent", "**Every brief**")
+    assert "without `model`" in paragraph and "each is pinned in its definition" in paragraph and "Leave `isolation` out as well" in paragraph
+    assert "Sonnet for the planner, test-writer, builder, prosecutor and detective; Haiku for the verifier and defender" in paragraph
+    pins = {name: frontmatter(REPO / "agents" / f"{name}.md")[0]["model"] for name in pl.AGENT_ROLES}  # what the agent files say, which is what the paragraph repeats
+    assert sorted(n for n, model in pins.items() if model == "sonnet") == sorted(["planner", "test-writer", "builder", "prosecutor", "detective"])
+    assert sorted(n for n, model in pins.items() if model == "haiku") == ["defender", "verifier"]
+    assert "(without `model`: the defender is pinned to Haiku)" in between(body, "2. **Defenders.**", "3. `PLUMBLINE merge-review")
+    assert "model:" not in body  # no launch in the skill names a model
+
+
 def test_the_run_skill_briefs_the_test_writer_on_how_the_tests_run_and_where_the_stubs_go():
     body = run_skill()
     brief = between(body, "- test-writer:", "- builder: the plan record.")

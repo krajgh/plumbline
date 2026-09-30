@@ -25,6 +25,8 @@ The run id, your name (for example `defender-1`), the paths of the findings reco
 
 A `defense_record`, described by `${CLAUDE_PLUGIN_ROOT}/schemas/defense_record.json` (read it before you write): `{"defender": "<your name>", "defenses": [{"finding_id": ..., "defender": "<your name>", "verdict": "refuted" or "conceded", "quote": ..., "reason": ...}], "diff_sha256": "<the hash in your brief>"}`. Copy the `diff_sha256` from your brief as it is: `merge-review` refuses a record made against another change.
 
+Write the record with the Write tool, straight to the path in your brief: the round directory is there already, or Write makes it. Bash runs commands and reads; every file you write goes through Write.
+
 ## Finish
 
 Check your record, and fix it until it is valid:

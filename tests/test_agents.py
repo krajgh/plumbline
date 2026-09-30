@@ -182,6 +182,32 @@ def test_the_test_writer_runs_the_tests_against_a_stub_and_records_the_check():
     assert "a fix" in body  # in a fix the tests run against today's code
 
 
+@pytest.mark.parametrize("name", NAMES)
+def test_every_prompt_says_the_record_is_written_with_the_write_tool(name):
+    body = agent(name)[1]
+    assert "with the Write tool" in body.split("## The record")[1].split("## Finish")[0]
+
+
+@pytest.mark.parametrize("name", ["planner", "verifier", "prosecutor", "defender", "detective"])
+def test_an_agent_with_bash_is_told_that_every_file_it_writes_goes_through_write(name):
+    body = agent(name)[1]
+    assert "Write the record with the Write tool, straight to the path in your brief" in body
+    assert "Bash runs commands and reads; every file you write goes through Write." in body
+
+
+def test_the_test_writer_creates_its_files_with_write_or_edit_and_its_record_with_write():
+    body = agent("test-writer")[1]
+    assert "Create your files with Write or Edit, which reach test paths, the run's stubs directory and your record" in body
+    assert "Write the record with the Write tool." in body
+
+
+@pytest.mark.parametrize("name", ["prosecutor", "defender", "detective"])
+def test_a_review_agent_is_told_the_round_directory_is_there_already_or_write_makes_it(name):
+    body = agent(name)[1]
+    assert "the round directory is there already, or Write makes it" in body
+    assert "mkdir" not in body  # there is no step that asks for a directory to be made
+
+
 def test_the_test_writer_runs_against_todays_code_and_imports_new_names_inside_the_tests():
     body = agent("test-writer")[1]
     assert "Import what a test needs from the change inside the test function, so that a name the change has yet to add fails that test when it runs (a pytest run exits 1) and does not stop the collection (exit 2)" in body

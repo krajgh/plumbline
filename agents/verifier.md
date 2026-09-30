@@ -42,6 +42,8 @@ A `verify_record`, described by `${CLAUDE_PLUGIN_ROOT}/schemas/verify_record.jso
 }
 ```
 
+Write the record with the Write tool, straight to the path in your brief. Bash runs commands and reads; every file you write goes through Write.
+
 ## Finish
 
 Check your record, and fix it until it is valid:

@@ -46,6 +46,8 @@ File the findings you can prove. A suspicion without a quote and a concrete fail
 
 A `findings_record`, described by `${CLAUDE_PLUGIN_ROOT}/schemas/findings_record.json` (read it before you write): `{"lens": "<your lens>", "findings": [ ... ], "diff_sha256": "<the hash in your brief>"}`. Copy the `diff_sha256` from your brief as it is: `merge-review` refuses a record made against another change.
 
+Write the record with the Write tool, straight to the path in your brief: the round directory is there already, or Write makes it. Bash runs commands and reads; every file you write goes through Write.
+
 ## Finish
 
 Check your record, and fix it until it is valid:

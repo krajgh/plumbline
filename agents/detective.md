@@ -27,6 +27,8 @@ The run id, the path of the merged review record of this round, the merge base (
 
 A `gaps_record`, described by `${CLAUDE_PLUGIN_ROOT}/schemas/gaps_record.json` (read it before you write): `{"gaps": [{"id": "G-1", "kind": "uncovered_ac", "detail": "...", "ac": "AC-2"}], "diff_sha256": "<the hash in your brief>"}`. Copy the `diff_sha256` from your brief as it is: `merge-review` refuses a record made against another change.
 
+Write the record with the Write tool, straight to the path in your brief: the round directory is there already, or Write makes it. Bash runs commands and reads; every file you write goes through Write.
+
 ## Finish
 
 Check your record, and fix it until it is valid:
