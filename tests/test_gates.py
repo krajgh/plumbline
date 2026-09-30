@@ -4,7 +4,7 @@ import pytest
 import plumbline as pl
 from helpers import DEFAULT_TOML, commit_all, write
 from rundata import (
-    CONTROLLED, RUN, adopt, begin, build_note_record, change_of, gate_stages, intake_record, ledger, now_hash, put, review_record, run_path,
+    CONTROLLED, RUN, adopt, agent_stopped, begin, build_note_record, change_of, gate_stages, intake_record, ledger, now_hash, put, review_record, run_path,
     set_exit_code, spec_record, verify_now, verify_record, write_code_s_run, write_docs_run, write_test_file, written_tests_record,
 )
 
@@ -534,3 +534,80 @@ def test_a_stage_without_max_rounds_prints_no_round(run_cli, adopted):
     write_docs_run(adopted)
     gate_stages(run_cli, adopted, ["verify", "review"])
     assert "round" not in gate(run_cli, adopted, "reduce").stdout
+
+
+# --- rounds count agents, not stops: an agent the harness asks again for its report stops again, and is still one round
+
+PLAN_STAGE = {"id": "plan", "role": "planner", "max_rounds": 2}
+
+
+def agent_entry(agent_id, stage="plan", **fields):
+    """A ledger entry of an agent that stopped. The string "<missing>" as `agent_id` leaves the key out."""
+    entry = {
+        "kind": "agent", "agent_id": agent_id, "agent_type": "plumbline:planner", "stage": stage,
+        "record": ".plumbline/runs/r1/plan.json", "record_sha256": "0" * 64, "valid": True, "blocks": 0, **fields,
+    }
+    if agent_id == "<missing>":
+        del entry["agent_id"]
+    return entry
+
+
+def passed_gate(stage="plan"):
+    return {"kind": "gate", "stage": stage, "gate": "spec_complete", "passed": True, "record_sha256": "0" * 64, "problems": []}
+
+
+def test_one_agent_that_stopped_four_times_is_round_1_and_the_plan_gate_passes(run_cli, adopted):  # the first real run said "round 4 of 2"
+    begin(adopted, "code.M")
+    path = put(adopted, "plan", spec_record(), agent=False)
+    for _ in range(4):  # what 0.4.0's hook entered: one entry for each stop, all of one agent with the same valid record
+        agent_stopped(adopted, "plan", path, "planner", "spec", agent_id="planner-1")
+    assert len([e for e in ledger(adopted) if e["kind"] == "agent"]) == 4
+    result = gate(run_cli, adopted, "plan")
+    assert result.returncode == 0, result.stdout
+    assert "gate spec_complete for stage 'plan': pass" in result.stdout and "round 1 of 2" in result.stdout and "past the 2 rounds" not in result.stdout
+
+
+def test_two_distinct_planner_agents_are_two_rounds_and_a_third_is_past_the_limit(run_cli, adopted):
+    begin(adopted, "code.M")
+    bad = spec_record(planned=("AC-1",))
+    path = put(adopted, "plan", bad, agent=False)
+    agent_stopped(adopted, "plan", path, "planner", "spec", agent_id="planner-1")
+    agent_stopped(adopted, "plan", path, "planner", "spec", agent_id="planner-1")  # asked again for the same report: still its first round
+    first = gate(run_cli, adopted, "plan")
+    assert first.returncode == 1 and "round 1 of 2" in first.stdout
+    agent_stopped(adopted, "plan", path, "planner", "spec", agent_id="planner-2")
+    failed_with(gate(run_cli, adopted, "plan"), "round 2 of 2", code=3)
+    agent_stopped(adopted, "plan", path, "planner", "spec", agent_id="planner-3")
+    failed_with(gate(run_cli, adopted, "plan"), "round 3 is past the 2 rounds stage 'plan' has", code=3)
+
+
+def test_a_stage_counts_its_agents_once_each_in_stage_round_and_in_rounds_taken():
+    four_stops = [agent_entry("a")] * 4
+    assert pl.stage_round(PLAN_STAGE, None, four_stops) == (1, 2) and pl.rounds_taken(PLAN_STAGE, None, four_stops) == 1
+    two_agents = [agent_entry("a"), agent_entry("b"), agent_entry("a"), agent_entry("b")]
+    assert pl.stage_round(PLAN_STAGE, None, two_agents) == (2, 2) and pl.rounds_taken(PLAN_STAGE, None, two_agents) == 2
+    assert pl.stage_round(PLAN_STAGE, None, []) == (0, 2) and pl.rounds_taken(PLAN_STAGE, None, []) == 1  # a stage taken by no agent took one round
+
+
+def test_an_entry_without_an_agent_id_counts_once_each():
+    nameless = [agent_entry("<missing>"), agent_entry(None), agent_entry(""), agent_entry(7), agent_entry(["a"]), agent_entry({"id": "a"})]  # nothing says these are one agent
+    assert pl.stage_round(PLAN_STAGE, None, nameless) == (6, 2) and pl.rounds_taken(PLAN_STAGE, None, nameless) == 6
+    mixed = [agent_entry("a"), agent_entry("a"), agent_entry("<missing>"), agent_entry("<missing>")]
+    assert pl.stage_round(PLAN_STAGE, None, mixed) == (3, 2) and pl.rounds_taken(PLAN_STAGE, None, mixed) == 3
+
+
+def test_the_round_counts_the_agents_since_the_gate_last_passed_and_no_other_stages_entries():
+    assert pl.stage_round(PLAN_STAGE, None, [agent_entry("a"), agent_entry("b"), passed_gate(), agent_entry("b")]) == (1, 2)  # b again, in the new count
+    assert pl.stage_round(PLAN_STAGE, None, [agent_entry("a"), {**passed_gate(), "passed": False}, agent_entry("a")]) == (1, 2)  # a failed gate resets nothing
+    assert pl.stage_round(PLAN_STAGE, None, [agent_entry("a"), passed_gate()]) == (0, 2)
+    others = [agent_entry("a"), agent_entry("x", stage="tests"), passed_gate("tests"), agent_entry("y", stage="tests")]
+    assert pl.stage_round(PLAN_STAGE, None, others) == (1, 2)  # another stage's agents and gates are its own
+    assert pl.rounds_taken(PLAN_STAGE, None, [agent_entry("a"), agent_entry("b"), passed_gate(), agent_entry("c")]) == 3  # the pass record counts the whole run
+
+
+def test_a_review_and_a_main_session_stage_are_not_counted_by_agents():
+    review = {"id": "review", "kind": "review", "max_rounds": 3}
+    crowd = [agent_entry(name, stage="review") for name in ("p-1", "p-2", "p-3", "d-1")]
+    assert pl.stage_round(review, {"round": 2}, crowd) == (2, 3) and pl.rounds_taken(review, {"round": 2}, crowd) == 2
+    assert pl.stage_round(review, None, crowd) == (0, 3)
+    assert pl.rounds_taken({"id": "intake", "role": "main"}, None, crowd) == 1

@@ -77,12 +77,13 @@ def write_ledger(repo, rows, run_id=RUN) -> None:
 
 
 def agent_stopped(repo, stage_id, path, role, record_type, valid=True, run_id=RUN, agent_id=None, sha=None) -> None:
-    """Enter the stop of plumbline:<role> the way the SubagentStop hook does: the record and its hash as they are now."""
+    """Enter the stop of plumbline:<role> the way the SubagentStop hook does: the record and its hash as they are now. Each call is
+    a new agent (a round of its stage) unless it names the `agent_id` of one that stopped before."""
     pl.append_ledger(
         repo,
         run_id,
         {
-            "kind": "agent", "agent_id": agent_id or f"agent-{stage_id}", "agent_type": f"plumbline:{role}", "stage": stage_id,
+            "kind": "agent", "agent_id": agent_id or f"agent-{stage_id}-{len(ledger(repo, run_id)) + 1}", "agent_type": f"plumbline:{role}", "stage": stage_id,
             "record": pl.rel_path(repo, path), "record_type": record_type, "record_sha256": sha or pl.file_sha256(path), "valid": valid, "blocks": 0,
         },
     )
@@ -324,6 +325,33 @@ def write_transcript(path, records, extra_lines=()):
     lines = [json.dumps(r) for r in records] + list(extra_lines)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
+
+
+def text_record(text) -> dict:
+    """One transcript record of an assistant message that says `text`."""
+    return {
+        "type": "assistant", "isSidechain": True,
+        "message": {"id": "msg_text", "role": "assistant", "model": SONNET, "content": [{"type": "text", "text": text}]},
+    }
+
+
+def handback_record(report, call_id="toolu_hb") -> dict:
+    """One transcript record of an assistant message that calls SubagentHandback with `report`, as Claude Code writes a tool call."""
+    return {
+        "type": "assistant", "isSidechain": True,
+        "message": {
+            "id": f"msg_{call_id}", "role": "assistant", "model": SONNET,
+            "content": [{"type": "tool_use", "id": call_id, "name": "SubagentHandback", "input": {"message": report}}],
+        },
+    }
+
+
+def refusal_record(call_id="toolu_hb", text="Only the auto-mode classifier can allow SubagentHandback: the session is not in auto mode") -> dict:
+    """The transcript record of the answer to a tool call that was refused."""
+    return {
+        "type": "user", "isSidechain": True,
+        "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call_id, "content": text, "is_error": True}]},
+    }
 
 
 def agent_row(agent_id, **fields) -> dict:

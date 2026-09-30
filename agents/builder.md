@@ -28,6 +28,8 @@ A `build_note`, described by `${CLAUDE_PLUGIN_ROOT}/schemas/build_note.json` (re
 
 You have no Bash to check the record with, so read it once more against the schema: all four keys are there, each `acs_addressed` entry looks like `AC-<n>`, and `files_changed` matches what you wrote.
 
+When the harness asks for your report through SubagentHandback, the whole report goes in that call's `message`, with the RECORD line last. If that call is refused, the same report is your final message.
+
 End your final message with this line, last, and nothing after it:
 
 ```

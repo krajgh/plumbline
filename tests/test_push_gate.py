@@ -1280,3 +1280,34 @@ def test_the_shell_command_is_the_first_word_after_the_options_that_follow_dash_
     assert pre._shell_command(["bash", "-lc", "x", "arg0"]) == "x"
     assert pre._shell_command(["bash", "-o", "pipefail", "-c", "x"]) == "x"
     assert pre._shell_command(["bash", "script.sh"]) is None and pre._shell_command(["bash", "-c"]) is None
+
+
+# ------------------------------------------------------------------------------------ the words of the denial
+
+
+def test_the_denial_says_there_is_no_pass_or_override_record_once(adopted):
+    reason = gate("git push origin feature", adopted)
+    assert reason.startswith(f"plumbline: HEAD {head(adopted)[:7]} has no pass or override record, so it is not pushed. Run the pipeline (/plumbline:run)")
+    assert reason.count("no pass or override record") == 1
+    opened = gate("gh pr create --fill", adopted)
+    assert f"HEAD {head(adopted)[:7]} has no pass or override record, so it is not opened for review. Run the pipeline" in opened
+    assert opened.count("no pass or override record") == 1
+
+
+def test_the_denial_of_another_ref_says_it_once_too(adopted):
+    other = commit_on(adopted, "other", "other.txt")
+    reason = gate("git push origin other", adopted)
+    assert reason.startswith(f"plumbline: other ({other[:7]}) has no pass or override record, so it is not pushed. Check other out")
+    assert reason.count("no pass or override record") == 1
+
+
+def test_a_denial_that_has_more_to_say_about_the_record_still_says_it(adopted):
+    sha = head(adopted)
+    write(adopted / ".plumbline" / "pass" / f"{sha}.json", "{not json")
+    reason = gate("git push origin feature", adopted)
+    assert f"HEAD {sha[:7]} has no pass or override record, so it is not pushed (.plumbline/pass/{sha}.json cannot be used: not valid JSON" in reason
+    assert reason.count("no pass or override record") == 1
+
+
+def test_the_phrase_the_denial_leaves_out_is_the_reason_the_coverage_check_gives(adopted):
+    assert pl.coverage(adopted, head(adopted), pl.load_project(adopted)) == (None, pre.NO_RECORD)

@@ -50,6 +50,8 @@ Check your record, and fix it until it is valid:
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/plumbline.py" check-record verify_record <the path of your record>
 ```
 
+When the harness asks for your report through SubagentHandback, the whole report goes in that call's `message`, with the RECORD line last. If that call is refused, the same report is your final message.
+
 End your final message with this line, last, and nothing after it:
 
 ```

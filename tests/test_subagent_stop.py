@@ -2,6 +2,7 @@
 agent's record belongs, blocks it (exit 2, the errors on stderr, the decision as JSON) until then, and gives up after 3 blocks."""
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -10,7 +11,8 @@ import subagent_stop
 from helpers import git, write
 from hookdata import AGENT, stop_payload
 from rundata import (
-    RUN, adopt, begin, build_note_record, ledger, put as put_file, run_path, spec_record, verify_record, written_tests_record,
+    RUN, adopt, begin, build_note_record, handback_record, ledger, put as put_file, refusal_record, run_path, spec_record, text_record, verify_record,
+    write_transcript, written_tests_record,
 )
 from samples import sample
 
@@ -124,19 +126,20 @@ def test_each_agent_is_checked_against_its_own_record_type(run_stop, adopted, na
 
 def test_the_last_line_may_dress_the_label_and_the_path(run_stop, adopted):
     put(adopted, "plan", spec_record())
-    for line in ("**RECORD:** .plumbline/runs/r1/plan.json", "RECORD: `.plumbline/runs/r1/plan.json`", "RECORD:.plumbline/runs/r1/plan.json", "  RECORD:   .plumbline/runs/r1/plan.json  "):
-        let_go(stop(run_stop, adopted, f"Done.\n\n{line}\n\n"))
+    lines = ("**RECORD:** .plumbline/runs/r1/plan.json", "RECORD: `.plumbline/runs/r1/plan.json`", "RECORD:.plumbline/runs/r1/plan.json", "  RECORD:   .plumbline/runs/r1/plan.json  ")
+    for n, line in enumerate(lines):
+        let_go(stop(run_stop, adopted, f"Done.\n\n{line}\n\n", agent_id=f"agent-{n}"))  # one agent each: one agent's repeated stops are one entry
     assert len(agents_entered(adopted)) == 4
 
 
 def test_a_closing_code_fence_after_the_record_line_does_not_hide_it(run_stop, adopted):  # C-18
     put(adopted, "plan", spec_record())
-    for message in (
+    for n, message in enumerate((
         "Done.\n```\nRECORD: .plumbline/runs/r1/plan.json\n```",
         "Done.\n\n```text\nRECORD: .plumbline/runs/r1/plan.json\n```\n\n",
         "Done.\n~~~\nRECORD: .plumbline/runs/r1/plan.json\n~~~",
-    ):
-        let_go(stop(run_stop, adopted, message))
+    )):
+        let_go(stop(run_stop, adopted, message, agent_id=f"agent-{n}"))
     assert len(agents_entered(adopted)) == 3
 
 
@@ -147,7 +150,7 @@ def test_a_relative_path_is_resolved_from_the_cwd_and_then_from_the_root(run_sto
     payload["cwd"] = str(src)  # the agent works in a subdirectory: the path is found from the root
     let_go(run_stop(payload, src))
     absolute = f"RECORD: {run_path(adopted, RUN, 'plan.json')}"
-    let_go(run_stop(stop_payload(adopted, message=absolute), adopted))
+    let_go(run_stop(stop_payload(adopted, message=absolute, agent_id="another-agent"), adopted))
     assert [e["record"] for e in agents_entered(adopted)] == [".plumbline/runs/r1/plan.json"] * 2
 
 
@@ -498,3 +501,316 @@ def test_the_hook_never_writes_anything_the_agent_did_not_cause(run_stop, adopte
 )
 def test_record_line(text, path):
     assert subagent_stop.record_line(text) == path
+
+
+# --- one entry for each agent and record: an agent the harness asks again for its report stops again, and is still one agent
+
+
+def test_four_stops_of_one_agent_with_the_same_valid_record_are_one_entry_and_one_round_and_the_plan_gate_passes(run_cli, run_stop, adopted):
+    put(adopted, "plan", spec_record())
+    for _ in range(4):  # the first real run: the planner stopped four times with the same plan.json
+        let_go(stop(run_stop, adopted))
+    [entry] = agents_entered(adopted)
+    assert (entry["agent_id"], entry["valid"], entry["record"], entry["stage"]) == (AGENT, True, ".plumbline/runs/r1/plan.json", "plan")
+    assert entry["record_sha256"] == pl.file_sha256(run_path(adopted, RUN, "plan.json"))
+    assert pl.stage_round({"id": "plan", "role": "planner", "max_rounds": 2}, None, ledger(adopted)) == (1, 2)
+    result = run_cli("gate", RUN, "plan", cwd=adopted)
+    assert result.returncode == 0, result.stdout
+    assert "gate spec_complete for stage 'plan': pass" in result.stdout and "round 1 of 2" in result.stdout
+
+
+def test_each_agent_is_entered_for_its_own_stops_and_counts_as_a_round(run_stop, adopted):
+    put(adopted, "plan", spec_record())
+    for agent_id in ("first", "second", "first", "second", "first"):  # the ledger's latest entry is the other agent's: the agent's own entry is the one that counts
+        let_go(stop(run_stop, adopted, agent_id=agent_id))
+    assert [e["agent_id"] for e in agents_entered(adopted)] == ["first", "second"]
+    assert pl.stage_round({"id": "plan", "role": "planner", "max_rounds": 2}, None, ledger(adopted)) == (2, 2)
+
+
+def test_a_later_stop_that_changes_the_record_or_its_validity_is_entered_again(run_stop, adopted):
+    path = put(adopted, "plan", spec_record())
+    let_go(stop(run_stop, adopted))
+    let_go(stop(run_stop, adopted))
+    assert len(agents_entered(adopted)) == 1
+    edited = spec_record()
+    edited["goal"] = "A goal written after the first stop."
+    path.write_text(json.dumps(edited), encoding="utf-8")
+    let_go(stop(run_stop, adopted))  # the record changed: the agent left another record
+    let_go(stop(run_stop, adopted))
+    first, second = agents_entered(adopted)
+    assert first["record_sha256"] != second["record_sha256"] == pl.file_sha256(path) and (first["valid"], second["valid"]) == (True, True)
+    write(adopted / "plumbline.toml", 'schema = 1\npipeline = "nope"\n')  # the record is as it was, and no longer checked: its validity changes
+    let_go(stop(run_stop, adopted))
+    let_go(stop(run_stop, adopted))
+    *_, last = agents_entered(adopted)
+    assert len(agents_entered(adopted)) == 3 and (last["valid"], last["record_sha256"]) == (False, second["record_sha256"])
+    assert {e["agent_id"] for e in agents_entered(adopted)} == {AGENT}  # three entries of one agent are one round
+    assert pl.stage_agents(ledger(adopted), "plan") == 1
+
+
+def test_a_stop_that_names_the_same_content_at_another_path_is_entered_again(run_stop, adopted):
+    part = json.dumps(sample("findings_record"))
+    for name in ("prosecutor-correctness", "prosecutor-tests"):  # one agent, two valid records with the same hash: two paths
+        target = run_path(adopted, RUN, "review", "round-1", f"{name}.json")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(part, encoding="utf-8")
+        let_go(stop(run_stop, adopted, f"RECORD: .plumbline/runs/r1/review/round-1/{name}.json", agent_type="plumbline:prosecutor", agent_id="pro"))
+    first, second = agents_entered(adopted)
+    assert first["record_sha256"] == second["record_sha256"] and (first["valid"], second["valid"]) == (True, True)
+    assert [first["record"], second["record"]] == [f".plumbline/runs/r1/review/round-1/{name}.json" for name in ("prosecutor-correctness", "prosecutor-tests")]
+
+
+def test_stops_that_name_no_agent_are_entered_each_time_and_count_as_a_round_each(run_stop, adopted):
+    put(adopted, "plan", spec_record())
+    for _ in range(2):
+        let_go(stop(run_stop, adopted, agent_id=None))
+    assert [e["agent_id"] for e in agents_entered(adopted)] == [None, None]
+    assert pl.stage_round({"id": "plan", "role": "planner", "max_rounds": 3}, None, ledger(adopted)) == (2, 3)
+
+
+def test_an_agent_let_go_with_an_invalid_record_that_stops_again_stays_one_entry(run_stop, adopted):
+    put(adopted, "plan", {"goal": ""})
+    outcomes = ["blocked" if stop(run_stop, adopted).returncode == 2 else "let go" for _ in range(8)]
+    assert outcomes == ["blocked"] * 3 + ["let go"] + ["blocked"] * 3 + ["let go"]  # the count of blocks starts again once the agent is let go
+    [entry] = agents_entered(adopted)
+    assert (entry["valid"], entry["blocks"]) == (False, 3)
+
+
+def test_an_unknown_plumbline_role_that_stops_again_is_entered_once(run_stop, adopted):
+    for _ in range(3):
+        let_go(stop(run_stop, adopted, "no record needed", agent_type="plumbline:wizard"))
+    [entry] = agents_entered(adopted)
+    assert (entry["valid"], entry["errors"]) == (False, ["unknown plumbline role"])
+
+
+# --- a report handed back through SubagentHandback: when the final message has no RECORD line, the last handback call has it
+
+HANDBACK_REFUSED = "Only the auto-mode classifier can allow SubagentHandback: the session is not in auto mode"
+
+
+@pytest.fixture
+def stop_with(run_stop, adopted, tmp_path):
+    """Stop an agent whose transcript holds `records` (a list of dicts, or of lines that are written as they are)."""
+
+    def run(records, message="", **fields):
+        payload = stop_payload(adopted, message=message, **fields)
+        payload["agent_transcript_path"] = str(tmp_path / "transcripts" / f"agent-{payload['agent_id']}.jsonl")
+        write_transcript(Path(payload["agent_transcript_path"]), [r for r in records if isinstance(r, dict)], [r for r in records if not isinstance(r, dict)])
+        return run_stop(payload, adopted)
+
+    return run
+
+
+@pytest.mark.parametrize("final", ["", "   \n", "Done: the report went through SubagentHandback."])
+def test_a_report_that_went_only_through_the_handback_names_its_record_from_the_transcript(stop_with, adopted, final):
+    put(adopted, "plan", spec_record())
+    let_go(stop_with([text_record("Working on it."), handback_record(PLAN_LINE)], message=final))
+    [entry] = agents_entered(adopted)
+    assert (entry["valid"], entry["record"], entry["stage"], entry["blocks"]) == (True, ".plumbline/runs/r1/plan.json", "plan", 0)
+    assert entry["record_sha256"] == pl.file_sha256(run_path(adopted, RUN, "plan.json"))
+
+
+def test_a_payload_without_a_final_message_field_falls_back_to_the_handback_too(run_stop, adopted, tmp_path):
+    put(adopted, "plan", spec_record())
+    payload = stop_payload(adopted)
+    del payload["last_assistant_message"]
+    payload["agent_transcript_path"] = str(write_transcript(tmp_path / "t" / "agent.jsonl", [handback_record(PLAN_LINE)]))
+    let_go(run_stop(payload, adopted))
+    assert [e["valid"] for e in agents_entered(adopted)] == [True]
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        "Planned it.\nRECORD: .plumbline/runs/r1/plan.json",
+        "Planned it.\n\n**RECORD:** `.plumbline/runs/r1/plan.json`\n\n",
+        "Planned it.\n```\nRECORD: .plumbline/runs/r1/plan.json\n```",
+    ],
+)
+def test_the_record_line_of_a_handback_message_is_read_like_the_one_of_a_final_message(stop_with, adopted, report):
+    put(adopted, "plan", spec_record())
+    let_go(stop_with([handback_record(report)]))
+    assert [e["valid"] for e in agents_entered(adopted)] == [True]
+
+
+def test_a_refused_handback_followed_by_a_text_report_is_read_from_the_final_message(stop_with, adopted):
+    put(adopted, "plan", spec_record())
+    named_elsewhere = "Planned it.\nRECORD: .plumbline/runs/r1/build.json"  # the handback names a place no planner writes: the final message comes first
+    records = [handback_record(named_elsewhere), refusal_record(text=HANDBACK_REFUSED), text_record(PLAN_LINE)]
+    let_go(stop_with(records, message=PLAN_LINE))
+    [entry] = agents_entered(adopted)
+    assert (entry["valid"], entry["record"]) == (True, ".plumbline/runs/r1/plan.json")
+
+
+def test_a_refused_handback_followed_by_the_same_report_as_text_is_let_go_once(stop_with, adopted):
+    put(adopted, "plan", spec_record())
+    records = [handback_record(PLAN_LINE), refusal_record(text=HANDBACK_REFUSED), text_record(PLAN_LINE)]
+    for _ in range(4):
+        let_go(stop_with(records, message=PLAN_LINE))
+    assert len(agents_entered(adopted)) == 1
+
+
+@pytest.mark.parametrize("final", [PLAN_LINE, ""], ids=["a text report ends each stop", "the handback calls are all there is"])
+def test_the_real_sequence_a_refused_handback_four_stops_one_entry_round_1_and_a_plan_gate_that_passes(stop_with, run_cli, adopted, final):
+    put(adopted, "plan", spec_record())
+    nudge = {"type": "user", "isSidechain": True, "message": {"role": "user", "content": "[handback-send-enforce] Your report has not been delivered."}}
+    records = []
+    for call in range(1, 5):  # the agent called SubagentHandback and was refused; the runtime nudged it; it stopped again
+        records += [handback_record(PLAN_LINE, f"toolu_{call}"), refusal_record(f"toolu_{call}", HANDBACK_REFUSED), nudge]
+        let_go(stop_with(records, message=final))
+    [entry] = agents_entered(adopted)
+    assert entry["valid"] is True and entry["record"] == ".plumbline/runs/r1/plan.json"
+    result = run_cli("gate", RUN, "plan", cwd=adopted)
+    assert result.returncode == 0 and "round 1 of 2" in result.stdout, result.stdout
+
+
+def test_only_the_last_handback_call_counts(stop_with, adopted):
+    put(adopted, "plan", spec_record())
+    wrong = handback_record("Planned it.\nRECORD: .plumbline/runs/r1/build.json", "toolu_1")
+    right = handback_record(PLAN_LINE, "toolu_2")
+    assert "a planner writes its record at" in blocked(stop_with([right, wrong], agent_id="right-then-wrong"))
+    let_go(stop_with([wrong, refusal_record("toolu_1"), right], agent_id="wrong-then-right"))
+    assert [e["agent_id"] for e in agents_entered(adopted)] == ["wrong-then-right"]
+    both = {**right, "message": {**right["message"], "content": [*wrong["message"]["content"], *right["message"]["content"]]}}  # two calls in one message
+    let_go(stop_with([both], agent_id="two-in-one"))
+    assert [e["agent_id"] for e in agents_entered(adopted)] == ["wrong-then-right", "two-in-one"]
+
+
+def test_the_handback_is_a_fallback_only_a_line_in_the_final_message_that_is_wrong_is_not_mended_by_it(stop_with, adopted):
+    put(adopted, "plan", spec_record())
+    reason = blocked(stop_with([handback_record(PLAN_LINE)], message="Done.\nRECORD: .plumbline/runs/r1/missing.json"))
+    assert "missing.json: no such file" in reason
+    assert agents_entered(adopted) == []
+
+
+def test_a_handback_without_a_record_line_blocks_and_the_message_says_where_the_line_goes(stop_with, adopted):
+    put(adopted, "plan", spec_record())
+    reason = blocked(stop_with([handback_record("Planned it, the spec is written.")], message="Done."))
+    assert "your report must end with a line of the form `RECORD: <path>`" in reason
+    assert "in the message of your SubagentHandback call" in reason and "in your final message when that call is refused" in reason
+    assert "not only of a hand-back report" not in reason
+    assert agents_entered(adopted) == []
+
+
+def test_the_other_block_messages_ask_for_the_line_at_the_end_of_the_report(run_stop, adopted):
+    put(adopted, "plan", {"goal": ""})
+    assert "end your report with the line `RECORD: <path>` again" in blocked(stop(run_stop, adopted, agent_id="invalid"))
+    assert "end your report with the line `RECORD: <path>` again" in blocked(stop(run_stop, adopted, "RECORD: README.md", agent_id="unusable"))
+    put(adopted, "build", build_note_record())
+    assert "end your report with the line `RECORD: <path>` again" in blocked(stop(run_stop, adopted, "RECORD: .plumbline/runs/r1/build.json", agent_id="misplaced"))
+
+
+def test_a_handback_that_is_far_from_the_end_of_a_big_transcript_is_still_found_by_reading_from_the_end(stop_with, adopted):
+    put(adopted, "plan", spec_record())
+    filler = [text_record("x" * 4000) for _ in range(700)]  # about 2.8 MB, more than is read
+    let_go(stop_with([*filler, handback_record(PLAN_LINE), refusal_record()], agent_id="tail"))
+    assert [e["agent_id"] for e in agents_entered(adopted)] == ["tail"]
+
+
+def test_a_handback_before_more_than_the_cap_is_left_unread_and_the_stop_is_blocked(stop_with, adopted):
+    put(adopted, "plan", spec_record())
+    filler = [text_record("x" * 4000) for _ in range(700)]
+    assert "must end with a line of the form" in blocked(stop_with([handback_record(PLAN_LINE), *filler], agent_id="buried"))
+
+
+# --- reading the transcript defensively, in process
+
+
+def lines_of(tmp_path, *lines, name="agent.jsonl", raw=None):
+    path = tmp_path / name
+    path.write_bytes(raw if raw is not None else "".join(line if isinstance(line, str) else json.dumps(line) for line in lines).encode("utf-8"))
+    return path
+
+
+def as_lines(*records):
+    return [(record if isinstance(record, str) else json.dumps(record)) + "\n" for record in records]
+
+
+GOOD = "Done.\nRECORD: a/b.json"
+
+
+def test_a_transcript_that_is_no_readable_file_names_nothing(tmp_path):
+    (tmp_path / "a-directory").mkdir()
+    for named in (None, 5, "", [], str(tmp_path / "missing.jsonl"), str(tmp_path / "a-directory"), "nul\0byte"):
+        assert subagent_stop.handback_record_line(named) is None, named
+        assert subagent_stop.transcript_tail(named) == [], named
+
+
+def test_the_message_of_the_last_call_is_what_is_read_and_a_last_call_without_a_message_names_nothing(tmp_path):
+    good = handback_record(GOOD)
+    for last in ({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "SubagentHandback", "input": {}}]}},
+                 {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "SubagentHandback", "input": {"message": ["RECORD: a/b.json"]}}]}},
+                 {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "SubagentHandback", "input": "RECORD: a/b.json"}]}},
+                 {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "SubagentHandback"}]}}):
+        path = lines_of(tmp_path, *as_lines(good, last))
+        assert subagent_stop.handback_record_line(path) is None  # the earlier call is not the last one
+    assert subagent_stop.handback_record_line(lines_of(tmp_path, *as_lines(handback_record("no line"), good))) == "a/b.json"
+
+
+def test_only_a_tool_use_of_subagent_handback_counts(tmp_path):
+    other_tool = {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Write", "input": {"message": GOOD}}]}}
+    look_alike = {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "SubagentHandbackLater", "input": {"message": GOOD}}]}}
+    as_text = {"type": "assistant", "message": {"content": [{"type": "text", "text": f"SubagentHandback message: {GOOD}"}]}}
+    as_result = {"type": "user", "message": {"content": [{"type": "tool_result", "name": "SubagentHandback", "content": GOOD}]}}
+    mention = {"type": "user", "message": {"role": "user", "content": f"[handback-send-enforce] call SubagentHandback: {GOOD}"}}
+    for record in (other_tool, look_alike, as_text, as_result, mention):
+        assert subagent_stop.handback_record_line(lines_of(tmp_path, *as_lines(record))) is None, record
+    assert subagent_stop.handback_record_line(lines_of(tmp_path, *as_lines(handback_record(GOOD), other_tool, look_alike, as_text, as_result, mention))) == "a/b.json"
+
+
+def test_a_call_is_found_wherever_its_record_keeps_the_content(tmp_path):
+    block = {"type": "tool_use", "id": "t", "name": "SubagentHandback", "input": {"message": GOOD}}
+    shapes = [
+        {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "hm"}, block]}},
+        {"type": "assistant", "content": [block]},  # no wrapping message
+        {"message": {"content": [block]}},  # no type
+    ]
+    for record in shapes:
+        assert subagent_stop.handback_record_line(lines_of(tmp_path, *as_lines(record))) == "a/b.json", record
+    for record in ({"message": {"content": "SubagentHandback"}}, {"message": "SubagentHandback"}, {"content": [None, 5, "SubagentHandback", [block]]}, [block], "SubagentHandback"):
+        assert subagent_stop.handback_record_line(lines_of(tmp_path, *as_lines(record))) is None, record
+
+
+def test_torn_blank_and_undecodable_lines_are_skipped_not_fatal(tmp_path):
+    deep = '{"x": ' + "[" * 60000 + '"SubagentHandback"' + "]" * 60000 + "}"  # deeper than json.loads follows: it raises RecursionError
+    body = "\n".join(["{torn SubagentHandback", "", "   ", deep, json.dumps(handback_record(GOOD)), "not json SubagentHandback", '{"a": 1}', "[1, 2]", "null"]) + "\n"
+    assert subagent_stop.handback_record_line(lines_of(tmp_path, raw=body.encode("utf-8"))) == "a/b.json"
+    undecodable = b"\xff\xfe SubagentHandback \x80\n" + json.dumps(handback_record(GOOD)).encode("utf-8") + b"\n\xc3\n"
+    assert subagent_stop.handback_record_line(lines_of(tmp_path, raw=undecodable)) == "a/b.json"
+    assert subagent_stop.handback_record_line(lines_of(tmp_path, raw=b"")) is None
+    assert subagent_stop.handback_record_line(lines_of(tmp_path, raw=b"\n\n")) is None
+
+
+def test_only_the_last_bytes_up_to_the_cap_are_read(tmp_path, monkeypatch):
+    last = json.dumps(handback_record(GOOD)) + "\n"
+    early = json.dumps(handback_record("early\nRECORD: early.json")) + "\n"
+    filler = json.dumps(text_record("f" * 300)) + "\n"
+    size = len(last.encode("utf-8"))
+    path = lines_of(tmp_path, early, filler, filler, last)
+    monkeypatch.setattr(subagent_stop, "MAX_TRANSCRIPT_BYTES", size)  # the last line, exactly: it begins where the window does
+    assert subagent_stop.handback_record_line(path) == "a/b.json"
+    monkeypatch.setattr(subagent_stop, "MAX_TRANSCRIPT_BYTES", size - 1)  # one byte short: the window begins inside the last line, which is torn
+    assert subagent_stop.handback_record_line(path) is None
+    monkeypatch.setattr(subagent_stop, "MAX_TRANSCRIPT_BYTES", size + 10)  # the window begins inside the line before it
+    assert subagent_stop.handback_record_line(path) == "a/b.json"
+    monkeypatch.setattr(subagent_stop, "MAX_TRANSCRIPT_BYTES", 3 * size)
+    assert subagent_stop.handback_record_line(path) == "a/b.json"
+    only_early = lines_of(tmp_path, early, filler, filler, filler, name="early.jsonl")
+    assert subagent_stop.handback_record_line(only_early) is None  # the early call is beyond the window ...
+    monkeypatch.setattr(subagent_stop, "MAX_TRANSCRIPT_BYTES", 1 << 20)
+    assert subagent_stop.handback_record_line(only_early) == "early.json"  # ... and inside a bigger one
+    assert subagent_stop.handback_record_line(lines_of(tmp_path, last.rstrip("\n"), name="no-newline.jsonl")) == "a/b.json"
+    assert subagent_stop.transcript_tail(lines_of(tmp_path, "a\nb\nc\n", name="small.jsonl")) == ["a", "b", "c", ""]  # a file inside the cap is read whole
+
+
+def test_a_line_the_cut_tears_is_left_out_though_its_tail_is_a_record(tmp_path, monkeypatch):
+    whole = json.dumps(handback_record("torn\nRECORD: torn.json"))
+    torn = "x" * 40 + whole + "\n"  # no record as it stands; its tail, from the 41st byte, is one
+    after = json.dumps(text_record("after")) + "\n"
+    monkeypatch.setattr(subagent_stop, "MAX_TRANSCRIPT_BYTES", len(whole) + 1 + len(after))  # the window begins exactly at the tail of `torn`
+    path = lines_of(tmp_path, "y\n", torn, after)
+    assert [line for line in subagent_stop.transcript_tail(path) if "torn.json" in line] == []
+    assert subagent_stop.handback_record_line(path) is None
+    monkeypatch.setattr(subagent_stop, "MAX_TRANSCRIPT_BYTES", len(whole) + 1 + len(after) + 41)  # the whole of `torn` is in it, and is no JSON
+    assert subagent_stop.handback_record_line(path) is None
+    assert subagent_stop.handback_record_line(lines_of(tmp_path, whole + "\n", after, name="whole.jsonl")) == "torn.json"

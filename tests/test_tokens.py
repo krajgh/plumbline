@@ -141,6 +141,15 @@ def test_a_transcript_that_cannot_be_found_is_a_note_not_a_failure(run_cli, adop
     assert "note: no transcript found for agent gone (plumbline:builder, stage build)" in result.stderr
 
 
+def test_a_missing_transcript_is_noted_once_for_an_agent_that_has_several_ledger_rows(run_cli, adopted):
+    rows = [agent_row("gone", transcript="/nowhere/agent-gone.jsonl")] * 4 + [agent_row("gone-too", transcript="/nowhere/agent-gone-too.jsonl")]
+    write_ledger(adopted, rows)
+    result = run_cli("tokens", RUN, cwd=adopted)
+    assert result.returncode == 0
+    assert result.stderr.count("no transcript found for agent gone (plumbline:builder, stage build)") == 1
+    assert result.stderr.count("no transcript found for agent gone-too (") == 1
+
+
 def test_gate_rows_and_other_entries_of_the_ledger_are_not_agents(run_cli, adopted, transcripts):
     first, _ = transcripts
     write_ledger(adopted, [{"kind": "gate", "stage": "verify", "gate": "verify_green", "passed": True}, agent_row("a1", transcript=str(first))])

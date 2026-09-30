@@ -43,7 +43,7 @@ def frontmatter(path):
 def test_plugin_json_says_what_the_task_specified():
     plugin = load(PLUGIN)
     assert plugin["name"] == "plumbline"
-    assert plugin["version"] == "0.4.0"
+    assert plugin["version"] == "0.4.1"
     assert plugin["author"] == {"name": "krajgh", "url": "https://github.com/krajgh"}
     assert plugin["homepage"] == "https://github.com/krajgh/plumbline"
     assert plugin["repository"] == "https://github.com/krajgh/plumbline"

@@ -9,7 +9,7 @@ import plumbline as pl
 from helpers import commit_all, git, write
 from rundata import (
     CONTROLLED, HAIKU, RUN, SONNET, adopt, agent_row, assistant_record, begin, build_note_record, change_of, gate_stages, intake_record, ledger, put, read,
-    review_record, run_path, verify_record, write_code_s_run, write_docs_run, write_ledger, write_transcript,
+    review_record, run_path, spec_record, verify_record, write_code_s_run, write_docs_run, write_ledger, write_transcript,
 )
 
 
@@ -188,6 +188,29 @@ def test_rounds_come_from_the_review_record_and_from_the_agents_the_ledger_saw(r
     assert result.returncode == 0, result.stdout
     rounds = {s["id"]: s["rounds"] for s in read(repo, "reduce")["stages"]}
     assert rounds == {"intake": 1, "plan": 1, "tests": 1, "build": 2, "verify": 1, "review": 2, "reduce": 1}
+
+
+def test_an_agent_that_stopped_several_times_is_one_round_in_the_pass_record_and_two_agents_are_two(run_cli, repo):
+    adopt(repo)
+    write_code_s_run(repo)
+    [planner_stop] = [e for e in ledger(repo) if e["kind"] == "agent" and e["stage"] == "plan"]
+    write_ledger(repo, [{k: v for k, v in planner_stop.items() if k != "at"}] * 3)  # the same agent, entered three times more (as 0.4.0 did for a report the harness asked for again)
+    put(repo, "build", build_note_record())  # the builder ran twice: two agents
+    result = do_pass(run_cli, repo)
+    assert result.returncode == 0, result.stdout
+    rounds = {s["id"]: s["rounds"] for s in read(repo, "reduce")["stages"]}
+    assert rounds["plan"] == 1 and rounds["build"] == 2 and rounds["tests"] == 1
+
+
+def test_the_pass_record_counts_the_agents_of_the_whole_run_though_the_gate_passed_in_between(run_cli, repo):
+    adopt(repo)
+    write_code_s_run(repo)
+    put(repo, "plan", spec_record())  # a second planner
+    gated = run_cli("gate", RUN, "plan", cwd=repo)
+    assert gated.returncode == 0 and "round 2 of 2" in gated.stdout  # both planners are in the count of `gate`, and its gate passes: the next count starts again
+    result = do_pass(run_cli, repo)
+    assert result.returncode == 0, result.stdout
+    assert {s["id"]: s["rounds"] for s in read(repo, "reduce")["stages"]}["plan"] == 2
 
 
 def test_a_row_note_travels_into_the_pass_record_with_the_declared_and_the_measured_row(run_cli, repo):

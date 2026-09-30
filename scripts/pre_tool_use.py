@@ -83,6 +83,7 @@ MAX_LISTED = 8
 MAX_DIRS = 64  # the directories one command line may run in: more are not followed
 MAX_ANCHORS = 12  # the places an agent's call is looked up from, to find its repository
 PASS_READ_SECONDS = 10  # how long the pass records of a repository may take to answer (a hook has 30 s)
+NO_RECORD = "no pass or override record"  # the reason plumbline.coverage gives for a commit that has neither record
 
 # Written so that this file does not itself contain an absolute home path.
 HOME_PATH = re.compile(r"(?<![\w./~-])/(?:home|Users)/[A-Za-z0-9_][A-Za-z0-9._-]*/")
@@ -1144,14 +1145,15 @@ def commit_problems(pl, root: Path, scope: str, base: str | None = None) -> list
 
 def _uncovered_message(what: str, label: str, sha: str, detail: str, action: Action) -> str:
     opened = "opened for review" if action.kind == "pr-create" else "pushed"
+    why = "" if detail == NO_RECORD else f" ({detail})"  # the message opens with those words: a detail that only repeats them is left out
     if label == "HEAD":
         return (
-            f"plumbline: HEAD {sha[:7]} has no pass or override record, so it is not {opened} ({detail}). "
+            f"plumbline: HEAD {sha[:7]} has {NO_RECORD}, so it is not {opened}{why}. "
             f"Run the pipeline (/plumbline:run), commit, and record the pass; or, if the builder decides to skip the pipeline, /plumbline:override. "
             f"Then {what} again."
         )
     return (
-        f"plumbline: {label} ({sha[:7]}) has no pass or override record, so it is not {opened} ({detail}). "
+        f"plumbline: {label} ({sha[:7]}) has {NO_RECORD}, so it is not {opened}{why}. "
         f"Check {label} out and run the pipeline there (/plumbline:run), commit, and record the pass; or, if the builder decides to skip the pipeline, /plumbline:override. "
         f"Then {what} again."
     )

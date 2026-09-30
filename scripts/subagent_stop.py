@@ -3,7 +3,7 @@
 
 Reads the hook's JSON on stdin. It acts only for a plumbline agent (agent type
 `plumbline:<name>`) inside a repository that has adopted plumbline. Such an agent
-must end its final reply with a line `RECORD: <path>`, naming a JSON record that
+must end its report with a line `RECORD: <path>`, naming a JSON record that
 validates against the record type of that agent (a planner writes a spec, a
 prosecutor a findings_record, and so on) and that sits where that agent's records
 belong: in the run in progress (the one .plumbline/runs/ACTIVE names, else the
@@ -11,13 +11,19 @@ newest run), at the path of a stage of the run's row that the agent's role serve
 (`<stage>.json`), or, for the three review roles, at
 `<review stage>/round-<n>/<name>.json`.
 
-Until it does, the stop is blocked, at most 3 times, counted per agent id. Then the
-agent is let go and the record is marked invalid in the ledger. Every stop that is let
-go is entered in the run's ledger.jsonl: agent id, type, stage, record and its
-sha256 at that moment, whether it is valid, and where the agent's transcript is
+The report is the agent's final message. When that message has no RECORD line, the
+hook looks for the line in the report the agent handed back through SubagentHandback:
+the `message` of the last such call in the agent's transcript (`agent_transcript_path`).
+
+Until the agent names a good record, the stop is blocked, at most 3 times, counted per
+agent id. Then the agent is let go and the record is marked invalid in the ledger. Every
+stop that is let go is entered in the run's ledger.jsonl: agent id, type, stage, record
+and its sha256 at that moment, whether it is valid, and where the agent's transcript is
 (`tokens` reads it). The sha256 is what lets the gates tell later that the record is
-still the one the agent left. An agent of an unknown `plumbline:` role is let go, and
-entered as invalid ("unknown plumbline role").
+still the one the agent left. A stop that leaves what the agent's latest entry already
+holds (the same record, hash and validity) adds no entry: an agent that the harness asks
+again for its report stops again, and is still one agent, in one round. An agent of an
+unknown `plumbline:` role is let go, and entered as invalid ("unknown plumbline role").
 
 A block is delivered in every way Claude Code accepts, because the hook is
 registered with `|| true`, which turns exit status 2 into 0: the reason goes to
@@ -30,6 +36,7 @@ agent cannot mend (the configuration is invalid, the run has no usable intake re
 does not hold it up either: the stop is let go and the record entered as invalid.
 """
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -40,6 +47,8 @@ MAX_BLOCKS = 3
 MAX_LISTED = 20
 RECORD_LINE = re.compile(r"^RECORD:\s*(\S.*?)\s*$")
 CODE_FENCE = re.compile(r"^(`{3,}|~{3,})[\w-]*$")
+HANDBACK_TOOL = "SubagentHandback"  # the tool through which the harness has an agent deliver its report
+MAX_TRANSCRIPT_BYTES = 2 << 20  # how much of the end of an agent's transcript is read for that report
 
 
 def record_line(text) -> str | None:
@@ -55,6 +64,60 @@ def record_line(text) -> str | None:
     if not match:
         return None
     return match.group(1).strip("`'\"<> ") or None
+
+
+def transcript_tail(named) -> list[str]:
+    """The lines of the last MAX_TRANSCRIPT_BYTES bytes of the transcript file `named`, oldest first. What is no readable regular
+    file (a missing path, a directory, a pipe, a value that is no path) gives no lines."""
+    try:
+        path = Path(named)
+        if not path.is_file():
+            return []
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            start = max(0, size - MAX_TRANSCRIPT_BYTES)
+            handle.seek(max(0, start - 1))  # one byte early: that byte says whether a line begins exactly at `start`
+            data = handle.read(MAX_TRANSCRIPT_BYTES + 1)
+    except (OSError, TypeError, ValueError):
+        return []
+    lines = data.decode("utf-8", "replace").split("\n")
+    return lines[1:] if start else lines  # a cut may have torn the first line, which is left out
+
+
+def content_blocks(record) -> list:
+    """The content blocks of a transcript record: those of its message, or, without one, of the record itself."""
+    if not isinstance(record, dict):
+        return []
+    message = record.get("message")
+    content = (message if isinstance(message, dict) else record).get("content")
+    return content if isinstance(content, list) else []
+
+
+def handback_message(named) -> str | None:
+    """The `message` of the last SubagentHandback call in the transcript `named`, read from its end; None when there is no
+    such call or it carries no text."""
+    for line in reversed(transcript_tail(named)):
+        if HANDBACK_TOOL not in line:  # tool results and prose fill most lines: only a line that names the tool is parsed
+            continue
+        try:
+            record = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        for block in reversed(content_blocks(record)):
+            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == HANDBACK_TOOL:
+                given = block.get("input")
+                message = given.get("message") if isinstance(given, dict) else None
+                return message if isinstance(message, str) else None
+    return None
+
+
+def handback_record_line(named) -> str | None:
+    """The path on the last line of the report that the agent handed back through SubagentHandback, read from its transcript.
+    The transcript is a fallback, so one that is missing, torn or unlike what is expected names nothing and raises nothing."""
+    try:
+        return record_line(handback_message(named))
+    except Exception:
+        return None
 
 
 def placement_problems(pl, root: Path, run_id: str | None, parts: tuple[str, ...], role: str) -> tuple[list[str], list[str], str | None]:
@@ -128,19 +191,20 @@ def block_message(record_type: str, named, problems: list[str], attempt: int, st
     many = f"{len(problems)} problem{'' if len(problems) == 1 else 's'}"
     if named is None:
         head = (
-            "plumbline: your final reply must end with a line of the form `RECORD: <path>`, "
+            "plumbline: your report must end with a line of the form `RECORD: <path>`, "
             f"naming the {record_type} record you wrote under .plumbline/runs/<run-id>/. "
-            "That line must be the last line of your final message itself, not only of a hand-back report."
+            "Put that line last in the whole report: in the message of your SubagentHandback call when the harness asks for "
+            "your report through it, and in your final message when that call is refused."
         )
     elif state == "misplaced":
         head = (
             f"plumbline: the record you named is a valid {record_type}, but it is not where this agent's record belongs ({many}). "
-            "Write it there, then end your final reply with the line `RECORD: <path>` again."
+            "Write it there, then end your report with the line `RECORD: <path>` again."
         )
     elif state == "unusable":
-        head = f"plumbline: the path you named is no record of a run ({many}). Write your record where it belongs, then end your final reply with the line `RECORD: <path>` again."
+        head = f"plumbline: the path you named is no record of a run ({many}). Write your record where it belongs, then end your report with the line `RECORD: <path>` again."
     else:
-        head = f"plumbline: the record you named is not a valid {record_type} ({many}). Fix the file, then end your final reply with the line `RECORD: <path>` again."
+        head = f"plumbline: the record you named is not a valid {record_type} ({many}). Fix the file, then end your report with the line `RECORD: <path>` again."
     lines = [head] + [f"- {p}" for p in problems[:MAX_LISTED]]
     if len(problems) > MAX_LISTED:
         lines.append(f"- and {len(problems) - MAX_LISTED} more")
@@ -168,6 +232,19 @@ def ledger_entry(data: dict, agent_type: str, record_type, valid: bool, blocks: 
     return entry
 
 
+def enter(pl, root: Path, run_id: str, entry: dict) -> None:
+    """Append a stop to the run's ledger, unless the agent's latest entry holds what this stop would add: the same record with
+    the same hash and validity. An agent that stops again with the record it left (the harness asks it again for a report it
+    has not delivered) stays one entry, and so one round; one that changes its record, or whether it is valid, is entered
+    again. A stop without an agent id cannot be matched to an earlier one, and is always appended."""
+    agent_id = entry.get("agent_id")
+    if isinstance(agent_id, str) and agent_id:
+        last = pl.latest_entry(pl.read_ledger(root, run_id), "agent", agent_id=agent_id)
+        if last is not None and all(last.get(key) == entry.get(key) for key in ("record", "record_sha256", "valid")):
+            return
+    pl.append_ledger(root, run_id, entry)
+
+
 def decide(data) -> str | None:
     """The reason to block this stop, or None to let the agent go. Writes the
     ledger entry and keeps the count of blocks, as described above."""
@@ -189,12 +266,14 @@ def decide(data) -> str | None:
     if record_type is None:  # a plumbline agent this plugin does not know: let it go, and say so in the run's ledger
         active = pl.active_run_id(root)
         if active is not None:
-            pl.append_ledger(root, active, ledger_entry(data, agent_type, None, False, 0, errors=["unknown plumbline role"]))
+            enter(pl, root, active, ledger_entry(data, agent_type, None, False, 0, errors=["unknown plumbline role"]))
         return None
 
     counter = counter_file(root, data.get("agent_id"))
     blocks = read_count(counter)  # counted per agent id: an agent's stops add up, whatever stop_hook_active says
     named = record_line(data.get("last_assistant_message"))
+    if named is None:  # the report may have gone through SubagentHandback: its message is the second place to look
+        named = handback_record_line(data.get("agent_transcript_path"))
     if named is None:
         found = {"problems": ["no RECORD line at the end of the final reply"], "unmendable": [], "stage": None, "where": None, "sha256": None, "state": "unusable"}
     else:
@@ -210,8 +289,8 @@ def decide(data) -> str | None:
     errors = problems + found["unmendable"]
     run_id = pl.active_run_id(root)  # the stop belongs to the run in progress, whatever the agent named
     if run_id is not None:
-        pl.append_ledger(
-            root, run_id,
+        enter(
+            pl, root, run_id,
             ledger_entry(data, agent_type, record_type, not errors, blocks, found["stage"], found["where"], found["sha256"], errors),
         )
     return None

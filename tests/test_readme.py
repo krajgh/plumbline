@@ -13,6 +13,7 @@ import pytest
 import plumbline as pl
 import pre_tool_use as pre
 import session_start
+import subagent_stop
 from helpers import CLI, DEFAULT_TOML, REPO, clean_env, commit_all, git, write
 from hookdata import add_origin, bash_payload, start_run, stop_payload, tool_payload
 from rundata import CONTROLLED, RUN, adopt, adopt_base, build_note_record, genuine_pass, put, put_part, spec_record, verify_record
@@ -181,7 +182,7 @@ def test_a_named_group_is_valid_in_the_node_that_runs_ponytails_hook_and_is_not_
 def test_the_status_line_gives_the_manifests_version_and_the_phase():
     status = section("Status").strip()
     version = json.loads((REPO / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))["version"]
-    assert version == "0.4.0" and status.startswith(f"Version {version}.")
+    assert version == "0.4.1" and status.startswith(f"Version {version}.")
     assert "Phase 2, agents and enforcement, is done" in status
     assert "The next phase is phase 3, light testing in a real session" in status
     assert "Phase 2b of 5" not in README
@@ -282,6 +283,33 @@ def test_a_record_no_agent_left_has_no_ledger_entry_and_its_gate_fails_as_the_pr
     (repo / ".plumbline" / "runs" / RUN / "plan.json").write_text((repo / ".plumbline" / "runs" / RUN / "plan.json").read_text() + " ")
     edited = run_cli("gate", RUN, "plan", cwd=repo)
     assert edited.returncode == 1 and "changed after plumbline:planner stopped" in edited.stdout
+
+
+def test_the_readme_counts_a_stages_rounds_by_its_agents_and_the_code_does(repo, run_cli, run_stop):
+    text = section("Runs, gates and the pass record")
+    rounds = re.search(r"\*\*Rounds\.\*\*(.*?)\n\n", text, re.S).group(1)
+    assert "the number of distinct agents (by `agent_id`; an entry without one counts once)" in rounds
+    assert "so an agent that stops again for the same report is still one round" in rounds
+    assert "The `rounds` of a stage in the pass record count its distinct agents the same way, over the whole run" in rounds
+    assert "A stop that leaves the `record`, `record_sha256` and `valid` that the agent's latest entry already holds is not entered again" in text
+    adopt_base(repo, commands={"test": CONTROLLED})
+    assert run_cli("plan", "--run-id", RUN, "--intent", "feature", "--row", "code.S", cwd=repo).returncode == 0
+    put(repo, "plan", spec_record(), agent=False)
+    for _ in range(4):  # one planner, stopping four times with the same plan
+        stop = run_stop(stop_payload(repo, "plumbline:planner", "planned\nRECORD: .plumbline/runs/r1/plan.json", agent_id="p-1"), repo)
+        assert stop.returncode == 0 and stop.stdout == ""
+    assert len([e for e in pl.read_ledger(repo, RUN) if e["kind"] == "agent"]) == 1
+    gated = run_cli("gate", RUN, "plan", cwd=repo)
+    assert gated.returncode == 0 and "round 1 of 2" in gated.stdout, gated.stdout
+
+
+def test_the_readme_says_where_the_hook_looks_for_a_report_and_the_hook_looks_there():
+    hook = section("SubagentStop", 3)
+    assert "The report is its final message; when that message has no such line, the hook reads the `message` of the agent's last SubagentHandback call" in hook
+    assert "from the end of its transcript, at most 2 MiB of it" in hook and subagent_stop.MAX_TRANSCRIPT_BYTES == 2 << 20
+    assert subagent_stop.HANDBACK_TOOL == "SubagentHandback"
+    assert "unless the agent's latest entry holds the same record, sha256 and validity already" in hook
+    assert "each ending its report, its final message or the message of its SubagentHandback call, with `RECORD: <path>`" in section("Agents")
 
 
 # ------------------------------------------------------------------------- the hooks: names, lists and quoted words

@@ -74,6 +74,21 @@ def test_every_prompt_tells_the_agent_to_end_with_a_record_line(name):
     assert body.rstrip().endswith("```")  # the record line is the last thing the prompt asks for
 
 
+HANDBACK = (
+    "When the harness asks for your report through SubagentHandback, the whole report goes in that call's `message`, with the RECORD line last. "
+    "If that call is refused, the same report is your final message."
+)
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_every_prompt_says_where_the_report_goes_when_the_harness_asks_for_it_through_subagent_handback(name):
+    _, body = agent(name)
+    finish = body.split("## Finish", 1)[1]
+    assert HANDBACK in finish and body.count("SubagentHandback") == 1  # one place, two sentences
+    assert finish.index(HANDBACK) < finish.index("End your final message with this line, last")  # the record line stays the last thing the prompt asks for
+    assert finish.rstrip().endswith("RECORD: <the path of your record>\n```")
+
+
 @pytest.mark.parametrize("name", NAMES)
 def test_every_prompt_names_the_schema_of_its_record_inside_the_plugin(name):
     _, body = agent(name)

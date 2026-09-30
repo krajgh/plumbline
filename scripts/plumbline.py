@@ -1811,8 +1811,9 @@ def render_record(type_name: str, data) -> str:
 # A run is a directory, .plumbline/runs/<run-id>/. It holds one <stage-id>.json
 # per stage, the per-agent records of a review unit under
 # <stage-id>/round-<n>/, and ledger.jsonl, which only ever grows: a line for
-# each plumbline agent that stopped (written by the SubagentStop hook) and a
-# line for each gate evaluation (written by `gate` and `pass`).
+# each plumbline agent that stopped, and again each time its record or the
+# record's validity changed (written by the SubagentStop hook), and a line for
+# each gate evaluation (written by `gate` and `pass`).
 
 
 def utc_now() -> str:
@@ -2603,22 +2604,43 @@ def measure_stage(project: Project, run: Run | None, run_id: str, stage: dict) -
 
 # ---- rounds
 
+def count_agents(entries: list[dict]) -> int:
+    """How many agents these ledger entries show. A round is an agent that ran, and one agent can stop more than once (the
+    harness asks it again for a report it has not delivered), so each agent id counts once however many entries it has. An
+    entry without an agent id counts on its own: nothing says it is an agent seen before."""
+    ids: set[str] = set()
+    anonymous = 0
+    for entry in entries:
+        agent_id = entry.get("agent_id")
+        if isinstance(agent_id, str) and agent_id:
+            ids.add(agent_id)
+        else:
+            anonymous += 1
+    return len(ids) + anonymous
+
+
+def stage_agents(ledger: list[dict], stage_id: str, since_gate_passed: bool = False) -> int:
+    """The number of distinct agents (see count_agents) the ledger shows for a stage: every one of them, or, with
+    `since_gate_passed`, those that stopped after the stage's gate last passed."""
+    entries: list[dict] = []
+    for entry in ledger:
+        if entry.get("stage") != stage_id:
+            continue
+        if entry.get("kind") == "agent":
+            entries.append(entry)
+        elif since_gate_passed and entry.get("kind") == "gate" and entry.get("passed") is True:
+            entries.clear()
+    return count_agents(entries)
+
+
 def stage_round(stage: dict, data: dict | None, ledger: list[dict]) -> tuple[int, int | None]:
     """(the round this stage is in, its max_rounds). A review stage is in the round its record says. An agent stage is in the
-    round of its agents that stopped since its gate last passed: a stage that passed and is run again (the review sent the
-    run back to build) starts counting again."""
+    round of its agents, counted once each (not once for each stop), that stopped since its gate last passed: a stage that
+    passed and is run again (the review sent the run back to build) starts counting again."""
     limit = stage.get("max_rounds")
     if stage.get("kind", "agent") == "review":
         return (data["round"] if data is not None else 0), limit
-    count = 0
-    for entry in ledger:
-        if entry.get("stage") != stage["id"]:
-            continue
-        if entry.get("kind") == "agent":
-            count += 1
-        elif entry.get("kind") == "gate" and entry.get("passed") is True:
-            count = 0
-    return count, limit
+    return stage_agents(ledger, stage["id"], since_gate_passed=True), limit
 
 
 # ---- evaluating a stage
@@ -3030,7 +3052,9 @@ def ledger_transcripts(root: Path, run_id: str) -> tuple[list[Path], list[str]]:
             candidates.append(Path(session).parent / session_id / "subagents" / f"agent-{agent_id}.jsonl")
         path = next((c for c in candidates if c.is_file()), None)
         if path is None:
-            notes.append(f"no transcript found for agent {entry.get('agent_id')} ({entry.get('agent_type')}, stage {entry.get('stage')})")
+            note = f"no transcript found for agent {entry.get('agent_id')} ({entry.get('agent_type')}, stage {entry.get('stage')})"
+            if note not in notes:  # an agent that stopped several times is one agent
+                notes.append(note)
         elif path not in found:
             found.append(path)
     return found, notes
@@ -3097,12 +3121,12 @@ def coverage(root: Path, head: str, project: Project) -> tuple[str | None, str]:
 
 
 def rounds_taken(stage: dict, record: dict | None, ledger: list[dict]) -> int:
-    """How many rounds a stage took: a review stage says so itself, an agent stage
-    is counted by the agents the ledger saw stop for it, a main-session stage took one."""
+    """How many rounds a stage took: a review stage says so itself, an agent stage is counted by the distinct agents the ledger
+    saw stop for it (an agent that stopped several times is one round; a stage that ran again after its gate passed adds its
+    new agents), a main-session stage took one."""
     if stage.get("kind", "agent") == "review" and record is not None:
         return record["round"]
-    agents = sum(1 for e in ledger if e.get("kind") == "agent" and e.get("stage") == stage["id"])
-    return agents or 1
+    return stage_agents(ledger, stage["id"]) or 1
 
 
 def stale_change_problems(project: Project, run: Run) -> list[str]:
