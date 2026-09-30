@@ -416,13 +416,16 @@ def tracked_or_untracked_text_files():
     return [REPO / name for name in listed.stdout.split("\0") if name]
 
 
+# Resolved when this module is imported, before the autouse fixture gives each test a throw-away HOME:
+# resolved inside the test, the maintainer's list would never be found.
+PRIVATE_WORDS = Path(os.environ.get("PLUMBLINE_PRIVATE_WORDS") or Path.home() / ".config" / "plumbline" / "private-words.txt")
+
 def test_nothing_names_a_private_project_person_or_path():
     # built from pieces so that this file does not contain what it forbids; a maintainer's own
     # private words, one per line, are read from a file outside the repository when it exists
     forbidden = ["/ho" + "me/", "@" + "gmail"]
-    private = Path(os.environ.get("PLUMBLINE_PRIVATE_WORDS") or Path.home() / ".config" / "plumbline" / "private-words.txt")
-    if private.is_file():
-        forbidden += [w.strip() for w in private.read_text(encoding="utf-8").splitlines() if w.strip() and not w.startswith("#")]
+    if PRIVATE_WORDS.is_file():
+        forbidden += [w.strip() for w in PRIVATE_WORDS.read_text(encoding="utf-8").splitlines() if w.strip() and not w.startswith("#")]
     offenders = []
     for path in tracked_or_untracked_text_files():
         if path.suffix in (".pyc",) or path == REPO / "tests" / "test_manifests.py":
