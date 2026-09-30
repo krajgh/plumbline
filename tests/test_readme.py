@@ -248,9 +248,15 @@ def test_a_named_group_is_valid_in_the_node_that_runs_ponytails_hook_and_is_not_
 def test_the_status_line_gives_the_manifests_version_and_the_phase():
     status = section("Status").strip()
     version = json.loads((REPO / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))["version"]
-    assert version == "0.4.1" and status.startswith(f"Version {version}.")
+    assert version == "0.4.2" and status.startswith(f"Version {version}.")
     assert "Phase 2, agents and enforcement, is done" in status
-    assert "The next phase is phase 3, light testing in a real session" in status
+    assert "Version 0.4.1 carried what the first real session found" in status and "Version 0.4.2 carries what the first real run found" in status
+    for fix in (
+        "stubs go in the run and not in the change", "says whether it comes from the agent's record or from the measured run", "a size problem names the files that contribute most",
+        "a matrix row can say where a failed gate goes", "launch agents without `model`", "`tokens` flags an output count that is a lower bound",
+    ):
+        assert fix in status, fix
+    assert "Phase 3, light testing in a real session, has begun" in status and "The next phase is phase 3" not in status
     assert "Phase 2b of 5" not in README
 
 
