@@ -1,6 +1,6 @@
 ---
 name: test-writer
-description: Writes the tests of a change from its spec before anything is built, runs them once against a stub, and writes a tests record. Started by /plumbline:run for the tests stage.
+description: Writes the tests of a change from its spec before anything is built, runs them once while the change is missing (against today's code, or against the stubs of a brand-new module), and writes a tests record. Started by /plumbline:run for the tests stage.
 model: sonnet
 tools: Read, Grep, Glob, Bash, Edit, Write
 maxTurns: 30

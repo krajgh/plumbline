@@ -311,6 +311,18 @@ def test_the_stubs_paragraph_says_where_stubs_go_and_that_the_change_never_holds
     assert [f["path"] for f in pl.classify(repo, pl.load_project(repo).pipeline, "main")["files"]] == ["src/feature.py"]
 
 
+def test_the_readme_names_the_stubs_dir_of_the_plan_and_the_files_written_of_the_tests_record_and_keeps_the_tip_out_of_the_skills_list():
+    from samples import sample
+
+    plan_row = next(line for line in README.splitlines() if line.startswith("| `plan "))
+    assert "and the run's `record_dir` and `stubs_dir`" in plan_row
+    assert {"record_dir", "stubs_dir"} <= set(pl.build_plan(PIPELINE, {**sample("change_class"), "row": "docs"}, "demo"))
+    records_row = next(line for line in README.splitlines() if line.startswith("| `tests_record` |"))
+    assert "`files_written` (the stubs too)" in records_row and "files_written" in pl.load_schema("tests_record")["properties"]
+    skills = section("Skills")
+    assert skills.index("**Relaying a request.**") > skills.index("- `/plumbline:init` and `/plumbline:subagent-discipline`, as before.")  # a paragraph of its own, after the list
+
+
 def test_a_measured_command_keeps_that_it_ran_and_not_what_it_printed_and_only_a_pytest_command_is_a_pytest_run(repo):
     result = pl.run_declared_command(repo, "echo assertion text; echo more >&2; exit 3", 5)
     assert set(result) == {"cmd", "exit_code", "seconds"} and result["exit_code"] == 3  # no output travels

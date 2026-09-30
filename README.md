@@ -99,7 +99,7 @@ After an intent is applied to a row, every required read must be produced by a s
 | --- | --- |
 | `validate-pipeline [FILE] [--project PATH]` | validates the default pipeline (or FILE), merged with the repository's `plumbline.toml` when `--project` is given |
 | `classify [--project PATH] [--base REF] [--intent ID] [--row ROW] [--out FILE]` | writes the `change_class` record: the diff from the merge base to the working tree, plus untracked files, and the intent. `--row` declares the row (for example `code.M`) when nothing has changed yet, so that there is nothing to measure |
-| `plan [--project PATH] [--base REF] [--run-id ID] [--intent ID [--spec FILE]] [--row ROW]` | prints, as JSON, the row with the intent applied and its ordered stages with resolved record paths. With `--intent` it starts the run, in a repository that has adopted plumbline: it writes the intake record (its hash goes into the ledger first), copies the supplied spec into the run as the plan record, and names the run in `.plumbline/runs/ACTIVE`. A run that has begun is never restarted |
+| `plan [--project PATH] [--base REF] [--run-id ID] [--intent ID [--spec FILE]] [--row ROW]` | prints, as JSON, the row with the intent applied, its ordered stages with resolved record paths, and the run's `record_dir` and `stubs_dir`. With `--intent` it starts the run, in a repository that has adopted plumbline: it writes the intake record (its hash goes into the ledger first), copies the supplied spec into the run as the plan record, and names the run in `.plumbline/runs/ACTIVE`. A run that has begun is never restarted |
 | `check-record TYPE FILE` | validates a record against its schema |
 | `render FILE [--type TYPE]` | prints a record as markdown |
 | `init [--project PATH] [--graft]` | adopts a repository |
@@ -145,7 +145,7 @@ Every stage writes one record. The schemas in `schemas/` use a small JSON Schema
 | --- | --- | --- |
 | `change_class` | intake | the changed files, their types, the size, the row, the intent, and the merge base every later check measures from |
 | `spec` | planner | goal, acceptance criteria, interfaces, test plan, risks, a split proposal at size L |
-| `tests_record` | test-writer | the tests (each named as the name appears in its file), which criteria they cover, the stub check |
+| `tests_record` | test-writer | the tests (each named as the name appears in its file), which criteria they cover, `files_written` (the stubs too), the stub check |
 | `build_note` | builder | files changed, criteria addressed, assumptions |
 | `verify_record` | verifier | commands run (each summary one short line, at most 80 characters, without the characters of source code), test counts, failing criteria, mechanical checks, and `diff_sha256` |
 | `review_record` | a review unit, by `merge-review` | findings (each marked `evidence_unverified` or not), defenses, survivors, `routes` (who each surviving finding goes to), gaps, and `diff_sha256` |
@@ -231,10 +231,11 @@ The prompts state what to do. The planner, test-writer and builder name ponytail
 ## Skills
 
 - `/plumbline:run` is the main session's recipe: continue the run in progress, or infer and confirm the intent and start a run with `plan --intent`; launch each stage's agent without `model`, because each is pinned in its definition (`run_in_background: false` when the next step needs its result); run the two measured gates with the Bash tool's largest timeout, or in the background; run a review round's prosecutors in the background together, then its defenders together, then the detective; evaluate the gates; loop to `on_fail` up to `max_rounds` (then stop and bring the findings and failing criteria to the builder); commit; `pass`; and report `status` and `tokens`. Records live in the main checkout, never in an agent's worktree.
-  **Relaying a request.** When you relay text from one session to another (a request written in a chat and pasted into the session that runs the pipeline), type a line of your own around the pasted text, such as `run this:` before it, or type `/plumbline:run` and paste only the request after it. Claude Code asks before it acts on a message that is only pasted text, and the pipeline does not start until you answer.
 - `/plumbline:override` (typed by the builder only: `disable-model-invocation: true`) records an override for HEAD. It runs `plumbline.py override` through skill shell injection with the builder's arguments as the reason (through a quoted here-document, so no character of the reason is read as shell), and the injection does not pass through PreToolUse. A Bash command that runs `plumbline.py override` is denied to every agent and to the main session, wherever the repository has adopted plumbline.
 - `/plumbline:status` shows a run (the one in progress), its stages and gates, and whether HEAD is covered.
 - `/plumbline:init` and `/plumbline:subagent-discipline`, as before.
+
+**Relaying a request.** When you relay text from one session to another (a request written in a chat and pasted into the session that runs the pipeline), type a line of your own around the pasted text, such as `run this:` before it, or type `/plumbline:run` and paste only the request after it. Claude Code asks before it acts on a message that is only pasted text, and the pipeline does not start until you answer.
 
 ## Hooks
 
