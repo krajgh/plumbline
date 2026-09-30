@@ -71,7 +71,7 @@ If an agent comes back marked partial (it ran out of turns), its stage was too b
 
 ## 5. Review units
 
-A stage with `kind: review` runs one round at a time, `round-<n>` starting at 1. Its agents write under `.plumbline/runs/<run_id>/<stage id>/round-<n>/`.
+A stage with `kind: review` runs one round at a time, `round-<n>` starting at 1. Its agents write under `.plumbline/runs/<run_id>/<stage id>/round-<n>/`, and the hook holds them to the highest round directory their stage has. Round 1's directory appears when its first agent writes. Every later round's directory comes from `gate`: when a review's gate fails with blockers standing and the stage has rounds left, `gate` creates `round-<n+1>/` itself and says so (`round 2 of 3 is open: ...`). Launch the next round's agents after that, with the new round's paths in their briefs; `merge-review` with no `--round` merges the highest round.
 
 Start each round with `PLUMBLINE check-diff --run <run_id>`: it prints the `merge_base` and the `diff_sha256` of the change as it is. Every brief of the round carries both, and every agent copies the `diff_sha256` into its record. `merge-review` refuses a record made against a different change, so the files stay as they are until the round is merged.
 
@@ -86,7 +86,7 @@ Start each round with `PLUMBLINE check-diff --run <run_id>`: it prints the `merg
 `gate` prints "round k of N" for the stage and exits 1 while the stage has rounds left. The stage's `on_fail` names where the run goes back to:
 
 - `plan` and `tests` go back to their own agent (the planner, the test-writer) with the gate's problems, for up to their `max_rounds`.
-- `verify` and `review` go back to `build`. Send the builder the failing criteria and error types, and the "for the builder" text of the surviving findings, and run the stages from there again, in order: `build`, then `verify`, then `review` again as a new round.
+- `verify` and `review` go back to `build`. Send the builder the failing criteria and error types, and the "for the builder" text of the surviving findings, and run the stages from there again, in order: `build`, then `verify`, then `review` again as a new round, the one whose directory `gate` opened.
 - The surviving findings under "for the test-writer" go to the test-writer, which revises the tests; then run `tests`, `verify` and `review` again. Once the build exists, the tests stage records its run of the test command and no longer expects the tests to fail.
 - A review of the tests goes back to `tests`.
 

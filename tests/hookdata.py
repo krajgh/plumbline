@@ -68,12 +68,25 @@ def denial(result):
 
 
 def start_run(repo, run_id="r1", activate=True):
-    """A run has begun in `repo`: its intake record exists and, with `activate`, .plumbline/runs/ACTIVE names it."""
-    from rundata import intake_record, put
+    """A run has begun in the adopted `repo`, as `plumbline.py plan --intent feature --row code.S` begins it: the intake record measured
+    from the repository's own merge base with main, the intake entry in the ledger, and .plumbline/runs/ACTIVE naming the run. With
+    `activate=False` the ACTIVE file is left as it was (or absent), as in a repository where another run, or the newest one, is in progress."""
+    import contextlib
+    import io
 
-    put(repo, "intake", intake_record("code.S"), run_id)
-    if activate:
-        activate_run(repo, run_id)
+    import plumbline as pl
+
+    active = repo / ".plumbline" / "runs" / "ACTIVE"
+    before = active.read_bytes() if active.is_file() else None
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = pl.main(["plan", "--intent", "feature", "--row", "code.S", "--base", "main", "--run-id", run_id, "--project", str(repo)])
+    assert code == 0, f"plan --intent failed: {out.getvalue()}{err.getvalue()}"
+    if not activate:
+        if before is None:
+            active.unlink(missing_ok=True)
+        else:
+            active.write_bytes(before)
     return run_id
 
 

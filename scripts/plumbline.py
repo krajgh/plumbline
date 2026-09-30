@@ -28,7 +28,9 @@ the agent that wrote it (written by the SubagentStop hook, with the record's
 sha256), and a review with the entry `merge-review` wrote. `gate` runs the
 repository's own [commands] for a verify stage and a tests stage, and enters what
 happened in the ledger. `pass` measures the change again and refuses a row that
-selects stages the run lacks.
+selects stages the run lacks. A review that fails with blockers standing and rounds
+left gets its next round's directory from `gate`: the review agents write only in
+the highest round-<n> directory of their stage.
 
 Exit status: 0 on success; 1 when what was checked is invalid, a gate fails, or
 a command refuses (init over an existing plumbline.toml, pass on a dirty tree);
@@ -2053,6 +2055,7 @@ class GateOutcome:
     record: str  # the stage's record, relative to the repository root
     record_sha256: str | None
     data: dict | None = None  # the record itself, when it exists and validates
+    checked: bool = False  # the record is valid and traced, and the gate's own check ran: its problems are the gate's, not the ledger's
 
 
 @dataclass
@@ -2374,12 +2377,18 @@ def _gate_verify_green(verify: dict, ctx: GateContext) -> list[str]:
 
 # ---- the review
 
+def standing_blockers(review: dict) -> list[str]:
+    """The findings of a review record that survive and are BLOCKING, by id: recomputed from the findings and the survivors, so that
+    the count the record states is not taken at its word."""
+    blocking = {f["id"] for f in review["findings"] if f["severity"] == "BLOCKING"}
+    return [fid for fid in dict.fromkeys(review["survivors"]) if fid in blocking]
+
+
 def _gate_no_surviving_blockers(review: dict, ctx: GateContext) -> list[str]:
     """The count of standing blockers is recomputed from the findings and the survivors, not taken from the record."""
     ids = {f["id"] for f in review["findings"]}
     survivors = list(dict.fromkeys(review["survivors"]))
-    blocking = {f["id"] for f in review["findings"] if f["severity"] == "BLOCKING"}
-    standing = [fid for fid in survivors if fid in blocking]
+    standing = standing_blockers(review)
     problems = [f"survivors names '{fid}', which is no finding of this round" for fid in survivors if fid not in ids]
     if review["blockers_surviving"] != len(standing):
         problems.append(f"blockers_surviving says {review['blockers_surviving']}, but the findings and survivors give {len(standing)}")
@@ -2662,6 +2671,7 @@ def evaluate_stage(
     path = run_dir(root, run_id) / f"{stage['id']}.json"
     gate = stage.get("gate")
     data, problems = read_stage_record(root, run_id, stage)
+    checked = False
     if run is None and run_problem is None:
         try:
             run = load_run(project, run_id)
@@ -2682,7 +2692,8 @@ def evaluate_stage(
                 ledger = read_ledger(root, run_id)  # with the run that was just entered
             if not problems:
                 problems = GATE_CHECKS[gate](data, GateContext(project, run_id, stage, run, ledger, measure))
-    return GateOutcome(stage["id"], gate, not problems, problems, rel_path(root, path), file_sha256(path), data)
+                checked = True
+    return GateOutcome(stage["id"], gate, not problems, problems, rel_path(root, path), file_sha256(path), data, checked)
 
 
 def ledger_gate_entry(outcome: GateOutcome) -> dict:
@@ -3566,10 +3577,26 @@ def cmd_merge_review(args) -> int:
     return 0
 
 
+def open_next_round(root: Path, run_id: str, stage: dict, outcome: GateOutcome, round_no: int, limit: int | None) -> Path | None:
+    """A review whose round ended with blockers standing, in a stage that has rounds left, goes back for another round. Its agents write
+    only in the highest round-<n> directory of their stage (the PreToolUse hook holds them to it) and `merge-review` merges the highest
+    round by default, so the directory of round N+1 is made here, and the main session has no step of its own to take. Returns it, or
+    None when the stage is no review, its rounds are used, the failure is the ledger's (a record that is missing, changed, or not traced
+    to its agents: that round is merged again, not left behind), or no blocker stands."""
+    if stage.get("kind", "agent") != "review" or limit is None or round_no >= limit or not outcome.checked or outcome.data is None:
+        return None
+    if not standing_blockers(outcome.data):
+        return None
+    directory = run_dir(root, run_id) / stage["id"] / f"round-{round_no + 1}"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
 def cmd_gate(args) -> int:
     """Evaluate a stage's gate: exit 0 when it passes, 1 when it fails, 3 when it fails (or would pass) past the stage's
     max_rounds, because the stage has used its rounds. The gates of a verify stage and of a tests stage run the repository's
-    commands themselves and enter what happened in the ledger."""
+    commands themselves and enter what happened in the ledger. A review that fails on standing blockers with rounds left
+    opens the directory of its next round (see open_next_round)."""
     project = _ready_project(args.project)
     existing_run_dir(project.root, args.run_id)
     stage = next((s for s in project.pipeline["stage"] if s["id"] == args.stage), None)
@@ -3602,6 +3629,10 @@ def cmd_gate(args) -> int:
         print(f"  round {round_no} of {limit}")
     if exhausted and not outcome.passed:
         print(f"  stage '{stage['id']}' has used its rounds: stop, and bring these problems and the surviving findings to the builder")
+    elif not outcome.passed:
+        opened = open_next_round(project.root, args.run_id, stage, outcome, round_no, limit)
+        if opened is not None:
+            print(f"  round {round_no + 1} of {limit} is open: {rel_path(project.root, opened)}/ (the next round's agents write there)")
     return 0 if outcome.passed else (3 if exhausted else 1)
 
 
@@ -3660,9 +3691,10 @@ def cmd_override(args) -> int:
     return 0
 
 
-class _OnIndexCopy:
+class OnIndexCopy:
     """This module, with its git commands working on a copy of the index: `git diff` refreshes and rewrites the index it reads,
-    so the commit checks (which live in the hook and take the module as an argument) run on a copy."""
+    so the commit checks (which live in the hook and take the module as an argument) run on a copy: `check-diff` and the hook's
+    check of a `git commit` both hand `commit_problems` this stand-in, and it uses nothing of the module but `_git`."""
 
     def __init__(self, index: Path) -> None:
         self._index = index
@@ -3688,7 +3720,7 @@ def cmd_check_diff(args) -> int:
     import pre_tool_use  # the commit checks live with the hook that applies them at commit time
 
     with index_copy(root) as index:
-        problems = pre_tool_use.commit_problems(_OnIndexCopy(index), root, "all", base=merge_base)
+        problems = pre_tool_use.commit_problems(OnIndexCopy(index), root, "all", base=merge_base)
     kinds = {"symlinks": "adds a symlink", "abs_paths": "adds an absolute home path", "secrets": "adds a key-shaped secret"}
     checks = {name: not any(problem.startswith(prefix) for problem in problems) for name, prefix in kinds.items()}
     report = {"merge_base": merge_base, "diff_sha256": digest, "checks": checks, "problems": problems}

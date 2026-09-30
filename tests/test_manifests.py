@@ -103,7 +103,7 @@ def test_hooks_json_registers_session_start_pre_tool_use_and_subagent_stop():
     [hook] = group["hooks"]
     assert hook["type"] == "command" and hook["timeout"] == 10
     [group] = hooks["PreToolUse"]
-    assert group["matcher"] == "Bash|PowerShell|Read|Grep|Glob|Edit|Write|NotebookEdit|Agent"  # letters and | only: an exact list of tool names
+    assert group["matcher"] == "Bash|PowerShell|Monitor|Read|Grep|Glob|Edit|Write|NotebookEdit|Agent"  # letters and | only: an exact list of tool names; Monitor runs a shell command as Bash does
     [hook] = group["hooks"]
     assert hook["type"] == "command" and hook["timeout"] == 30
     [group] = hooks["SubagentStop"]
@@ -307,6 +307,16 @@ def test_the_run_skill_says_what_the_rounds_and_exit_3_mean_and_where_plan_and_t
     failing = between(run_skill(), "## 6. When a gate fails", "## 7. Reduce")
     assert '"round k of N"' in failing and "exits 3 when the stage has used its rounds" in failing
     assert "`plan` and `tests` go back to their own agent" in failing
+
+
+def test_the_run_skill_says_gate_opens_each_later_rounds_directory_and_asks_for_no_step_of_the_main_session():  # the hook's round and the CLI's meet here
+    body = run_skill()
+    units = between(body, "## 5. Review units", "Start each round with")
+    assert "the hook holds them to the highest round directory their stage has" in units and "Round 1's directory appears when its first agent writes" in units
+    assert "`gate` creates `round-<n+1>/` itself" in units and "blockers standing" in units and "rounds left" in units
+    assert "`merge-review` with no `--round` merges the highest round" in units
+    assert "the one whose directory `gate` opened" in between(body, "## 6. When a gate fails", "## 7. Reduce")
+    assert "mkdir" not in body and "create the directory" not in body.lower() and "create the round" not in body.lower()
 
 
 def test_the_run_skill_names_the_active_file_and_the_measured_row():

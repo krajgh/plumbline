@@ -206,12 +206,13 @@ def test_a_named_file_that_does_not_exist_yet_is_not_protected(adopted):
 
 
 def test_a_role_that_the_repositorys_pipeline_gives_no_record_target_writes_no_record(adopted):
+    start_run(adopted)  # `plan --intent` refuses a pipeline that gives an agent no record target, so the run begins first and the pipeline is edited after
     custom = DEFAULT_TOML.read_text().replace('[roles.builder]\nwrites = ["record", "code"]', '[roles.builder]\nwrites = ["code"]')
     assert custom != DEFAULT_TOML.read_text()
     write(adopted / "pipelines" / "house.toml", custom)
     write(adopted / "plumbline.toml", 'schema = 1\npipeline = "pipelines/house.toml"\n')
     commit_all(adopted, "own pipeline")
-    start_run(adopted)
+    assert any("writes must include 'record'" in error for error in pl.load_project(adopted).errors)
     assert writes(adopted, "builder", "src/app.py") is None
     reason = writes(adopted, "builder", ".plumbline/runs/r1/build.json")
     assert reason and "writes only its own record" in reason
@@ -285,10 +286,9 @@ def run_with_everything(started):
     put(repo, "test-review", {"target": "tests"})
     put_part(repo, "test-review", "prosecutor-tests", {"lens": "tests", "findings": []})
     put_part(repo, "review", "prosecutor-security", {"lens": "security", "findings": []})
-    write(repo / ".plumbline" / "runs" / "r1" / "ledger.jsonl", '{"kind": "agent"}\n')
     write(repo / ".plumbline" / "supplied-spec.json", "{}")
     write(repo / ".plumbline" / "pass" / "abc.json", "{}")
-    put(repo, "intake", intake_record("code.S"), "r0")
+    put(repo, "intake", intake_record("code.S", repo), "r0")
     put(repo, "plan", spec_record(), "r0")
     put(repo, "build", build_note_record(), "r0")
     write(repo / ".pytest_cache" / "v" / "cache" / "nodeids", "[]")

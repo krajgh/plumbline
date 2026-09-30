@@ -98,13 +98,16 @@ def merged(repo, stage_id, path, round_no=1, run_id=RUN, parts=()) -> None:
 
 def run_entry(repo, stage_id, diff=None, run_id=RUN, exit_code=0, cmd=None, junit=None, before=None, after=None, extra=()) -> None:
     """Enter a measured run the way `gate` does: the commands and how they ended, and the guarded files before and after. The
-    test command is the repository's own when it declares one (as `gate` runs it), else `cmd`, else `true`."""
-    declared = pl.load_project(repo).commands.get("test")
-    command = {"name": "test", "cmd": cmd or (declared[0] if declared else PASSING), "exit_code": exit_code, "seconds": 0.01, **({"junit": junit} if junit else {})}
+    test command is the repository's own when it declares one (as `gate` runs it), else `cmd`, else `true`. A verify run also
+    runs the lint, typecheck and build commands the repository declares, and each of those ends 0."""
+    declared = pl.load_project(repo).commands
+    test = declared.get("test")
+    command = {"name": "test", "cmd": cmd or (test[0] if test else PASSING), "exit_code": exit_code, "seconds": 0.01, **({"junit": junit} if junit else {})}
+    others = [{"name": name, "cmd": declared[name][0], "exit_code": 0, "seconds": 0.01} for name in ("lint", "typecheck", "build") if stage_id == "verify" and declared.get(name)]
     pl.append_ledger(
         repo, run_id,
         {
-            "kind": "run", "stage": stage_id, "gate": "verify_green" if stage_id == "verify" else "tests_fail_on_stub", "commands": [command, *extra],
+            "kind": "run", "stage": stage_id, "gate": "verify_green" if stage_id == "verify" else "tests_fail_on_stub", "commands": [command, *others, *extra],
             "diff_sha256": diff, "guarded_before": before or {}, "guarded_after": after if after is not None else (before or {}), "timeout": 900,
         },
     )

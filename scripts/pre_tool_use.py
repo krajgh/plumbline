@@ -23,15 +23,18 @@ the paths the call names, so an agent whose working directory drifts is held all
     - `git commit` is denied when what it would commit adds a symlink, an
       absolute home path, or a key-shaped secret (sk-ant- followed by 20 or more
       characters).
-    - a redirection, `tee` or another writer aimed at .plumbline/pass/ or at a
-      run's ledger.jsonl is denied: only plumbline.py commands write them.
+    - a redirection, `tee` or another writer aimed at .plumbline/pass/, at a
+      run's ledger.jsonl or at .plumbline/runs/ACTIVE is denied: only plumbline.py
+      commands write them.
+    - the commit checks read the change on a copy of the index, so that a check leaves
+      the repository's own index as it was (`git diff` rewrites the index it reads).
   Bash, for plumbline agents
     - every simple command must match the command classes of the agent's role
       (the [roles.*] tables of the pipeline); a denial names what is allowed. The
       read-only git and search classes take no leading VAR=value, and no git option
       that runs a program or writes a file, in any abbreviation git accepts.
   Edit, Write and NotebookEdit
-    - .plumbline/pass/ and every ledger.jsonl are denied to everyone.
+    - .plumbline/pass/, every ledger.jsonl and .plumbline/runs/ACTIVE are denied to everyone.
     - a plumbline agent writes only what its role's write targets cover: its own
       record (in the active run, and for the review roles in the current round of the
       stage, in the file named for the role), the tests type, or everything else except
@@ -63,6 +66,7 @@ if sys.version_info < (3, 11):  # plumbline.py reads TOML with tomllib: answer "
     sys.exit(127)
 
 import base64
+import contextlib
 import json
 import os
 import re
@@ -161,6 +165,7 @@ WRITERS_LAST = {"cp", "install", "ln", "rsync"}  # the destination is written
 PASS_DIR = ".plumbline/pass"
 RUNS_DIR = ".plumbline/runs"
 ACTIVE_FILE = "ACTIVE"  # .plumbline/runs/ACTIVE holds the id of the run the agents work in
+ACTIVE_REL = f"{RUNS_DIR}/{ACTIVE_FILE}".lower()
 
 # Where no agent writes, whatever its role: git's own files, agent settings and instructions, repository automation.
 LANE_DIRS = {".git": "git", ".claude": "settings", ".github": "automation", ".husky": "automation"}
@@ -1091,7 +1096,9 @@ def added_lines(patch: str):
 
 def commit_problems(pl, root: Path, scope: str, base: str | None = None) -> list[str]:
     """What the coming commit adds that must not be committed. With a `base` commit (scope "all"), what
-    the whole change adds: everything from that commit to the working tree, .plumbline/ left out."""
+    the whole change adds: everything from that commit to the working tree, .plumbline/ left out. `pl` needs to offer
+    only `_git`: `check-diff` and the hook's check of a `git commit` pass plumbline.OnIndexCopy, whose `_git` works on a
+    copy of the index, because `git diff` rewrites the index it reads."""
     problems: list[str] = []
     tracked = scope in ("tracked", "all")
     heads = _git(pl, root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}").returncode == 0
@@ -1480,7 +1487,16 @@ def push_reason(pl, root: Path, action: Action, state: RefState) -> str | None:
 
 
 def commit_reason(pl, root: Path, action: Action, added: bool) -> str | None:
-    problems = commit_problems(pl, root, commit_scope(action.args, added))
+    scope = commit_scope(action.args, added)
+    with contextlib.ExitStack() as stack:
+        try:
+            # `git diff` refreshes and rewrites the index it reads, whatever --no-optional-locks says: on a copy, the real one stays as it was
+            index = stack.enter_context(pl.index_copy(root))
+        except (OSError, pl.PlumblineError):
+            checked = pl  # no copy could be made: the check still runs, on the index itself, as it always did
+        else:
+            checked = pl.OnIndexCopy(index)
+        problems = commit_problems(checked, root, scope)
     if not problems:
         return None
     listed = "; ".join(problems[:MAX_LISTED]) + (f"; and {len(problems) - MAX_LISTED} more" if len(problems) > MAX_LISTED else "")
@@ -2155,8 +2171,9 @@ def written_targets(step: Step) -> list[str]:
 
 
 def protected_rel(pl, roots: dict, path: Path) -> str | None:
-    """The repository-relative path, when `path` (or where it really leads) is under .plumbline/pass/ or is a
-    run's ledger.jsonl in a repository that has adopted plumbline: those are written only by plumbline.py."""
+    """The repository-relative path, when `path` (or where it really leads) is under .plumbline/pass/, is a run's ledger.jsonl, or is
+    .plumbline/runs/ACTIVE (the file that names the run the agents work in) in a repository that has adopted plumbline: those are
+    written only by plumbline.py."""
     for candidate in dict.fromkeys((path, Path(os.path.realpath(path)))):
         if ".plumbline" not in str(candidate).lower() and candidate.name != "ledger.jsonl":
             continue  # cannot be one of them: no need to look for the repository
@@ -2169,7 +2186,7 @@ def protected_rel(pl, roots: dict, path: Path) -> str | None:
         rel = _relative(root, candidate) if root is not None else None
         low = rel.lower() if rel is not None else None
         if low is not None and (
-            low == PASS_DIR or low.startswith(PASS_DIR + "/") or re.fullmatch(re.escape(RUNS_DIR) + r"/[^/]+/ledger\.jsonl", low)
+            low == PASS_DIR or low.startswith(PASS_DIR + "/") or low == ACTIVE_REL or re.fullmatch(re.escape(RUNS_DIR) + r"/[^/]+/ledger\.jsonl", low)
         ):
             return rel
     return None
@@ -2177,7 +2194,8 @@ def protected_rel(pl, roots: dict, path: Path) -> str | None:
 
 def protected_message(rel: str) -> str:
     return (
-        f"plumbline: {rel} is written only by plumbline.py commands (`pass` writes .plumbline/pass/; the gates and the hooks write a run's ledger.jsonl), "
+        f"plumbline: {rel} is written only by plumbline.py commands (`pass` writes .plumbline/pass/, `plan --intent` names the run in progress in "
+        ".plumbline/runs/ACTIVE, and the gates and the hooks write a run's ledger.jsonl), "
         "so nothing edits it, redirects into it or pipes into it. Run the pipeline's commands instead."
     )
 
@@ -2424,7 +2442,7 @@ def own_record(pl, root: Path, pipeline: dict, role: str, rel: str) -> tuple[boo
         if rounds[1] != current:
             return False, (
                 f"plumbline: the {role} writes in the current round of {rounds[0]} (round-{current}); {rel} is in round-{rounds[1]}. "
-                "The main session creates a new round's directory before the round's agents start."
+                "`plumbline.py gate` opens the next round's directory when a review fails with rounds left; write in the round your brief names."
             )
     return True, None
 

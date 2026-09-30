@@ -1,6 +1,6 @@
 """OV-ABBR, hook side: `plumbline.py override --rea "..."` runs the override too (argparse takes any unambiguous prefix of a long
-option), so the hook recognises the abbreviations of --reason and --project as it does the full words. The CLI itself is separately
-getting allow_abbrev=False; the hook does not depend on that."""
+option), so the hook recognises the abbreviations of --reason and --project as it does the full words. The CLI itself has
+allow_abbrev=False and refuses them; the hook does not depend on that."""
 import pytest
 
 import pre_tool_use as pre
@@ -43,16 +43,22 @@ def test_an_abbreviated_reason_option_is_still_an_override(adopted, option):
     assert ask(adopted, f'python3 "$SCRIPT" override --run r1 {option}{value}') == DENIAL
 
 
-def test_the_reviewers_override_reproduction_is_denied_and_really_overrides_when_nothing_stops_it(run_cli, adopted):
+def test_the_reviewers_override_reproduction_is_denied_by_the_hook_and_refused_by_the_cli(run_cli, adopted):
     command = f'P={CLI}; python3 "$P" override --rea "{REASON}"'
     assert ask(adopted, command) == DENIAL
     assert ask(adopted, command, "verifier") == DENIAL
-    # the premise: the CLI of 0.3.0 accepts the abbreviation (with allow_abbrev=False it stops doing so, and this line may say so)
-    result = run_cli("override", "--rea", REASON, cwd=adopted)
-    if result.returncode == 0:
-        assert "override recorded" in result.stdout
-    else:
-        assert "unrecognized arguments" in result.stderr or "ambiguous" in result.stderr or "expected" in result.stderr
+    # The premise moved: 0.3.0's CLI took `--rea` for `--reason` and wrote a real override. It has allow_abbrev=False now, so the command
+    # refuses the abbreviation itself, and the hook (which does not depend on that) stops the line before the CLI is reached.
+    for option in ("--rea", "--reas", "--reaso", "--re"):
+        result = run_cli("override", option, REASON, cwd=adopted)
+        assert result.returncode == 2 and "the following arguments are required: --reason" in result.stderr, (option, result.stderr)
+    result = run_cli("override", "--reason", REASON, "--proj", str(adopted), cwd=adopted)
+    assert result.returncode == 2 and "unrecognized arguments: --proj" in result.stderr, result.stderr
+    assert not (adopted / ".plumbline").exists()  # none of the refusals wrote an override
+    # the option typed in full is what the builder's /plumbline:override runs, and it records the override
+    result = run_cli("override", "--reason", REASON, cwd=adopted)
+    assert result.returncode == 0 and "override recorded" in result.stdout, result.stderr
+    assert len(list((adopted / ".plumbline" / "pass").glob("*.override.json"))) == 1
 
 
 @pytest.mark.parametrize("option", ["--project", "--projec", "--proje", "--proj", "--pro", "--pr", "--p"])

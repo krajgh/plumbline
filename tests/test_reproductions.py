@@ -9,7 +9,7 @@ import pytest
 
 from helpers import CLI, REPO, clean_env, commit_all, git, write
 from hookdata import add_origin, remote_ref, start_run, tool_payload
-from rundata import adopt, build_note_record, genuine_pass, put, put_part, spec_record, verify_record, written_tests_record
+from rundata import adopt_base, build_note_record, genuine_pass, put, put_part, spec_record, verify_record, written_tests_record
 
 REGISTERED = json.loads((REPO / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
 REASON = "twenty characters or more of reason"
@@ -43,23 +43,21 @@ class World:
 @pytest.fixture
 def world(repo, home, tmp_path):
     write(repo / "run_tests.sh", "#!/bin/sh\necho tests ran\n")
-    write(repo / "tests" / "test_app.py", "from src.app import main\n\ndef test_main():\n    assert main() == 1\n")
-    commit_all(repo, "tests and a test script")
-    adopt(repo)
-    with open(repo / "plumbline.toml", "a", encoding="utf-8") as handle:
-        handle.write('\n[commands]\ntest = "sh run_tests.sh"\nlint = "sh lint.sh"\n')
     write(repo / "lint.sh", "#!/bin/sh\necho lint ran\n")
-    commit_all(repo, "commands")
+    write(repo / "tests" / "test_app.py", "from src.app import main\n\ndef test_main():\n    assert main() == 1\n")
+    write(repo / ".pytest_cache" / "v" / "cache" / "nodeids", '["tests/test_app.py::test_main"]')  # what a test run left behind
+    write(repo / "junit.xml", "<testcase/>")
+    commit_all(repo, "tests, scripts and what a test run left")
+    # The base already holds the adoption, the tests and the scripts, as in a repository that adopted plumbline long ago: what is changed
+    # after it (a docs change, in the tests that need a pass) measures as the docs row `genuine_pass` declares.
+    adopt_base(repo, commands={"test": "sh run_tests.sh", "lint": "sh lint.sh"})
     origin = add_origin(repo, tmp_path)
-    start_run(repo)
+    start_run(repo)  # through `plan --intent`: a real intake record, its ledger entry, and .plumbline/runs/ACTIVE
     put(repo, "plan", spec_record())
     put(repo, "tests", written_tests_record())
     put(repo, "build", build_note_record())
     put(repo, "verify", verify_record())
     put_part(repo, "test-review", "prosecutor-tests", {"lens": "tests", "findings": []})
-    write(repo / ".plumbline" / "runs" / "r1" / "ledger.jsonl", '{"kind": "agent"}\n')
-    write(repo / ".pytest_cache" / "v" / "cache" / "nodeids", '["tests/test_app.py::test_main"]')
-    write(repo / "junit.xml", "<testcase/>")
     return World(repo, origin, home, tmp_path)
 
 
