@@ -33,8 +33,14 @@ the paths the call names, so an agent whose working directory drifts is held all
       (the [roles.*] tables of the pipeline); a denial names what is allowed. The
       read-only git and search classes take no leading VAR=value, and no git option
       that runs a program or writes a file, in any abbreviation git accepts.
+    - the orchestrator's classes are plumbline-run (plumbline.py's check-diff, gate, merge-review,
+      status, tokens, check-record and open, and `plan --run RUN --json`: no `plan --intent`, `pass`,
+      `override` or `init`) and git-meta (git status, rev-parse, log, branch --show-current, and diff
+      with --stat, --numstat or --name-only: nothing that prints a patch). It has no search class,
+      so `cat` and `grep` of source are refused, and no VAR=value goes before either class.
   Edit, Write and NotebookEdit
-    - .plumbline/pass/, every ledger.jsonl and .plumbline/runs/ACTIVE are denied to everyone.
+    - .plumbline/pass/, every ledger.jsonl and .plumbline/runs/ACTIVE are denied to everyone, and the
+      orchestrator (whose policy writes nothing) writes no file at all.
     - a plumbline agent writes only what its role's write targets cover: its own
       record (in the active run, and for the review roles in the current round of the
       stage, in the file named for the role), the tests type, or everything else except
@@ -44,6 +50,9 @@ the paths the call names, so an agent whose working directory drifts is held all
       and an agent that writes code but not tests also leaves conftest.py, pytest.ini, tox.ini,
       setup.cfg, noxfile.py and the files the repository's [commands] name to the main session.
   Agent
+    - the orchestrator launches the stage agents (plumbline:planner, test-writer, builder, verifier,
+      prosecutor, defender, detective, canary) and no other agent: not itself, not a general agent
+      and not another plugin's. The rules below hold for its launches as for the main session's.
     - a plumbline agent is launched in the main checkout (no `isolation`) and with the model
       its definition pins; another agent is not briefed on .plumbline/ paths; in a calibration
       run a defender's brief does not name the canary (its record is listed among the findings
@@ -53,6 +62,10 @@ the paths the call names, so an agent whose working directory drifts is held all
       each record, the canary's among them), and a directory that holds either are not read or searched:
       Read, Grep and Glob are denied them, and so is a Bash command that names one or runs a search
       tool over it (a glob counts as what it matches).
+  Read, Grep and Glob, for the agent plumbline:orchestrator
+    - only inside .plumbline/runs/<the active run>/ (symbolic links followed): its records, ledger and
+      round directories. A Grep or Glob needs an explicit path there, and a Glob pattern that leaves it
+      by `..` or an absolute path is refused. Source, tests and diffs stay with the stage agents.
   Read, Grep and Glob, for the agent plumbline:builder only
     - a path that matches the tests type of the pipeline, or is listed in the tests record
       of any run, is denied; under .plumbline/ only the active run's intake, plan and the
@@ -148,8 +161,11 @@ GIT_BUILTINS = frozenset(
     verify-tag version whatchanged worktree write-tree gitk""".split()
 )
 
-# The plumbline agents, and the review units' among them (which write under a review stage's round directories).
-ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary")
+# The plumbline agents, and the review units' among them (which write under a review stage's round directories). The stage agents are the ones a
+# pipeline's stages run; the orchestrator runs them for the main session, and is held to its own lane (what it reads, runs and launches).
+STAGE_ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary")
+ORCHESTRATOR = "orchestrator"
+ROLES = (*STAGE_ROLES, ORCHESTRATOR)
 REVIEW_ROLES = ("prosecutor", "defender", "detective", "canary")
 # The files a review agent writes in a round directory, by role: the defender's are the panel's (defender-<n>.json) and a screening defender's (screen-<k>.json),
 # the canary's are its record, named as a second prosecutor's of a lens (prosecutor-<lens>-b.json), and its key, and a name of that kind is the canary's alone.
@@ -1990,6 +2006,54 @@ def canary_command_reason(pl, role: str, steps: list["Step"], cwd: Path) -> str 
     return None
 
 
+# ------------------------------------------------- the orchestrator's lane: the run's directory
+#
+# The orchestrator launches the stage agents and runs plumbline's commands, so what it needs to read is the run's own files: records, the ledger, the round
+# directories. Source, tests and the content of diffs stay with the stage agents, which keeps the orchestrator's context small and leaves it nothing to fix
+# code with. An allowlist, like the builder's blindness turned inside out: what is not the active run's directory is not read.
+
+
+def orchestrator_reason(data: dict) -> str | None:
+    """The orchestrator's Read, Grep and Glob reach the active run's directory (.plumbline/runs/<run>/) and nothing outside it. A Grep or Glob names its
+    path, and a Glob pattern that leaves that path by `..` or an absolute pattern is refused."""
+    if data.get("agent_type") != "plumbline:orchestrator":
+        return None
+    tool, tool_input, cwd = data.get("tool_name"), data.get("tool_input") or {}, data.get("cwd")
+    if not isinstance(tool_input, dict) or not isinstance(cwd, str) or not cwd:
+        return None
+    import plumbline as pl
+
+    here = Path(cwd)
+    if tool == "Read":
+        named = tool_input.get("file_path")
+        if not isinstance(named, str) or not named:
+            return None
+        target, shown = _join(here, named), f"a Read of {named}"
+    elif tool in ("Grep", "Glob"):
+        named = tool_input.get("path")
+        if not isinstance(named, str) or not named.strip():
+            if adopted_root(pl, here) is None:
+                return None
+            return f"plumbline: the orchestrator's {tool} needs an explicit path inside the active run's directory (.plumbline/runs/<run id>/): a search from where it stands would cover the source."
+        target, shown = _join(here, named), f"a {tool} of {named}"
+        pattern = tool_input.get("pattern") if tool == "Glob" and isinstance(tool_input.get("pattern"), str) else None
+        if pattern:
+            if ".." in pattern.replace("\\", "/").split("/") or pattern.startswith(("/", "~")) or re.match(r"[A-Za-z]:", pattern):
+                target, shown = Path("/"), f"a Glob for {pattern}"  # it leaves the path it names: nowhere inside the run's directory
+            else:
+                target = _join(target, _static_prefix(pattern))
+    else:
+        return None
+    for root in adopted_roots(pl, anchors_of(here, target)):
+        run = active_run(pl, root)
+        directory = root / RUNS_DIR / run if run else None
+        inside = directory is not None and _inside(Path(os.path.realpath(target)), Path(os.path.realpath(directory)))  # where a link leads is what counts
+        if not inside:
+            where = f"the active run's directory, {RUNS_DIR}/{run}/" if run else "the active run's directory (no run is in progress, so there is none)"
+            return f"plumbline: the orchestrator reads {where} and nothing else: its records, the ledger and the round directories. {shown} reaches outside it, and source and tests stay with the stage agents."
+    return None
+
+
 def calibrating(pl, root: Path) -> bool:
     """Is the run in progress a calibration run? Its intake record says so."""
     run = active_run(pl, root)
@@ -2135,8 +2199,8 @@ def agent_role(data: dict) -> str | None:
     return None
 
 
-def plumbline_cli(pl, argv: list[str]) -> str | None:
-    """The subcommand, when `argv` runs this plugin's own plumbline.py (`python3 <path>/plumbline.py <subcommand> ...`)."""
+def plumbline_args(pl, argv: list[str]) -> tuple[str, list[str]] | None:
+    """The subcommand and its arguments, when `argv` runs this plugin's own plumbline.py (`python3 <path>/plumbline.py <subcommand> ...`)."""
     if not argv or not re.fullmatch(r"python(\d+(\.\d+)*)?", os.path.basename(argv[0])):
         return None
     i = 1
@@ -2148,7 +2212,13 @@ def plumbline_cli(pl, argv: list[str]) -> str | None:
         return None
     if os.path.realpath(argv[i]) != os.path.realpath(pl.PLUGIN_ROOT / "scripts" / "plumbline.py"):
         return None  # another script that happens to be called plumbline.py is not ours
-    return argv[i + 1]
+    return argv[i + 1], argv[i + 2 :]
+
+
+def plumbline_cli(pl, argv: list[str]) -> str | None:
+    """The subcommand, when `argv` runs this plugin's own plumbline.py (`python3 <path>/plumbline.py <subcommand> ...`)."""
+    found = plumbline_args(pl, argv)
+    return found[0] if found else None
 
 
 # The options of `plumbline.py override`: argparse accepts any unambiguous prefix of a long option, so `--rea` is `--reason`.
@@ -2438,6 +2508,88 @@ def _search_only(argv: list[str]) -> bool:
     return True
 
 
+PLUMBLINE_RUN = ("check-diff", "gate", "merge-review", "status", "tokens", "check-record", "open")  # the commands of the plumbline-run class, besides `plan --run`
+GIT_CONTENT_LONG = (  # long options of git diff and git log (and status) that print what the files say: a patch, a word diff, a verbose status
+    "patch", "unified", "word-diff", "word-diff-regex", "color-words", "patch-with-stat", "patch-with-raw", "combined", "cc", "binary", "diff-merges", "verbose",
+)
+GIT_CONTENT_SHORT = "puUcvL"  # -p, -u, -U<n>, -c, -v and -L<range>: the short ones. A bundle counts up to the first letter that takes a value (see GIT_VALUE_SHORTS)
+GIT_SUMMARIES = ("--numstat", "--name-only")  # what `git diff` shows with no content (--stat, which takes `=width` too, is the third)
+
+
+def _plan_run_only(args: list[str]) -> bool:
+    """`plan --run RUN [--json] [--project PATH]`, the plan of a run that has begun: nothing else the command takes (`--intent` and the rest start a
+    run). The command line takes no abbreviation of an option, so the exact spellings are all there is."""
+    seen_run = False
+    i = 0
+    while i < len(args):
+        name, equals, _value = args[i].partition("=")
+        if name == "--json" and not equals:
+            i += 1
+        elif name in ("--run", "--project") and (equals or i + 1 < len(args)):
+            seen_run = seen_run or name == "--run"
+            i += 1 if equals else 2
+        else:
+            return False
+    return seen_run
+
+
+def _plumbline_run(pl, argv: list[str]) -> bool:
+    """Is this one of the plumbline-run commands: `plumbline.py` check-diff, gate, merge-review, status, tokens, check-record or open, or `plan --run`?"""
+    found = plumbline_args(pl, argv)
+    if found is None:
+        return False
+    sub, args = found
+    return sub in PLUMBLINE_RUN or (sub == "plan" and _plan_run_only(args))
+
+
+def _shows_content(word: str) -> bool:
+    """Is this option of git diff, log or status one that prints what the files say (a patch, a word diff, a verbose status)? Git takes any
+    unambiguous prefix of a long option, so a prefix of one of them is one; `--color` is its own option and not a prefix of `--color-words`."""
+    if word.startswith("--"):
+        name = word[2:].split("=", 1)[0]
+        return bool(name) and name != "color" and any(option.startswith(name) for option in GIT_CONTENT_LONG)
+    if word.startswith("-") and len(word) > 1:
+        for letter in word[1:]:
+            if letter in GIT_CONTENT_SHORT:
+                return True
+            if letter in GIT_VALUE_SHORTS:
+                break  # the rest of the bundle is that option's value
+    return False
+
+
+def _git_meta(argv: list[str]) -> bool:
+    """git's summary views: status and rev-parse, log, `branch --show-current`, and diff only with --stat, --numstat or --name-only. Nothing
+    prints a patch, and no option runs a program or writes a file (the git-read rules, which this class keeps)."""
+    i = 1
+    while i < len(argv):
+        word = argv[i]
+        if word == "-C" and i + 1 < len(argv):
+            i += 2
+        elif word in GIT_QUIET_FLAGS:
+            i += 1
+        elif word.startswith("-"):
+            return False  # -c, --git-dir, --exec-path and the like change what git runs
+        else:
+            break
+    if i >= len(argv):
+        return False
+    sub, rest = argv[i], argv[i + 1 :]
+    if sub == "branch":
+        return rest == ["--show-current"]
+    if sub not in ("status", "rev-parse", "log", "diff"):
+        return False
+    options = rest[: rest.index("--")] if "--" in rest else rest
+    if any(_dangerous_git_option(a) for a in options):
+        return False
+    if sub == "rev-parse":
+        return True
+    if any(_shows_content(a) for a in options):
+        return False
+    if sub == "diff":
+        return any(a in GIT_SUMMARIES or a == "--stat" or a.startswith("--stat=") for a in options)
+    return True
+
+
 def _class_matches(pl, project, classes: list[str], argv: list[str]) -> list[str]:
     """The command classes of a role's policy that this command belongs to."""
     name = os.path.basename(argv[0])
@@ -2452,6 +2604,10 @@ def _class_matches(pl, project, classes: list[str], argv: list[str]) -> list[str
         elif kind == "plumbline-check" and plumbline_cli(pl, argv) == "check-diff":
             found.append(kind)
         elif kind == "graft" and project.graft_enabled and name == "graft":
+            found.append(kind)
+        elif kind == "plumbline-run" and _plumbline_run(pl, argv):
+            found.append(kind)
+        elif kind == "git-meta" and name == "git" and _git_meta(argv):
             found.append(kind)
     return found
 
@@ -2476,6 +2632,10 @@ def _allowed_summary(project, role: str, classes: list[str]) -> str:
             parts.append("`plumbline.py check-diff`")
         elif kind == "graft":
             parts.append("the graft wrapper" if project.graft_enabled else "the graft wrapper (graft is off in this repository)")
+        elif kind == "plumbline-run":
+            parts.append("`plumbline.py` " + ", ".join(PLUMBLINE_RUN[:-1]) + f" and {PLUMBLINE_RUN[-1]}, and `plan --run RUN --json`")
+        elif kind == "git-meta":
+            parts.append("git's summary views (status, rev-parse, log with no patch, branch --show-current, and diff with --stat, --numstat or --name-only)")
     parts.append("`plumbline.py check-record TYPE FILE` to check your record")
     return "; ".join(parts)
 
@@ -2534,6 +2694,11 @@ def _role_command_reason(pl, role: str, steps: list[Step], root: Path) -> str | 
                 return (
                     f"plumbline: the {role}'s read-only git and search tools run as they are, with no VAR=value before them "
                     f"(an environment variable can make git or grep run a program), so `{shown}` is refused. Run it without the assignment."
+                )
+            if kinds and step.assigns and all(kind in ("plumbline-run", "git-meta") for kind in kinds):
+                return (
+                    f"plumbline: the {role}'s plumbline and git commands run as they are, with no VAR=value before them "
+                    f"(an environment variable can make python or git run a program), so `{shown}` is refused. Run it without the assignment."
                 )
             if kinds or plumbline_cli(pl, step.argv) == "check-record":
                 continue
@@ -2680,6 +2845,8 @@ def partition_reason(pl, root: Path, role: str, target: Path, real: Path) -> str
     if not isinstance(policy, dict):
         return None
     writes = [w for w in policy.get("writes", []) if isinstance(w, str)]
+    if not writes:  # the orchestrator: it launches the stage agents and runs plumbline's commands, and the files are theirs
+        return f"plumbline: the {role} writes no file: the stage agents write the records, and the main session commits. Launch the agent whose work this is."
     pipeline = project.pipeline or pl.load_toml(pl.PIPELINE_DIR / f"{pl.DEFAULT_PIPELINE}.toml")
     patterns = next((t["paths"] for t in pipeline.get("type", []) if t.get("id") == "tests"), [])
     fixed = {name.lower() for name in pipeline_paths(pl, project, root) | {pl.CONFIG_FILE}}  # compared without case: a filesystem may not tell them apart
@@ -2756,7 +2923,8 @@ def pinned_model(pl, role: str) -> str | None:
 
 def agent_launch_reason(data: dict) -> str | None:
     """A plumbline agent is launched in the main checkout (records live there), with the model its definition pins; an agent that is
-    not one of plumbline's is not briefed on the run's files, which the stage agents write and read."""
+    not one of plumbline's is not briefed on the run's files, which the stage agents write and read. The orchestrator launches the stage
+    agents and no other: its launches meet these rules too, as the main session's do."""
     tool_input, cwd = data.get("tool_input"), data.get("cwd")
     if not isinstance(tool_input, dict) or not isinstance(cwd, str) or not cwd:
         return None
@@ -2764,16 +2932,23 @@ def agent_launch_reason(data: dict) -> str | None:
     plumbline_agent = isinstance(subagent, str) and subagent.startswith("plumbline:")
     text = f"{tool_input.get('prompt', '')}\n{tool_input.get('description', '')}"
     names_canary = subagent == "plumbline:defender" and bool(re.search(r"canary", text, re.I))
+    from_orchestrator = data.get("agent_type") == f"plumbline:{ORCHESTRATOR}"
     if plumbline_agent:
-        if tool_input.get("isolation") is None and tool_input.get("model") is None and not names_canary:
+        if not from_orchestrator and tool_input.get("isolation") is None and tool_input.get("model") is None and not names_canary:
             return None
-    elif not re.search(r"\.plumbline[/\\]", text, re.I):
+    elif not from_orchestrator and not re.search(r"\.plumbline[/\\]", text, re.I):
         return None
     import plumbline as pl
 
     roots = adopted_roots(pl, anchors_of(Path(cwd)))
     if not roots:
         return None
+    if from_orchestrator and not (plumbline_agent and subagent[len("plumbline:") :] in STAGE_ROLES):
+        who = subagent if isinstance(subagent, str) and subagent else "a general agent"
+        return (
+            f"plumbline: the orchestrator launches the stage agents (plumbline:{', '.join(STAGE_ROLES[:-1])} or {STAGE_ROLES[-1]}) and no other agent, "
+            f"itself included: {who} is not one of them. The stage agents do the work, and the main session does the rest."
+        )
     if names_canary and any(calibrating(pl, root) for root in roots):
         return (
             "plumbline: a defender's brief lists the findings records of the round alike, the canary's among them, and names neither the canary nor its key. "
@@ -2836,7 +3011,7 @@ def decide(data) -> str | None:
         if tool in ("Bash", "PowerShell", "Monitor"):
             return bash_reason(data)
         if tool in ("Read", "Grep", "Glob"):
-            return builder_reason(data) or defender_reason(data)
+            return builder_reason(data) or defender_reason(data) or orchestrator_reason(data)
         if tool in ("Edit", "Write", "NotebookEdit"):
             return write_reason(data)
         if tool in ("Agent", "Task"):  # the tool has been called both

@@ -25,6 +25,10 @@ holds (the same record, hash and validity) adds no entry: an agent that the harn
 again for its report stops again, and is still one agent, in one round. An agent of an
 unknown `plumbline:` role is let go, and entered as invalid ("unknown plumbline role").
 
+The orchestrator (`plumbline:orchestrator`) runs a leg of a run for the main session. It is no stage's agent and ends with a report, so no
+record is asked of it: the stop is let go and a `leg` entry (agent id, the path of its transcript, and where the session's is) goes in the
+ledger, once per agent id, so that `tokens` can report what the legs spent apart from the stage agents.
+
 A block is delivered in every way Claude Code accepts, because the hook is
 registered with `|| true`, which turns exit status 2 into 0: the reason goes to
 stderr, to stdout as {"decision": "block", "reason": ...}, and the exit status is
@@ -245,6 +249,21 @@ def enter(pl, root: Path, run_id: str, entry: dict) -> None:
     pl.append_ledger(root, run_id, entry)
 
 
+def enter_leg(pl, root: Path, run_id: str, data: dict) -> None:
+    """Append an orchestrator's stop to the run's ledger as a leg, unless that agent's leg is entered already (an agent that stops again is
+    still one leg). A stop without an agent id cannot be matched to an earlier one, and is always appended."""
+    agent_id = data.get("agent_id")
+    if isinstance(agent_id, str) and agent_id and pl.latest_entry(pl.read_ledger(root, run_id), "leg", agent_id=agent_id) is not None:
+        return
+    pl.append_ledger(
+        root, run_id,
+        {
+            "kind": "leg", "agent_id": agent_id, "agent_transcript_path": data.get("agent_transcript_path"),
+            "session_id": data.get("session_id"), "session_transcript": data.get("transcript_path"),
+        },
+    )
+
+
 def decide(data) -> str | None:
     """The reason to block this stop, or None to let the agent go. Writes the
     ledger entry and keeps the count of blocks, as described above."""
@@ -263,6 +282,11 @@ def decide(data) -> str | None:
     root = pl.git_toplevel(Path(cwd), timeout=5)
     if root is None or not (root / pl.CONFIG_FILE).is_file():
         return None  # not adopted here: gate nothing
+    if role == pl.ORCHESTRATOR:  # a leg, not a stage: nothing to validate, and nothing to hold it up for
+        active = pl.active_run_id(root)
+        if active is not None:
+            enter_leg(pl, root, active, data)
+        return None
     if record_type is None:  # a plumbline agent this plugin does not know: let it go, and say so in the run's ledger
         active = pl.active_run_id(root)
         if active is not None:

@@ -50,12 +50,15 @@
       }
     },
     "tokens": {
-      "description": "Token usage of the run. by_model maps a model name to {output, fresh_input, cache_read, output_lower_bound}, each an integer count. output_lower_bound is how many messages never got their final usage entry: when it is above 0, output is at least the count given.",
+      "description": "Token usage of the run. by_model maps a model name to {output, fresh_input, cache_read, output_lower_bound}, each an integer count: what the stage agents spent. output_lower_bound is how many messages never got their final usage entry: when it is above 0, output is at least the count given. orchestration, present when the orchestrator ran the run in legs, holds the same counts for the legs' own transcripts, per model and apart from by_model.",
       "type": "object",
       "required": ["by_model"],
       "additionalProperties": false,
       "properties": {
         "by_model": {
+          "type": "object"
+        },
+        "orchestration": {
           "type": "object"
         }
       }

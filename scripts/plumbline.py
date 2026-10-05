@@ -1879,6 +1879,17 @@ def _render_pass_record(d) -> list[str]:
         )
     else:
         out.append("None recorded.")
+    orchestration = _get(_get(d, "tokens"), "orchestration", {})
+    if isinstance(orchestration, dict) and orchestration:  # only a run that the orchestrator ran in legs has it
+        out += ["", "Orchestration, the legs of the orchestrator, apart from the agents above:", ""]
+        out += _table(
+            ["Model", "Output", "Fresh input", "Cache read"],
+            [
+                [m, f"at least {_get(u, 'output')}" if _get(u, "output_lower_bound") else _get(u, "output"), _get(u, "fresh_input"), _get(u, "cache_read")]
+                for m, u in orchestration.items()
+            ],
+            align={1, 2, 3},
+        )
     out += _section("Notes", d.get("notes"))
     if "open_findings" in d:  # a pass record from before 0.5.0 has neither list
         out += _section("Open findings", d.get("open_findings"), _open_finding_text)
@@ -3416,24 +3427,26 @@ def usage_by_model(transcripts: list[Path]) -> dict:
     return dict(sorted(by_model.items()))
 
 
-def ledger_transcripts(root: Path, run_id: str) -> tuple[list[Path], list[str]]:
-    """The agent transcripts a run's ledger points to, and notes about those it cannot find.
-    The path Claude Code reported for the agent is used; failing that, it is derived
-    from the session transcript as <dir>/<session_id>/subagents/agent-<agent_id>.jsonl."""
+def ledger_transcripts(root: Path, run_id: str, kind: str = "agent") -> tuple[list[Path], list[str]]:
+    """The transcripts a run's ledger points to for its `agent` entries (the stage agents) or its `leg` entries (the orchestrator's), and notes about
+    those it cannot find. The path Claude Code reported for the agent is used (`transcript` of an agent entry, `agent_transcript_path` of a leg);
+    failing that, it is derived from the session transcript as <dir>/<session_id>/subagents/agent-<agent_id>.jsonl."""
     found: list[Path] = []
     notes: list[str] = []
     for entry in read_ledger(root, run_id):
-        if entry.get("kind") != "agent":
+        if entry.get("kind") != kind:
             continue
         candidates = []
-        if isinstance(entry.get("transcript"), str) and entry["transcript"]:
-            candidates.append(Path(entry["transcript"]))
+        for key in ("transcript", "agent_transcript_path"):
+            if isinstance(entry.get(key), str) and entry[key]:
+                candidates.append(Path(entry[key]))
         session, session_id, agent_id = entry.get("session_transcript"), entry.get("session_id"), entry.get("agent_id")
         if isinstance(session, str) and isinstance(session_id, str) and isinstance(agent_id, str) and session and session_id and agent_id:
             candidates.append(Path(session).parent / session_id / "subagents" / f"agent-{agent_id}.jsonl")
         path = next((c for c in candidates if c.is_file()), None)
         if path is None:
-            note = f"no transcript found for agent {entry.get('agent_id')} ({entry.get('agent_type')}, stage {entry.get('stage')})"
+            what = f"agent {agent_id} ({entry.get('agent_type')}, stage {entry.get('stage')})" if kind == "agent" else f"orchestrator leg {agent_id}"
+            note = f"no transcript found for {what}"
             if note not in notes:  # an agent that stopped several times is one agent
                 notes.append(note)
         elif path not in found:
@@ -3443,17 +3456,27 @@ def ledger_transcripts(root: Path, run_id: str) -> tuple[list[Path], list[str]]:
 
 def tokens_for_run(root: Path, run_id: str) -> tuple[dict, list[str]]:
     """The run's `tokens` object, {"by_model": {...}}, and notes: the transcripts that could not be found, and each model whose output
-    count is a lower bound because some of its messages never got their final usage entry (see usage_by_model)."""
+    count is a lower bound because some of its messages never got their final usage entry (see usage_by_model). `by_model` is what the
+    stage agents spent. A run that the orchestrator ran in legs also has `orchestration`, the same per-model counts for the legs' own
+    transcripts, kept apart: it is the orchestration that sat in the main session before, and a run's cost shows it."""
     existing_run_dir(root, run_id)
     transcripts, notes = ledger_transcripts(root, run_id)
     by_model = usage_by_model(transcripts)
-    for model, usage in by_model.items():
-        if usage["output_lower_bound"]:
-            notes.append(
-                f"the output tokens of {model} are a lower bound: {_plural(usage['output_lower_bound'], 'message')} "
-                "had no final usage entry, only the snapshot taken as a message starts"
-            )
-    return {"by_model": by_model}, notes
+    tokens: dict = {"by_model": by_model}
+    counted = [("", by_model)]
+    if any(entry.get("kind") == "leg" for entry in read_ledger(root, run_id)):
+        leg_transcripts, leg_notes = ledger_transcripts(root, run_id, "leg")
+        notes += leg_notes
+        tokens["orchestration"] = usage_by_model(leg_transcripts)
+        counted.append((" (orchestration)", tokens["orchestration"]))
+    for label, usage_of in counted:
+        for model, usage in usage_of.items():
+            if usage["output_lower_bound"]:
+                notes.append(
+                    f"the output tokens of {model}{label} are a lower bound: {_plural(usage['output_lower_bound'], 'message')} "
+                    "had no final usage entry, only the snapshot taken as a message starts"
+                )
+    return tokens, notes
 
 
 # ------------------------------------------- pass records and overrides
@@ -4229,9 +4252,10 @@ def cmd_pass(args) -> int:
     note_pass(project.root, args.run_id, record, pass_file)
     print(f"plumbline: pass recorded for {record['commit'][:7]} (run {args.run_id}, row {record['row']})")
     print(f"  wrote {rel_path(project.root, run_copy)} and {rel_path(project.root, pass_file)}")
-    for model, usage in record["tokens"]["by_model"].items():
-        output = f"at least {usage['output']}" if usage.get("output_lower_bound") else str(usage["output"])  # some of its messages never got their final count
-        print(f"  tokens {model}: output {output}, fresh input {usage['fresh_input']}, cache read {usage['cache_read']}")
+    for label, usage_of in (("", record["tokens"]["by_model"]), (" orchestration", record["tokens"].get("orchestration", {}))):
+        for model, usage in usage_of.items():
+            output = f"at least {usage['output']}" if usage.get("output_lower_bound") else str(usage["output"])  # some of its messages never got their final count
+            print(f"  tokens{label} {model}: output {output}, fresh input {usage['fresh_input']}, cache read {usage['cache_read']}")
     return 0
 
 

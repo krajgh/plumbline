@@ -56,6 +56,7 @@ def _objects(schema, path="$"):
 # is written next to it: a record from an earlier version has to stay valid, because the push gate reads a run's records again.
 OPTIONAL = {
     ("pass_record", "$"): {"open_findings", "gaps"},  # 0.5.0: a pass record from 0.4.2 has neither
+    ("pass_record", "$.tokens"): {"orchestration"},  # 0.5.0: only a run that the orchestrator ran in legs has it
     ("defense_record", "$.defenses[]"): {"severity_claim"},  # 0.5.0: only a defender that concedes a finding worse than filed writes one
     ("review_record", "$.defenses[]"): {"severity_claim"},
     ("review_record", "$.findings[]"): {"severity_raised_from"},  # only on a finding that merge-review raised

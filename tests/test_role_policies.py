@@ -663,7 +663,7 @@ def test_written_operands_are_what_a_writer_writes_or_removes(argv, expected):
 
 
 def test_the_hook_roles_are_the_pipelines_roles():
-    assert pre.ROLES == tuple(pl.AGENT_RECORDS) and pre.REVIEW_ROLES == ("prosecutor", "defender", "detective", "canary")
+    assert pre.ROLES == pl.AGENT_ROLES and pre.STAGE_ROLES == tuple(pl.AGENT_RECORDS) and pre.REVIEW_ROLES == ("prosecutor", "defender", "detective", "canary")
     assert pre.CONFIG_COMMANDS == pl.CONFIG_COMMANDS and pre.PASS_DIR == pl.PASS_DIR and pre.RUNS_DIR == pl.RUNS_DIR and pre.STUBS_DIR == pl.STUBS_DIR == "stubs"
     assert set(pre.GIT_READ) == {"diff", "show", "log", "status", "rev-parse", "merge-base", "ls-files", "grep", "blame"}
 
