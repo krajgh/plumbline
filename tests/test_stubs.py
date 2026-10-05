@@ -261,7 +261,7 @@ def test_the_stubs_are_left_out_even_where_gitignore_does_not_name_plumbline(rep
 def test_a_stub_left_under_a_test_path_is_the_change_and_counts(measured):
     write(measured / "tests" / "_stubs" / "newmod.py", numbered(300))  # where the 0.4.1 prompt put it: the reason the stubs moved
     after = classified(measured)
-    assert (after["lines"], after["size"]) == (340, "M") and "tests/_stubs/newmod.py" in [f["path"] for f in after["files"]]
+    assert (after["lines"], after["size"]) == (190, "M") and "tests/_stubs/newmod.py" in [f["path"] for f in after["files"]]  # 40 lines of source and 300 of a test path, which count half (0.5.1)
 
 
 def test_check_diff_reads_the_same_change_with_or_without_the_stubs(run_cli, measured):

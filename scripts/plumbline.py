@@ -60,6 +60,7 @@ import datetime as dt
 import functools
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -71,6 +72,7 @@ import time
 import tomllib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -488,6 +490,7 @@ PIPELINE_SHAPE = {
             "properties": {
                 "S": {"type": "integer", "minimum": 1},
                 "M": {"type": "integer", "minimum": 1},
+                "weights": {"type": "object"},  # file type id -> a number from 0 to 1: checked in validate_pipeline, which knows the types
             },
         },
         "type": {"type": "array", "minItems": 1, "items": TYPE_SHAPE},
@@ -705,6 +708,11 @@ def validate_pipeline(pl: dict) -> tuple[list[str], list[str]]:
             )
     if pl["sizes"]["S"] >= pl["sizes"]["M"]:
         errors.append("sizes: S must be smaller than M")
+    for tid, weight in pl["sizes"].get("weights", {}).items():
+        if tid not in type_ids:
+            errors.append(f"sizes.weights: '{tid}' is not a type of this pipeline (a key is the id of a [[type]]: {', '.join(dict.fromkeys(type_ids))})")
+        if not _is_type(weight, "number") or not 0 <= weight <= 1:  # a NaN fails the comparison too
+            errors.append(f"sizes.weights.{tid}: {weight!r} is not a number from 0 to 1")
 
     # matrix: a row for every type, and every row consistent with the stages
     matrix = pl["matrix"]
@@ -1248,6 +1256,41 @@ def size_for(lines: int, sizes: dict) -> str:
     return "M" if lines <= sizes["M"] else "L"
 
 
+def size_weights(pipeline: dict) -> dict[str, float | int]:
+    """What a changed line of each file type counts for in the size, for the types [sizes] `weights` lists, as written: a number from 0 to 1.
+    A type it does not list counts a full line. Thorough tests should not push a change into a bigger row, so the default pipeline weighs `tests` at half."""
+    listed = (pipeline.get("sizes") or {}).get("weights")
+    return {tid: w for tid, w in listed.items() if _is_type(w, "number") and 0 <= w <= 1} if isinstance(listed, dict) else {}
+
+
+def lines_by_type(files: list[dict]) -> dict[str, int]:
+    """The changed lines (added + removed) of each file type among the files of a change_class record, as they are: the generated files are left out."""
+    counted: dict[str, int] = {}
+    for f in files:
+        if not f["generated"]:
+            counted[f["type"]] = counted.get(f["type"], 0) + f["added"] + f["removed"]
+    return counted
+
+
+def measure_size(pipeline: dict, files: list[dict]) -> tuple[int, dict[str, float | int]]:
+    """(the size of a change in lines, the weights that applied) for the files of a change_class record: the changed lines (added + removed) of
+    each file that is not generated, times the weight of its type, summed and rounded up. A weight is read as the decimal it is written as (0.3 is
+    3/10), so that the rounding is exact. The weights that applied are those that are not 1, for the types among the files: the record keeps them,
+    and with none the size is the plain count of changed lines. Every place that sizes a change reads this measure, through the record."""
+    weights, counted = size_weights(pipeline), lines_by_type(files)
+    total = sum(Fraction(str(weights.get(tid, 1))) * lines for tid, lines in counted.items())
+    return math.ceil(total), {tid: weights[tid] for tid in counted if tid in weights and weights[tid] != 1}
+
+
+def size_text(record: dict) -> str:
+    """A change's size as it is printed, `262 weighted lines (code 120, tests 284 at 0.5)`: the weighted total (`lines`), then the changed lines
+    of each file type as they are, in the record's order of types, with the weight of each type that counts for less than a full line."""
+    counted, weights = lines_by_type(record["files"]), record.get("weights") or {}
+    kinds = [tid for tid in [*record["types"], *sorted(counted)] if counted.get(tid)]
+    split = ", ".join(f"{tid} {counted[tid]}" + (f" at {weights[tid]}" if tid in weights else "") for tid in dict.fromkeys(kinds))
+    return f"{record['lines']} weighted lines" + (f" ({split})" if split else "")
+
+
 def row_label(pipeline: dict, type_id: str, size: str) -> str:
     """`code.M` for a row split by size, `docs` for a flat row."""
     row = pipeline["matrix"][type_id]
@@ -1420,7 +1463,7 @@ def classify(root: Path, pipeline: dict, base: str | None = None, intent: str = 
                 "symlink": entry["symlink"],
             }
         )
-    lines = sum(f["added"] + f["removed"] for f in files if not f["generated"])
+    lines, weights = measure_size(pipeline, files)
     size = size_for(lines, pipeline["sizes"])
     present = {f["type"] for f in files}
     types = [tid for tid in pipeline["precedence"] if tid in present]
@@ -1441,6 +1484,7 @@ def classify(root: Path, pipeline: dict, base: str | None = None, intent: str = 
         "files": files,
         "types": types,
         "lines": lines,
+        **({"weights": weights} if weights else {}),
         "size": size,
         "row": chosen,
         "intent": intent,
@@ -1663,10 +1707,11 @@ def _table(headers: list[str], rows: list[list], align: frozenset | set = frozen
 
 def _render_change_class(d) -> list[str]:
     out = ["# Change class", ""]
-    out.append(
-        f"Row `{_s(d.get('row'))}`: size {_s(d.get('size'))}, {_s(d.get('lines'))} changed lines. "
-        f"Types: {', '.join(_s(t) for t in _list(d.get('types'))) or 'none'}."
-    )
+    try:
+        sized = size_text(d)
+    except (KeyError, TypeError):  # a record that does not hold what the text is made of: its own count of lines, as it stands
+        sized = f"{_s(d.get('lines'))} changed lines"
+    out.append(f"Row `{_s(d.get('row'))}`: size {_s(d.get('size'))}, {sized}. Types: {', '.join(_s(t) for t in _list(d.get('types'))) or 'none'}.")
     out += ["", f"- Intent: `{_s(d.get('intent'))}`", f"- Base: `{_s(d.get('base'))}`, merge base `{_short(d.get('merge_base'))}`", f"- Head: `{_short(d.get('head'))}`"]
     if d.get("calibrate") is True:
         out.append("- A calibration run: each review round with defenders also has a canary")
@@ -3668,16 +3713,23 @@ MAX_NAMED_FILES = 5  # how many files a problem about the size of a change names
 
 
 def biggest_files(record: dict, limit: int = MAX_NAMED_FILES) -> str:
-    """A sentence naming the files of a measured change (a change_class record) that contribute the most changed lines, up to `limit`,
-    each with its count, or "" when none counts. The size is the sum over the same files: untracked files are in it as added lines, and
+    """A sentence naming the files of a measured change (a change_class record) that contribute the most to its size, up to `limit`, each with
+    its changed lines (and the weight of its type, where that counts for less than a full line), or "" when none counts. A file contributes its
+    changed lines times that weight, which orders them. The size is the sum over the same files: untracked files are in it as added lines, and
     generated files are not."""
+    weights = record.get("weights") or {}
     counted = sorted(
-        ((f["added"] + f["removed"], f["path"]) for f in record["files"] if not f["generated"] and f["added"] + f["removed"] > 0),
-        key=lambda item: (-item[0], item[1]),
+        (
+            (Fraction(str(weights.get(f["type"], 1))) * (f["added"] + f["removed"]), f["added"] + f["removed"], f["path"], f["type"])
+            for f in record["files"]
+            if not f["generated"] and f["added"] + f["removed"] > 0
+        ),
+        key=lambda item: (-item[0], item[2]),
     )
+    counted = [item for item in counted if item[0] > 0]
     if not counted:
         return ""
-    named = ", ".join(f"{path} ({_plural(lines, 'line')})" for lines, path in counted[:limit])
+    named = ", ".join(f"{path} ({_plural(lines, 'line')}{f' at {weights[kind]}' if kind in weights else ''})" for _share, lines, path, kind in counted[:limit])
     rest = f" and {_plural(len(counted) - limit, 'file')} more" if len(counted) > limit else ""
     return f" The files that contribute most: {named}{rest}."
 
@@ -3694,7 +3746,7 @@ def row_problems(project: Project, run: Run, measured: dict | None) -> list[str]
     problems = []
     if not any(by_id[sid]["record"] == "pass_record" for sid in stages):
         problems.append(
-            f"this row ends before reduce: split the change (it measures as {label}, {measured['lines']} changed lines, and nothing is built at that size)."
+            f"this row ends before reduce: split the change (it measures as {label}, {size_text(measured)}, and nothing is built at that size)."
             + biggest_files(measured)
         )
     missing = missing_stages(project, run, measured)

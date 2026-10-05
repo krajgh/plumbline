@@ -49,7 +49,7 @@ def test_a_change_of_1800_lines_declared_code_s_measures_as_l_and_gets_no_pass(r
     put(adopted, "review", review_record(diff=now_hash(adopted)))
     result = pass_of(run_cli, adopted)
     assert result.returncode == 1
-    assert "this row ends before reduce: split the change (it measures as code.L, 1800 changed lines, and nothing is built at that size)" in result.stdout
+    assert "this row ends before reduce: split the change (it measures as code.L, 1800 weighted lines (code 1800), and nothing is built at that size)" in result.stdout
     assert "The files that contribute most: src/big.py (1800 lines)." in result.stdout
     assert "the change" in result.stdout and not (adopted / ".plumbline" / "pass").exists()
 
@@ -214,7 +214,7 @@ def test_a_size_l_change_names_its_biggest_files_in_the_check_and_in_the_refusal
     result, data = check_diff(run_cli, adopted)
     [problem] = [p for p in data["problems"] if p.startswith("this row ends before reduce")]
     assert problem == (
-        "this row ends before reduce: split the change (it measures as code.L, 453 changed lines, and nothing is built at that size)."
+        "this row ends before reduce: split the change (it measures as code.L, 453 weighted lines (code 453), and nothing is built at that size)."
         " The files that contribute most: src/big.py (450 lines), src/small.py (3 lines)."
     )
     commit_all(adopted, "the big change")

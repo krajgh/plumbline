@@ -4,9 +4,13 @@ inputs = ["request", "diff"]            # available before any stage runs
 generated = ["graft/**", "**/*.lock", "pnpm-lock.yaml", "package-lock.json", "uv.lock", "poetry.lock"]
 precedence = ["code", "config", "tests", "docs"]   # when a change touches several types, the first decides its row
 
-[sizes]            # changed lines (added + removed) outside `generated`
+[sizes]            # changed lines (added + removed) outside `generated`, each file's lines times the weight of its type
 S = 50             # S: at most 50
 M = 400            # M: at most 400; L: more
+# `weights` is optional: a file type id and what a changed line of that type counts for, a number from 0 to 1. A type not listed counts 1.
+# The size is the sum over the files of changed lines times the weight of the file's type, rounded up.
+# Thorough tests should not push a change into a bigger row (splitting a feature because its tests are thorough is backwards), so a line of a test file counts half.
+weights = { tests = 0.5 }
 
 # File types, tried in order; a file takes the first that matches.
 [[type]]

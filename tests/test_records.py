@@ -61,7 +61,7 @@ OPTIONAL = {
     ("review_record", "$.defenses[]"): {"severity_claim"},
     ("review_record", "$.findings[]"): {"severity_raised_from"},  # only on a finding that merge-review raised
     ("review_record", "$"): {"panel_needed", "canary"},  # 0.5.0: a review record from 0.4.2 has no panel_needed, and only a calibration round has a canary
-    ("change_class", "$"): {"calibrate"},  # only the intake record of a calibration run has it
+    ("change_class", "$"): {"calibrate", "weights"},  # only the intake record of a calibration run has the first; 0.5.1: the second is there only where a file type counts for less than a full line
     ("review_record", "$.routes"): {"planner"},  # a record from 0.4.2 routes to two roles
 }
 
@@ -558,7 +558,7 @@ def test_render_carries_the_records_content():
     assert verify.startswith("# Verify: not green") and "- graft_fresh: n/a" in verify and "**AC-1**: AssertionError" in verify
     change = pl.render_record("change_class", sample("change_class"))
     assert "| uv.lock | code | 300 | 0 | generated |" in change and "| docs/link.md | docs | 1 | 0 | symlink |" in change
-    assert "Row `code.M`: size M, 101 changed lines. Types: code, docs." in change
+    assert "Row `code.M`: size M, 101 weighted lines (code 100, docs 1). Types: code, docs." in change
     passed = pl.render_record("pass_record", sample("pass_record"))
     assert "| sonnet | 1200 | 3400 | 56000 |" in passed and "# Pass record: pass" in passed
     lower = sample("pass_record")

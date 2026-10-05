@@ -65,9 +65,13 @@
       }
     },
     "lines": {
-      "description": "Changed lines (added + removed) outside the generated files.",
+      "description": "The size of the change in lines: the changed lines (added + removed) of each file outside the generated ones, times the weight of its file type under the pipeline's [sizes] (a type with no weight counts 1), summed and rounded up.",
       "type": "integer",
       "minimum": 0
+    },
+    "weights": {
+      "description": "What a changed line of a file type counts for in `lines`, for each type among the files whose weight is not 1 (for example {\"tests\": 0.5}). Absent when every file counts a full line.",
+      "type": "object"
     },
     "size": {
       "description": "S, M or L, from `lines` and the pipeline's [sizes] table.",

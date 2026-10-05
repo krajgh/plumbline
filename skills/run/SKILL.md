@@ -35,7 +35,7 @@ Settle the intent and the row before anything is planned, state both in a senten
 | `refactor` | behaviour stays the same | no planner, no new tests; the shipped template spec says behaviour is unchanged and every existing test passes, and the diff leaves the test files as they are |
 | `review-only` | the change already exists | nothing is built: verify and review only |
 
-**The row.** plumbline measures a change that already exists: its type and its size (S up to 50 changed lines, M up to 400, L more) select the row. When nothing has changed yet, as with a feature, a fix or a refactor on a clean tree, estimate the change and declare the row yourself: `--row code.M` for a code change of size M, a bare type such as `--row docs` for a flat row.
+**The row.** plumbline measures a change that already exists: its type and its size (S up to 50 weighted changed lines, M up to 400, L more; a line of a test file counts for half) select the row. When nothing has changed yet, as with a feature, a fix or a refactor on a clean tree, estimate the change and declare the row yourself: `--row code.M` for a code change of size M, a bare type such as `--row docs` for a flat row.
 
 The declared row is an estimate, and plumbline measures the change again: `check-diff --run` reports what it measures as, and `pass` refuses a run whose row lacks a stage the measured row selects. A change that measures larger than declared needs a new run for the measured row (`plan --intent <intent> --row <measured row>`). A change that measures as size L ends before reduce: the planner proposes a split into changes of size M or smaller, and each of those gets its own run.
 
