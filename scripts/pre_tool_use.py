@@ -2512,7 +2512,7 @@ PLUMBLINE_RUN = ("check-diff", "gate", "merge-review", "status", "tokens", "chec
 GIT_CONTENT_LONG = (  # long options of git diff and git log (and status) that print what the files say: a patch, a word diff, a verbose status
     "patch", "unified", "word-diff", "word-diff-regex", "color-words", "patch-with-stat", "patch-with-raw", "combined", "cc", "binary", "diff-merges", "verbose",
 )
-GIT_CONTENT_SHORT = "puUcvL"  # -p, -u, -U<n>, -c, -v and -L<range>: the short ones. A bundle counts up to the first letter that takes a value (see GIT_VALUE_SHORTS)
+GIT_CONTENT_SHORT = {"status": "v", "log": "puUcL", "diff": "puUcL"}  # -v of status, and -p, -u, -U<n>, -c and -L<range> of log and diff (-u of status is the untracked-files mode). A bundle counts up to the first letter that takes a value (see GIT_VALUE_SHORTS)
 GIT_SUMMARIES = ("--numstat", "--name-only")  # what `git diff` shows with no content (--stat, which takes `=width` too, is the third)
 
 
@@ -2542,15 +2542,15 @@ def _plumbline_run(pl, argv: list[str]) -> bool:
     return sub in PLUMBLINE_RUN or (sub == "plan" and _plan_run_only(args))
 
 
-def _shows_content(word: str) -> bool:
-    """Is this option of git diff, log or status one that prints what the files say (a patch, a word diff, a verbose status)? Git takes any
+def _shows_content(sub: str, word: str) -> bool:
+    """Is this option of git diff, log or status (`sub`) one that prints what the files say (a patch, a word diff, a verbose status)? Git takes any
     unambiguous prefix of a long option, so a prefix of one of them is one; `--color` is its own option and not a prefix of `--color-words`."""
     if word.startswith("--"):
         name = word[2:].split("=", 1)[0]
         return bool(name) and name != "color" and any(option.startswith(name) for option in GIT_CONTENT_LONG)
     if word.startswith("-") and len(word) > 1:
         for letter in word[1:]:
-            if letter in GIT_CONTENT_SHORT:
+            if letter in GIT_CONTENT_SHORT[sub]:
                 return True
             if letter in GIT_VALUE_SHORTS:
                 break  # the rest of the bundle is that option's value
@@ -2583,7 +2583,7 @@ def _git_meta(argv: list[str]) -> bool:
         return False
     if sub == "rev-parse":
         return True
-    if any(_shows_content(a) for a in options):
+    if any(_shows_content(sub, a) for a in options):
         return False
     if sub == "diff":
         return any(a in GIT_SUMMARIES or a == "--stat" or a.startswith("--stat=") for a in options)

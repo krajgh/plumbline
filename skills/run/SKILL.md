@@ -55,7 +55,7 @@ It runs `classify` on the change (or takes your declared row), writes the run's 
 
 Launch the agent `plumbline:orchestrator` with the Agent tool, `run_in_background: true`, without `model` (it is pinned to Sonnet) and without `isolation`. Its brief is the run id and, after a report that needed the builder, the builder's decision in a sentence or two. Then wait for its report, without polling and without commands of your own: the completion arrives as one notification, which is one turn of yours.
 
-The report is at most 15 lines: the run id, where the leg stopped and why, the options with the orchestrator's recommendation, the rounds each stage used, and the open findings as ids with one line each.
+The report is at most 15 lines: the run id, where the leg stopped and why, the options with the orchestrator's recommendation, the rounds each stage used, and the open findings as ids with one line each. A leg that ends with no report of that shape (it reached its turn limit, say) is followed by another leg with the same run id: the run's state is on disk, so the next leg continues from the first stage that has not passed.
 
 ## 4. A report that needs the builder
 

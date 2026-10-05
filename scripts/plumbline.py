@@ -4449,6 +4449,26 @@ def _stage_state(project: Project, run_id: str, stage: dict) -> tuple[str, list[
     return ("pass" if outcome.passed else "FAIL"), outcome.problems[:3]
 
 
+def round_progress(root: Path, run_id: str, stage: dict) -> str | None:
+    """`round 2: prosecutor-correctness, prosecutor-tests; BLOCKING filed: 1` for a review stage that has a round directory: the records the
+    highest round holds (the canary's key apart) and how many BLOCKING findings the findings records in it carry. A leg that resumes, and a
+    leg that chooses who defends, needs both, and an agent that has Bash but no Grep or Glob tool cannot list or search the directory itself."""
+    unit = run_dir(root, run_id) / stage["id"]
+    rounds = sorted(n for n in (_round_number(p) for p in unit.glob("round-*")) if n is not None)
+    if not rounds:
+        return None
+    names: list[str] = []
+    blocking = 0
+    for path in sorted((unit / f"round-{rounds[-1]}").glob("*.json"), key=lambda p: p.stem):
+        if path.stem == CANARY_KEY:
+            continue
+        names.append(path.stem)
+        data, problem = load_json_file(path)
+        if problem is None and not check_record("findings_record", data):
+            blocking += sum(1 for finding in data["findings"] if finding["severity"] == "BLOCKING")
+    return f"round {rounds[-1]}: {', '.join(names) or 'no records yet'}; BLOCKING filed: {blocking}"
+
+
 def status_rounds(project: Project, run: Run) -> str | None:
     """`rounds: plan 1, tests 3, review 2`: the rounds each stage that has run took so far, counted as `pass` counts them (see rounds_taken), in
     the order the stages run, or None while none has. The main session's stages (intake, reduce) and the ones an intent supplies are left out."""
@@ -4509,6 +4529,9 @@ def cmd_status(args) -> int:
         print(f"  {stage['id']:<13}{stage['record']:<15}{state:<10}{stage.get('gate') or '-'}")
         for problem in problems:
             print(f"      {problem}")
+        progress = round_progress(root, run_id, stage) if stage.get("kind", "agent") == "review" else None
+        if progress:
+            print(f"      {progress}")
     rounds = status_rounds(project, run)
     if rounds:
         print(rounds)

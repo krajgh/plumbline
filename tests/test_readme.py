@@ -267,15 +267,16 @@ def test_the_status_line_gives_the_manifests_version_and_the_phase():
         assert fix in status, fix
     assert "Phase 3, light testing in a real session, is done" in status and "has begun" not in status and "The next phase is phase 3" not in status
     assert "Version 0.4.2 was the first public release." in status and "Not yet published" not in status
-    assert "Version 0.5.0 carries, so far, what those two runs showed about the review:" in status
+    assert "Version 0.5.0 carries what those two runs showed. About the review:" in status and "so far" not in status
     for item in (
         "open findings last beyond the run (the pass record keeps them, `plumbline.py open` lists them and `status` counts them)", "a defender can claim a higher severity (`severity_claim` on a conceded verdict)",
         "a full defender panel only when a prosecutor filed a BLOCKING finding (a screening defender answers otherwise, and `panel_needed` keeps the step)",
-        "a spec review after plan for size M and L (the run stores its request, and a `requirements` lens compares it with the spec)", "a canary finding in calibration runs only",
+        "a spec review after plan for size M and L (the run stores its request, and a `requirements` lens compares it with the spec)", "a canary finding in calibration runs only (it looks like any prosecutor's finding, and only its key says which it is)",
+        "About the cost: the orchestrator agent takes the pipeline's control flow out of the main session, its biggest cost, and the run skill keeps only the main session's part",
     ):
         assert item in status, item
     assert "A run begun under 0.4.2 on a size-M or L row has no spec review, so its pass record no longer covers its commit under 0.5.0" in status
-    assert "it joins this same version" in status  # the orchestrator is part B of the same release
+    assert "it joins this same version" not in status and "Next come repository rules as data, graft and the CI templates, and installs for every repository at once." in status
     assert "Phase 2b of 5" not in README
 
 

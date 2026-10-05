@@ -59,8 +59,10 @@ def test_the_prompt_names_the_commands_it_runs_and_they_are_the_cli_s():
     assert "`PLUMBLINE` below stands for `python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/plumbline.py\"`" in body
 
 
-def test_the_prompt_never_asks_for_a_command_that_starts_a_run_records_a_pass_or_an_override():
+def test_the_prompt_says_who_starts_the_run_records_the_pass_and_talks_to_the_builder_and_asks_for_none_of_it():
     _, body = orchestrator()
+    assert "Starting the run and recording its pass are the main session's, and an override is the builder's own command. Your report goes to the main session, which alone talks to the builder." in body
+    assert "so your leg ends with a report and no file of yours" in body
     for command in ("plan --intent", "PLUMBLINE pass", "PLUMBLINE override", "PLUMBLINE init", "--calibrate"):
         assert command not in body, command
 
@@ -87,8 +89,9 @@ def test_a_leg_starts_from_the_run_id_and_reads_where_the_run_stands_in_one_call
     assert "Take the stages in order, from the first one whose state is not `pass`, `supplied` or `recorded`." in start
     for key in ("`stages`", "`role` or `kind`", "`reads` as paths", "record `path`", "`gate`", "`on_fail`", "`max_rounds`", "`lenses`", "`request` file", "`record_dir`", "`stubs_dir`", "`commands`", "`supplied`"):
         assert key in start, key  # what the plan gives it, so that the main session pastes nothing in
-    assert "`status` shows the state of each stage, and the rounds each has used" in start
-    assert "launch only the agents whose record is missing" in start
+    assert "`status` shows the state of each stage, the rounds each has used" in start
+    assert "the line `round <n>: ...` under it names the records the round holds already: launch only the agents whose record is missing" in start
+    assert "under a review stage, the records its highest round holds and how many BLOCKING findings the prosecutors filed in it" in start
 
 
 def test_every_key_the_prompt_says_the_plan_gives_is_in_the_plan():
@@ -179,6 +182,7 @@ def test_the_review_units_launch_each_step_in_one_message_in_the_foreground():
     assert "run_in_background" not in review  # the foreground is the default the discipline names, so the steps say it in words
     assert "`merge-review` with no `--round` merges the highest round" in review and "`gate` creates `round-<n+1>/` itself" in review
     assert "Every brief of the round carries both, and every agent copies the `diff_sha256` into its record." in review
+    assert "(a problem it reports about the row is a hand-back, as above)" in review
 
 
 def test_the_review_units_carry_the_calibration_canary_after_the_prosecutors_and_the_screening_and_panel_steps():
@@ -189,7 +193,7 @@ def test_the_review_units_carry_the_calibration_canary_after_the_prosecutors_and
     assert "The canary is a finding to answer, so launch the defenders the round's rule names even when no prosecutor filed a finding." in review
     for needed in ("**No BLOCKING finding, and the stage has `screen_defenders`:**", "`screen-1`", "**No BLOCKING finding, and `screen_defenders` is 0:** no defender runs", "it says \"panel needed\"", "`panel_needed`", "in this round and not in the next"):
         assert needed in review, needed
-    assert "Grep the round directory for `\"severity\"\\s*:\\s*\"BLOCKING\"`" in review  # how it tells a BLOCKING finding without reading the findings records one by one
+    assert "`PLUMBLINE status --run <run id>` shows `BLOCKING filed: <n>` under the stage" in review  # how it tells a BLOCKING finding without reading the findings records or searching for them
     assert "In a calibration run it also prints `canary: refuted by 2 of 3 defenders` (or the like): keep that line for your report." in review
 
 
@@ -392,12 +396,73 @@ def test_status_leaves_the_main_sessions_stages_and_a_supplied_stage_out_of_the_
     assert rounds_line(run_cli, adopted_code_m) == "rounds: build 1"  # not intake, reduce or the plan the intent supplied
 
 
+def round_line(run_cli, repo, stage="review"):
+    out = run_cli("status", "--run", RUN, cwd=repo).stdout.splitlines()
+    row = next(i for i, line in enumerate(out) if line.startswith(f"  {stage} "))
+    after = [line for line in out[row + 1 :] if line.startswith("      ")]  # the lines indented under the stage
+    return next((line.strip() for line in after if line.strip().startswith("round ")), None)
+
+
+def finding(fid, severity="MINOR", lens="correctness"):
+    return {
+        "id": fid, "lens": lens, "file": "src/new_module.py", "line": 2, "claim": "c", "failure_scenario": "s", "rule": "AC-1", "evidence": "line 2", "outside_code": None, "severity": severity,
+    }
+
+
+def test_status_says_under_a_review_stage_which_records_its_highest_round_holds_and_how_many_blocking_findings_were_filed(run_cli, adopted_code_m):
+    from rundata import put_part
+
+    started(run_cli, adopted_code_m, "feature", "--row", "code.S")
+    assert round_line(run_cli, adopted_code_m) is None  # no round directory yet
+    put_part(adopted_code_m, "review", "prosecutor-correctness", {"lens": "correctness", "findings": [finding("correctness-1", "MAJOR")]})
+    assert round_line(run_cli, adopted_code_m) == "round 1: prosecutor-correctness; BLOCKING filed: 0"
+    put_part(adopted_code_m, "review", "prosecutor-tests", {"lens": "tests", "findings": [finding("tests-1", "BLOCKING", "tests"), finding("tests-2", "BLOCKING", "tests")]})
+    assert round_line(run_cli, adopted_code_m) == "round 1: prosecutor-correctness, prosecutor-tests; BLOCKING filed: 2"
+    put_part(adopted_code_m, "review", "defender-1", {"defender": "defender-1", "defenses": []})
+    assert round_line(run_cli, adopted_code_m) == "round 1: defender-1, prosecutor-correctness, prosecutor-tests; BLOCKING filed: 2"  # a defender's record has no findings to count
+
+
+def test_status_names_only_the_highest_round_and_leaves_the_canarys_key_out(run_cli, adopted_code_m):
+    from rundata import put_part
+
+    started(run_cli, adopted_code_m, "feature", "--row", "code.S")
+    put_part(adopted_code_m, "review", "prosecutor-correctness", {"lens": "correctness", "findings": [finding("correctness-1", "BLOCKING")]})
+    put_part(adopted_code_m, "review", "prosecutor-correctness", {"lens": "correctness", "findings": []}, round_no=2)
+    put_part(adopted_code_m, "review", "prosecutor-correctness-b", {"lens": "correctness", "findings": [finding("correctness-2", "MAJOR")]}, round_no=2, role="canary")
+    put_part(adopted_code_m, "review", "canary-key", {"finding_id": "correctness-2", "why_false": "x"}, round_no=2, agent=False)
+    assert round_line(run_cli, adopted_code_m) == "round 2: prosecutor-correctness, prosecutor-correctness-b; BLOCKING filed: 0"
+
+
+def test_status_counts_nothing_from_a_record_that_does_not_validate_and_says_so_when_the_round_is_empty(run_cli, adopted_code_m):
+    started(run_cli, adopted_code_m, "feature", "--row", "code.S")
+    write(run_path(adopted_code_m, RUN, "review", "round-1", "prosecutor-correctness.json"), '{"lens": "correctness", "findings": [{"severity": "BLOCKING"}]}')
+    write(run_path(adopted_code_m, RUN, "review", "round-1", "notes.json"), "not json")
+    assert round_line(run_cli, adopted_code_m) == "round 1: notes, prosecutor-correctness; BLOCKING filed: 0"
+    (run_path(adopted_code_m, RUN, "review", "round-1", "prosecutor-correctness.json")).unlink()
+    (run_path(adopted_code_m, RUN, "review", "round-1", "notes.json")).unlink()
+    assert round_line(run_cli, adopted_code_m) == "round 1: no records yet; BLOCKING filed: 0"
+
+
+def test_every_review_stage_of_the_row_has_the_line_and_no_other_stage_does(run_cli, adopted_code_m):
+    from rundata import put_part
+
+    started(run_cli, adopted_code_m, "feature")  # code.M: spec-review, test-review and review
+    for stage, lens in (("spec-review", "requirements"), ("test-review", "tests"), ("review", "correctness")):
+        put_part(adopted_code_m, stage, f"prosecutor-{lens}", {"lens": lens, "findings": []})
+    out = run_cli("status", "--run", RUN, cwd=adopted_code_m).stdout
+    assert out.count("      round 1: prosecutor-") == 3
+    for stage in ("spec-review", "test-review", "review"):
+        assert round_line(run_cli, adopted_code_m, stage) == f"round 1: prosecutor-{dict(zip(('spec-review', 'test-review', 'review'), ('requirements', 'tests', 'correctness')))[stage]}; BLOCKING filed: 0"
+    assert "      round " not in "\n".join(line for line in out.splitlines() if line.startswith(("  plan ", "  tests ", "  build ", "  verify ")))
+
+
 def test_the_readme_commands_table_lists_the_plan_run_and_the_status_rounds():
     readme = (REPO / "README.md").read_text(encoding="utf-8")
     row = next(line for line in readme.splitlines() if line.startswith("| `plan "))
     assert "[--run RUN [--json]]" in row and "rebuilt from its own files and writing nothing" in row
     status = next(line for line in readme.splitlines() if line.startswith("| `status "))
     assert "the rounds each stage that has run took (`rounds: plan 1, tests 2, review 1`)" in status
+    assert "under a review stage the records its highest round holds and how many BLOCKING findings were filed in it (`round 2: prosecutor-tests; BLOCKING filed: 0`)" in status
 
 
 # --- the run skill: the main session's part only
@@ -448,6 +513,7 @@ def test_a_leg_is_started_in_the_background_with_the_run_id_and_waited_for_witho
     assert "Then wait for its report, without polling and without commands of your own: the completion arrives as one notification, which is one turn of yours." in leg
     assert "The report is at most 15 lines" in leg and "the open findings as ids with one line each" in leg
     assert "paste" not in leg.lower()  # the plan is read by the orchestrator, not handed to it
+    assert "A leg that ends with no report of that shape (it reached its turn limit, say) is followed by another leg with the same run id" in leg
 
 
 def test_a_report_that_needs_the_builder_is_put_with_ask_user_question_and_a_new_leg_follows_the_answer():
@@ -481,3 +547,60 @@ def test_the_skills_launch_and_the_hooks_launch_pins_agree_on_the_orchestrator()
 
     assert pre.pinned_model(pl, "orchestrator") == "sonnet" == frontmatter(AGENTS / "orchestrator.md")[0]["model"]
     assert "(it is pinned to Sonnet)" in skill()[1]
+
+
+# --- the README
+
+
+def readme_section(title, level=2):
+    from test_readme import section
+
+    return section(title, level)
+
+
+def test_the_readme_describes_the_run_flow_the_legs_and_why():
+    text = readme_section("Runs, gates and the pass record")
+    flow = text.split("**The run flow: the main session, the orchestrator's legs, the stage agents.**", 1)[1].split("\n\n", 1)[0]
+    for needed in (
+        "launches `plumbline:orchestrator` in the background with the run id", "The orchestrator runs one *leg*", "`status`, `plan --run RUN --json` and `check-diff`",
+        "so a leg needs only the run id", "briefs that carry paths and hashes and never file contents", "within the stage's `max_rounds`", "at spawn depth 2",
+        "A leg ends when every gate of the row has passed", "a hook refusal it would have to work around", "a change that measures larger than its row or at size L",
+        "a stage that reached `max_rounds`", "non-blocking findings or gaps left once every gate passed: fix or ship", "an error it is unable to resolve",
+        "a report of at most 15 lines: the run id, where it stopped and why, the options with its recommendation, the rounds used per stage, and the open findings",
+        "starts a new leg, a fresh orchestrator, with the answer", "Reduce stays the main session's", "about 91% of the main session's cache reads", "in one message, in the foreground",
+        "Each leg is entered in the ledger (`leg`), and `tokens` reports what the legs spent apart from the stage agents (`orchestration`)",
+    ):
+        assert needed in flow, needed
+    assert "through a new leg of the orchestrator" in text.split("**Resuming a run.**", 1)[1].split("\n\n", 1)[0]
+
+
+def test_the_readme_says_the_costs_figures_predate_the_orchestrator_and_promises_no_number():
+    text = readme_section("What a run costs")
+    note = next(line for line in text.splitlines() if line.startswith("- **These figures predate the orchestrator.**"))
+    assert "From 0.5.0 `plumbline:orchestrator` does it, on Sonnet at medium effort, in legs that `tokens` reports apart as `orchestration`" in note
+    assert "the next size-M run with the orchestrator in place measures the after, and no number is promised in advance" in note
+    assert text.index(note) < text.index("- **There is no token cap.**")
+
+
+def test_the_readme_limits_name_what_is_left_open_about_the_orchestrator():
+    limits = readme_section("Limits")
+    group = limits.split("**The orchestrator**", 1)[1].split("**Measured runs**", 1)[0]
+    assert "- **Its lane is a guard rail like the others.**" in group and "(`junit-<stage>.xml`) and the test-writer's stubs, and nothing hides them from it" in group
+    assert "`SendMessage`, which it uses to resume a stage agent, is not among the tools the matcher names" in group
+    assert "whether the harness honours the frontmatter `effort` and restricts the agent to its `tools` was not tested" in group and "the run skill's fallback applies" in group
+    assert "A leg that reaches it stops without a report, and the main session starts another leg" in group
+    assert "`maxTurns` is 200" in group and orchestrator()[0]["maxTurns"] == "200"
+    from test_manifests import HOOKS, load
+
+    assert "SendMessage" not in load(HOOKS)["hooks"]["PreToolUse"][0]["matcher"]  # the limit is real today
+
+
+def test_the_readme_status_says_what_0_5_0_carries():
+    status = readme_section("Status")
+    assert status.strip().startswith("Version 0.5.0.") and "About the cost: the orchestrator agent" in status
+    assert json.loads((REPO / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))["version"] == "0.5.0"
+
+
+def test_the_status_skill_says_where_the_orchestrators_cost_is():
+    body = frontmatter(REPO / "skills" / "status" / "SKILL.md")[1]
+    assert "of the run's agents, per model, and, apart, of the orchestrator's legs (`orchestration`)" in body

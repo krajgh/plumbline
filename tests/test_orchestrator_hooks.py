@@ -2,16 +2,15 @@
 classes), which agents it launches (the stage agents, under the launch pins), and the ledger entry its stop leaves. The main session may still
 launch the stage agents itself, as the fallback when the orchestrator is not used."""
 import json
-import os
 import re
 
 import pytest
 
 import plumbline as pl
 import pre_tool_use as pre
-from helpers import CLI, REPO, commit_all, git, write
+from helpers import CLI, REPO, commit_all, write
 from hookdata import bash_payload, denial, start_run, stop_payload, tool_payload
-from rundata import RUN, adopt, adopt_base, ledger, put, run_path
+from rundata import RUN, adopt, adopt_base, ledger, put
 
 ORCHESTRATOR = "plumbline:orchestrator"
 STAGE_ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary")
@@ -200,6 +199,7 @@ def test_the_orchestrator_runs_plumbline_s_commands_for_a_run(started, command):
         "git branch --show-current",
         "git diff --stat", "git diff --stat=100", "git diff --numstat main...HEAD", "git diff --name-only", "git diff --cached --stat", "git diff --stat -- src/", "git diff HEAD~1 --name-only",
         "git diff --stat --name-only --numstat", "git --no-pager log --oneline", "git -C . status", "git status && git rev-parse HEAD",
+        "git status -uno", "git status -uall -s", "git status --untracked-files=no", "git status -sb", "git log -n5 --oneline", "git log -5", "git log --max-count=3",
     ],
 )
 def test_the_orchestrator_looks_at_the_repository_through_git_s_summary_views(started, command):
@@ -229,7 +229,7 @@ def test_the_orchestrator_looks_at_the_repository_through_git_s_summary_views(st
         (f"{PLUMBLINE} validate-pipeline", "may run only"),
         (f"{PLUMBLINE} override --reason 'a reason that is long enough'", "the builder's command"),
         (f"{PLUMBLINE}", "may run only"),
-        (f"python3 -c 'import plumbline'", "may run only"),
+        ("python3 -c 'import plumbline'", "may run only"),
         ("python3 other/plumbline.py status", "may run only"),
         (f"FOO=1 {PLUMBLINE} status --run r1", "no VAR=value before them"),
         (f"PYTHONPATH=/tmp {PLUMBLINE} gate r1 verify", "no VAR=value before them"),
@@ -256,8 +256,8 @@ def test_the_orchestrator_looks_at_the_repository_through_git_s_summary_views(st
         ("python3 -m pytest", "may run only"), ("pytest", "may run only"), ("sh -c 'cat src/app.py'", "may run only"), ("bash -c 'git log -p'", "may run only"),
         ("rm -rf src", "may run only"), ("touch x", "may run only"), ("mv a b", "may run only"), ("cp a b", "may run only"), ("curl http://x", "may run only"), ("sudo git status", "another user"),
         (f"{PLUMBLINE} status --run r1 > out.txt", "does not write files"), (f"{PLUMBLINE} status --run r1 | tee out.txt", "may run only"),
-        (f"{PLUMBLINE} status --run r1 && cat src/app.py", "may run only"), (f"git status; cat tests/test_app.py", "may run only"),
-        (f"echo $(cat src/app.py)", "may run only"), (f"{PLUMBLINE} check-record spec $(cat src/app.py)", "may run only"),
+        (f"{PLUMBLINE} status --run r1 && cat src/app.py", "may run only"), ("git status; cat tests/test_app.py", "may run only"),
+        ("echo $(cat src/app.py)", "may run only"), (f"{PLUMBLINE} check-record spec $(cat src/app.py)", "may run only"),
         ("git push origin feature", "may run only"),  # the role's classes answer before the push gate would
     ],
 )
