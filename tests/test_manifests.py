@@ -311,7 +311,8 @@ def test_the_run_skill_says_how_a_run_in_progress_is_resumed():  # C-30
 def test_the_orchestrator_says_gate_opens_each_later_rounds_directory_and_asks_for_no_step_of_its_own():  # the hook's round and the CLI's meet here
     body = orchestrator_body()
     units = between(body, "## Review units", "Start each round with")
-    assert "the hook holds them to the highest round directory their stage has" in units and "Round 1's directory appears when its first agent writes" in units
+    assert "the round its agents write in is the stage's `next_round` in the plan" in units and "the hook holds them to that round, so that a round that is over keeps its records" in units
+    assert "Round 1's directory appears when its first agent writes" in units and "its agents' first write makes the directory" in units
     assert "`gate` creates `round-<n+1>/` itself" in units and "blockers standing" in units and "rounds left" in units
     assert "`merge-review` with no `--round` merges the highest round" in units
     assert "the one whose directory `gate` opened" in between(body, "## When a gate fails", "## A decision comes back")

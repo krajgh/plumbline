@@ -1646,16 +1646,11 @@ def active_run(pl, root: Path) -> str | None:
 
 
 def current_round(pl, root: Path, run_id: str, stage_id: str) -> int:
-    """The round a review stage is in: the highest round-<n> directory it has, or 1 while it has none."""
-    rounds = [1]
-    try:
-        for entry in (root / RUNS_DIR / run_id / stage_id).iterdir():
-            match = re.fullmatch(r"round-([1-9][0-9]*)", entry.name)
-            if match and _isdir(entry):
-                rounds.append(int(match.group(1)))
-    except OSError:
-        pass
-    return max(rounds)
+    """The round a review stage's agents write in: the highest round-<n> directory it has, or 1 while it has none, unless that round is over (its gate passed,
+    or what the stage reviews changed after its records were made), and then the next one: a review that runs again never writes over a round that is over.
+    plumbline.review_round decides, and `plan --run` gives the same number as the stage's `next_round`."""
+    stage = next((s for s in _pipeline_of(pl, root).get("stage", []) if s.get("id") == stage_id), {"id": stage_id})
+    return pl.review_round(root, run_id, stage)
 
 
 # -------------------------------------------------- the builder's blindness
@@ -2794,7 +2789,7 @@ def own_record(pl, root: Path, pipeline: dict, role: str, rel: str) -> tuple[boo
         if rounds[1] != current:
             return False, (
                 f"plumbline: the {role} writes in the current round of {rounds[0]} (round-{current}); {rel} is in round-{rounds[1]}. "
-                "`plumbline.py gate` opens the next round's directory when a review fails with rounds left; write in the round your brief names."
+                "A review that runs again once what it reviews has changed is the next round, and `plumbline.py plan --run RUN` names it (`next_round`); write in the round your brief names."
             )
     return True, None
 

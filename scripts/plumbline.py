@@ -1501,13 +1501,17 @@ def default_run_id(root: Path) -> str:
     return f"{short}-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
 
 
-def build_plan(pipeline: dict, record: dict, run_id: str, commands: dict | None = None, graft: bool = False, request: bool = False) -> dict:
+def build_plan(
+    pipeline: dict, record: dict, run_id: str, commands: dict | None = None, graft: bool = False, request: bool = False, next_rounds: dict[str, int] | None = None
+) -> dict:
     """The stages to run for a classified change, in order, with every read
     resolved to a record path and every on_fail resolved within the row. The
     intake record's intent is applied to the row: skipped stages are left out,
     the records it supplies count as present, and its gates and lenses replace
     the stages' own. When the run stores its request (`request`), the request
-    input resolves to the file that holds it."""
+    input resolves to the file that holds it. A review stage says the round its
+    agents write in (`next_round`, see review_round): 1 for a run that has begun
+    nothing, and what `next_rounds` gives for one that has."""
     intent = record.get("intent", DEFAULT_INTENT)
     effective = effective_row(pipeline, record["row"], intent)
     by_id = {s["id"]: s for s in pipeline["stage"]}
@@ -1546,6 +1550,7 @@ def build_plan(pipeline: dict, record: dict, run_id: str, commands: dict | None 
         if kind == "review":
             for key in ("target", "defenders", "survive_if_unrefuted_by", "screen_defenders", "detective"):
                 entry[key] = stage.get(key)
+            entry["next_round"] = (next_rounds or {}).get(sid, 1)
         stages.append(entry)
     return {
         "run_id": run_id,
@@ -2112,6 +2117,12 @@ def latest_entry(ledger: list[dict], kind: str, **fields) -> dict | None:
     return None
 
 
+def entry_position(ledger: list[dict], entry: dict | None) -> int | None:
+    """Where this entry (one of the entries of `ledger`, as latest_entry returns it) stands in the ledger: the order of the entries is what
+    tells which came first, where the time they carry has a resolution of a second."""
+    return next((i for i, other in enumerate(ledger) if other is entry), None)
+
+
 def resumed_since(ledger: list[dict], entry: dict | None) -> bool:
     """Was the agent of this `agent` entry (an entry of `ledger`) resumed after the stop the entry records? The PreToolUse hook enters a
     `resume` for each message the orchestrator sends to an agent that has stopped, so an agent whose latest `resume` comes after its latest
@@ -2119,8 +2130,21 @@ def resumed_since(ledger: list[dict], entry: dict | None) -> bool:
     agent_id = (entry or {}).get("agent_id")
     if not (isinstance(agent_id, str) and agent_id):
         return False
-    position = next((i for i, other in enumerate(ledger) if other is entry), None)
+    position = entry_position(ledger, entry)
     return position is not None and any(other.get("kind") == "resume" and other.get("agent_id") == agent_id for other in ledger[position + 1 :])
+
+
+def changed_at(ledger: list[dict], stage_id: str) -> int | None:
+    """Where in the ledger a stage's record last changed: the latest `agent` or `supplied` entry of the stage whose record_sha256 is not the one the entry
+    before it held (the first entry always changed it). A stop that leaves the record as it was changes nothing, so a resumed agent that has nothing to
+    change does not make what was reviewed stale. None while the stage has no such entry."""
+    last, found = None, None
+    for position, entry in enumerate(ledger):
+        if entry.get("kind") in ("agent", "supplied") and entry.get("stage") == stage_id:
+            if entry.get("record_sha256") != last:
+                found = position
+            last = entry.get("record_sha256")
+    return found
 
 
 def stop_after_resume(ledger: list[dict], agent_id: str, floor: int) -> dict | None:
@@ -3037,6 +3061,37 @@ def _round_number(path: Path) -> int | None:
     return int(match.group(1)) if match and path.is_dir() else None
 
 
+TARGET_NAMES = {"tests": ("the tests", "them"), "plan": ("the plan", "it")}  # how a problem names what a review stage reviewed, and the pronoun that goes with it
+
+
+def review_round(root: Path, run_id: str, stage: dict, ledger: list[dict] | None = None) -> int:
+    """The round the agents of a review stage write in now: the highest round-<n> directory the stage has (round 1 while it has none), or the one after it
+    when that round is over. A round is over when its gate has passed on the record `merge-review` built from it, or when its records were made before what
+    the stage reviews (its `target`: the plan, the tests) last changed. A review that runs again then, after a replan, a rebuild or a revision of the tests, or
+    to look at what was fixed once a gate had passed, is the next round, so it never writes over the history of a round that is over. A round whose gate failed
+    with blockers has its next directory already (`gate` opens it); a round still being written, or one whose gate has not run, goes on in its directory."""
+    unit = run_dir(root, run_id) / stage["id"]
+    rounds = sorted(n for n in (_round_number(p) for p in unit.glob("round-*")) if n is not None)
+    if not rounds:
+        return 1
+    highest = rounds[-1]
+    ledger = read_ledger(root, run_id) if ledger is None else ledger
+    record_path = run_dir(root, run_id) / f"{stage['id']}.json"
+    data, problem = load_json_file(record_path)
+    if problem is None and isinstance(data, dict) and data.get("round") == highest:
+        gate = latest_entry(ledger, "gate", stage=stage["id"])
+        if gate is not None and gate.get("passed") is True and gate.get("record_sha256") == file_sha256(record_path):
+            return highest + 1
+    target = stage.get("target")
+    changed = changed_at(ledger, target) if isinstance(target, str) else None
+    if changed is not None:
+        for part in sorted((unit / f"round-{highest}").glob("*.json")):
+            position = entry_position(ledger, latest_entry(ledger, "agent", record=rel_path(root, part)))
+            if position is not None and position < changed:
+                return highest + 1
+    return highest
+
+
 def _part_type(data) -> str | None:
     """Which per-agent review record `data` is, or None when it is none of them."""
     return next((name for name in REVIEW_PART_TYPES if not check_record(name, data)), None)
@@ -3379,11 +3434,21 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
         problems += request_problems(root, run_id, ledger)
     tree = worktree_tree(root)
     current = change_hash(root, run.merge_base, tree)
+    target = stage.get("target")
+    changed = changed_at(ledger, target) if isinstance(target, str) else None  # where in the ledger what the stage reviews last changed
     parts = []
     for where, data, role in used:
         sha = file_sha256(root / where)
         parts.append({"path": where, "sha256": sha})
-        problems += _agent_entry_problems(latest_entry(ledger, "agent", record=where), role, sha, where, ledger, run_id)
+        entry = latest_entry(ledger, "agent", record=where)
+        problems += _agent_entry_problems(entry, role, sha, where, ledger, run_id)
+        position = entry_position(ledger, entry)
+        if changed is not None and position is not None and position < changed:
+            noun = TARGET_NAMES.get(target, (f"the {target} record", "it"))[0]
+            problems.append(
+                f"{where}: its agent stopped before {noun} last changed, so it reviewed an older version; run the agent again in round {round_no + 1} "
+                f"(`plumbline.py plan --run {run_id}` gives it as the stage's `next_round`)"
+            )
         if data["diff_sha256"] != current:
             problems.append(
                 f"{where}: it covers the change {data['diff_sha256'][:12]}, but the files now hash to {current[:12]}; "
@@ -4105,10 +4170,11 @@ def plan_of_run(args) -> int:
             raise PlumblineError(f"--run prints the plan of a run that has begun, so {name} does not go with it (it starts a run)")
     project = _ready_project(args.project)
     run_id = check_run_id(args.plan_run)
-    load_run(project, run_id)  # the run must exist, and its intake record must be the one `plan --intent` wrote
+    run = load_run(project, run_id)  # the run must exist, and its intake record must be the one `plan --intent` wrote
     intake, _problems = read_stage_record(project.root, run_id, intake_stage_of(project.pipeline))
     ledger = read_ledger(project.root, run_id)
-    plan = build_plan(project.pipeline, intake, run_id, project.commands, project.graft_enabled, latest_entry(ledger, "request") is not None)
+    rounds = {stage["id"]: review_round(project.root, run_id, stage, ledger) for stage in run.stages if stage.get("kind", "agent") == "review"}
+    plan = build_plan(project.pipeline, intake, run_id, project.commands, project.graft_enabled, latest_entry(ledger, "request") is not None, rounds)
     for entry in plan["supplied"]:
         shown = latest_entry(ledger, "supplied", stage=entry["stage"])
         entry["source"] = shown.get("source") if shown else None

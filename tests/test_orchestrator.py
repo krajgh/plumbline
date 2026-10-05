@@ -165,7 +165,8 @@ def test_a_hand_back_that_returns_with_a_decision_is_acted_on_first():
     decision = between(body, "## A decision comes back", "## Hand back")
     assert "When your brief gives the builder's decision, act on it first." in decision
     assert "**Fix the open findings**" in decision and "**Ship:** hand back with every gate passed." in decision
-    assert "`gate` opened no new round" in decision and "names it; run that agent again" in decision
+    assert "`gate` opened no new round, and the review is the next one: the round that passed is over, `next_round` in the plan names the round after it" in decision
+    assert "so that the records of the round that passed stay as they were" in decision and "over the old records" not in decision  # the old text had the review write over them
 
 
 # --- the stage procedure, moved out of the run skill
