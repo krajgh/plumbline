@@ -1,11 +1,14 @@
 """A canary finding, in calibration runs only: `plan --calibrate` marks the run, the canary plants one false finding in each review round that has
 defenders, the defenders may not see its key, and `merge-review` reports how they answered it without ever counting it."""
 import json
+import re
 
 import pytest
 
 import plumbline as pl
 import pre_tool_use as pre
+from pathlib import Path
+
 from helpers import REPO, default_pipeline, write
 from helpers import commit_all
 from hookdata import bash_payload, stop_payload, tool_payload
@@ -16,7 +19,7 @@ from rundata import (
 from samples import sample
 from test_agents import agent
 from test_manifests import between, frontmatter
-from test_readme import rows, section
+from test_readme import README, rows, section
 
 ROUND = ("review", "round-1")
 
@@ -53,11 +56,15 @@ def finding(fid, severity="BLOCKING", lens="correctness"):
     }
 
 
-def canary_finding(fid="canary-1", severity="MAJOR", file="src/app.py"):
-    return {**finding(fid, severity, "canary"), "file": file, "claim": "main swallows the error of retry", "failure_scenario": "retry raises, and main returns None"}
+CID = "correctness-2"  # the canary's finding: a prosecutor's id, numbered after the correctness prosecutor's own (correctness-1)
+CANARY_STEM = "prosecutor-correctness-b"  # and its record: named as a second prosecutor's of the lens
 
 
-KEY = {"finding_id": "canary-1", "why_false": "main returns what retry returns, so retry's error reaches the caller"}
+def canary_finding(fid=CID, severity="MAJOR", file="src/app.py", lens="correctness"):
+    return {**finding(fid, severity, lens), "file": file, "claim": "main swallows the error of retry", "failure_scenario": "retry raises, and main returns None"}
+
+
+KEY = {"finding_id": CID, "why_false": "main returns what retry returns, so retry's error reaches the caller"}
 
 
 def file_findings(repo, findings, round_no=1):
@@ -65,11 +72,11 @@ def file_findings(repo, findings, round_no=1):
     put_part(repo, "review", "prosecutor-tests", {"lens": "tests", "findings": []}, round_no)
 
 
-def plant(repo, finding_=None, key=KEY, round_no=1):
-    """What the canary leaves: its record, traced to plumbline:canary, and its key, a file no agent entry covers."""
-    put_part(repo, "review", "prosecutor-canary", {"lens": "canary", "findings": [finding_ or canary_finding()]}, round_no)
+def plant(repo, finding_=None, key=KEY, round_no=1, stem=CANARY_STEM, lens="correctness", stage="review"):
+    """What the canary leaves: its record, a prosecutor's to look at and traced to plumbline:canary, and its key, a file no agent entry covers."""
+    put_part(repo, stage, stem, {"lens": lens, "findings": [finding_ or canary_finding(lens=lens)]}, round_no, role="canary")
     if key is not None:
-        put_part(repo, "review", "canary-key", key, round_no, agent=False)
+        put_part(repo, stage, "canary-key", key, round_no, agent=False)
 
 
 def answer(fid, who, verdict="conceded", quote="return retry(url)", claim=None):
@@ -142,16 +149,19 @@ def test_the_intake_record_of_a_calibration_run_renders_as_one():
 # --- the agent, the record and the policy
 
 
-def test_the_canary_is_the_eighth_agent_and_writes_a_findings_record_with_the_canary_lens():
-    assert pl.AGENT_ROLES[-1] == "canary" and pl.AGENT_RECORDS["canary"] == "findings_record" and len(pl.AGENT_ROLES) == 8
-    assert "canary" in pl.load_schema("findings_record")["properties"]["lens"]["enum"]
-    assert "canary" in pl.load_schema("findings_record")["properties"]["findings"]["items"]["properties"]["lens"]["enum"]
-    assert "canary" not in pl.load_schema("review_record")["properties"]["lenses"]["items"]["enum"]  # the merged record never holds the canary's finding
-    assert "canary" not in pl.KNOWN_LENSES  # no stage or row reviews through it
+def test_the_canary_is_the_eighth_agent_and_writes_a_findings_record_with_a_lens_of_the_round():
+    assert pl.AGENT_ROLES[7] == "canary" and pl.AGENT_RECORDS["canary"] == "findings_record" and len(pl.AGENT_RECORDS) == 8
+    schema = pl.load_schema("findings_record")["properties"]
+    lenses = pl.load_schema("review_record")["properties"]["lenses"]["items"]["enum"]
+    assert schema["lens"]["enum"] == lenses == schema["findings"]["items"]["properties"]["lens"]["enum"]  # the canary's lens is one a review runs, and no lens is the canary's
+    assert "canary" not in schema["lens"]["enum"] and "canary" not in pl.KNOWN_LENSES
+    assert "canary" not in json.dumps(schema)  # nothing of the schema a prosecutor reads says there is one
     record = sample("findings_record")
-    record.update(lens="canary")
-    record["findings"] = [{**f, "lens": "canary"} for f in record["findings"][:1]]
     assert pl.check_record("findings_record", record) == []
+    record.update(lens="canary")
+    assert any(e.startswith("$.lens:") for e in pl.check_record("findings_record", record))
+    record["findings"] = [{**f, "lens": "canary"} for f in record["findings"][:1]]
+    assert any(e.startswith("$.findings[0].lens:") for e in pl.check_record("findings_record", record))
 
 
 def test_the_canary_policy_writes_its_records_only_and_runs_git_read_and_search():
@@ -169,14 +179,21 @@ def test_the_canary_prompt_says_what_to_plant_what_to_write_and_where():
     for needed in (
         "You are the canary in a plumbline calibration run", "The prosecutors file findings that are true. You file one that is false",
         "`merge-review` keeps your finding out of the survivors, the routes, the blockers and what the pass record leaves open",
-        "the two paths where you write, both in the round directory: your record, `prosecutor-canary.json`, and your key, `canary-key.json`",
+        "File it so that it is a prosecutor's in every way they can see: a lens of the round, an id and a file name in a prosecutor's shape",
+        "Your key is the one place that says which finding is yours",
+        "the lenses of the round; the paths of the prosecutors' records, which have reported already; and the round directory, where you write two files",
+        "Read the prosecutors' records, and note how they write",
         "It is plausible, so that a reviewer who reads only the claim believes it, and it is false, so that a line of the code, or of its file, shows it: a defender refutes it by quoting that line",
-        "`id` `canary-1`, `lens` `canary`", "`severity` `MAJOR`, so that the round needs the same defenders with the canary as without it",
-        '{"finding_id": "canary-1", "why_false": ', "Write both files with the Write tool", "RECORD: <the path of your record>",
+        "`id` the lens, a dash and the number after the highest the prosecutor of that lens used (`security-3`, or `security-1` when it filed none), `lens` that lens",
+        "`severity` `MAJOR`, so that the round needs the same defenders with the canary as without it",
+        '{"finding_id": "<the id of your finding>", "why_false": ', "Name the record `prosecutor-<lens>-b.json` in the round directory", "and the key `canary-key.json` beside it",
+        "Write both files with the Write tool", "RECORD: <the path of your record>",
     ):
         assert needed in body, needed
-    assert '{"lens": "canary", "findings": [ <your one finding> ], "diff_sha256": "<the hash in your brief>"}' in body
+    assert '{"lens": "<the lens of your finding>", "findings": [ <your one finding> ], "diff_sha256": "<the hash in your brief>"}' in body
     assert "check-record findings_record <the path of your record>" in body
+    assert "lens `canary`" not in body and '"lens": "canary"' not in body and "canary-1" not in body  # the record carries nothing of the old plant
+    assert "after the prosecutors have reported and before the defenders" in fields["description"]
 
 
 # --- the hooks: the canary writes its two files
@@ -188,29 +205,32 @@ def write_by(repo, role, name, round_name="round-1", stage="review"):
 
 
 def test_the_canary_writes_its_record_and_its_key_in_the_current_round_and_nothing_else(calibration):
-    assert write_by(calibration, "canary", "prosecutor-canary.json") is None and write_by(calibration, "canary", "canary-key.json") is None
-    for other in ("prosecutor-correctness.json", "defender-1.json", "screen-1.json", "detective.json", "notes.json"):
+    for lens in ("correctness", "tests", "security", "data", "boundaries", "docs", "requirements"):
+        assert write_by(calibration, "canary", f"prosecutor-{lens}-b.json") is None, lens  # its record is named for a second prosecutor of any lens it picks
+    assert write_by(calibration, "canary", "canary-key.json") is None
+    for other in ("prosecutor-correctness.json", "prosecutor-canary.json", "prosecutor-correctness-c.json", "prosecutor-x-y-b.json", "defender-1.json", "screen-1.json", "detective.json", "notes.json"):
         assert write_by(calibration, "canary", other), other
-    assert write_by(calibration, "canary", "prosecutor-canary.json", "round-2")  # another round's directory
+    assert write_by(calibration, "canary", "prosecutor-correctness-b.json", "round-2")  # another round's directory
     denied = write_by(calibration, "canary", "detective.json")
-    assert "round-<n>/prosecutor-canary.json or canary-key.json" in denied
+    assert "round-<n>/prosecutor-<lens>-b.json or canary-key.json" in denied
 
 
 def test_the_canarys_files_are_the_canarys_alone(calibration):
     for role in ("prosecutor", "defender", "detective"):
-        assert write_by(calibration, role, "prosecutor-canary.json"), role
+        assert write_by(calibration, role, "prosecutor-correctness-b.json"), role
         assert write_by(calibration, role, "canary-key.json"), role
     assert write_by(calibration, "prosecutor", "prosecutor-security.json") is None  # a prosecutor's own file is still its own
+    assert write_by(calibration, "prosecutor", "prosecutor-canary.json") is None  # and so is any name that is not a second record of a lens
     assert pl.AGENT_RECORDS["canary"] == "findings_record" and pre.REVIEW_ROLES == ("prosecutor", "defender", "detective", "canary")
-    assert pre.REVIEW_FILE_NAMES["canary"] == ("prosecutor-canary.json", "canary-key.json")
+    assert pre.REVIEW_FILE_NAMES["canary"] == ("prosecutor-<lens>-b.json", "canary-key.json")
 
 
 def test_the_canarys_stop_is_let_go_with_its_record_in_the_round_directory(run_stop, repo):
     adopt(repo)
     begin(repo, "code.S")
-    record = {"lens": "canary", "findings": [canary_finding()], "diff_sha256": now_hash(repo)}
-    write(run_path(repo, RUN, *ROUND, "prosecutor-canary.json"), json.dumps(record))
-    result = run_stop(stop_payload(repo, "plumbline:canary", "Planted.\nRECORD: .plumbline/runs/r1/review/round-1/prosecutor-canary.json"), repo)
+    record = {"lens": "correctness", "findings": [canary_finding()], "diff_sha256": now_hash(repo)}
+    write(run_path(repo, RUN, *ROUND, f"{CANARY_STEM}.json"), json.dumps(record))
+    result = run_stop(stop_payload(repo, "plumbline:canary", f"Planted.\nRECORD: .plumbline/runs/r1/review/round-1/{CANARY_STEM}.json"), repo)
     assert result.returncode == 0 and result.stdout == "" and result.stderr == ""
     [entry] = [e for e in ledger(repo) if e["kind"] == "agent"]
     assert (entry["agent_type"], entry["stage"], entry["record_type"], entry["valid"]) == ("plumbline:canary", "review", "findings_record", True)
@@ -219,7 +239,7 @@ def test_the_canarys_stop_is_let_go_with_its_record_in_the_round_directory(run_s
 def test_the_canary_has_no_stage_of_its_own_so_a_record_outside_a_review_round_holds_it_back(run_stop, repo):
     adopt(repo)
     begin(repo, "code.S")
-    record = {"lens": "canary", "findings": [canary_finding()], "diff_sha256": now_hash(repo)}
+    record = {"lens": "correctness", "findings": [canary_finding()], "diff_sha256": now_hash(repo)}
     write(run_path(repo, RUN, "plan.json"), json.dumps(record))
     result = run_stop(stop_payload(repo, "plumbline:canary", "Planted.\nRECORD: .plumbline/runs/r1/plan.json"), repo)
     assert result.returncode == 2 and "a canary writes its record at .plumbline/runs/r1/review/round-<n>/<name>.json" in result.stderr
@@ -230,6 +250,10 @@ def test_the_canary_has_no_stage_of_its_own_so_a_record_outside_a_review_round_h
 
 def key_path(repo):
     return repo / ".plumbline" / "runs" / RUN / "review" / "round-1" / "canary-key.json"
+
+
+def ledger_path(repo):
+    return repo / ".plumbline" / "runs" / RUN / "ledger.jsonl"
 
 
 def read_as(repo, role, tool, **tool_input):
@@ -256,7 +280,7 @@ def test_a_defender_cannot_read_the_key_or_find_it_through_a_symlink(keyed):
 
 
 def test_a_defender_reads_the_canarys_record_like_any_findings_record(keyed):
-    for name in ("prosecutor-canary.json", "prosecutor-correctness.json", "prosecutor-tests.json"):
+    for name in (f"{CANARY_STEM}.json", "prosecutor-correctness.json", "prosecutor-tests.json"):
         assert read_as(keyed, "defender", "Read", file_path=str(key_path(keyed).with_name(name))) is None, name
     assert read_as(keyed, "defender", "Read", file_path=str(keyed / "src" / "app.py")) is None
     assert read_as(keyed, "defender", "Read", file_path=str(keyed / ".plumbline" / "runs" / RUN / "plan.json")) is None  # the spec a claim rests on
@@ -282,6 +306,20 @@ def test_a_defender_can_still_search_the_source_and_the_findings_records_one_by_
 def test_a_glob_that_names_the_key_is_denied_wherever_it_looks(keyed):
     assert read_as(keyed, "defender", "Glob", pattern="**/canary-key.json", path="src")
     assert read_as(keyed, "defender", "Glob", pattern="**/CANARY-KEY.JSON")
+
+
+def test_a_defender_cannot_read_the_ledger_either_because_it_names_the_agent_of_each_record(keyed):
+    entry = [e for e in ledger(keyed) if e.get("agent_type") == "plumbline:canary"]
+    assert len(entry) == 1 and entry[0]["record"].endswith(f"{CANARY_STEM}.json")  # what the ledger holds, which the defender would read
+    denied = read_as(keyed, "defender", "Read", file_path=str(ledger_path(keyed)))
+    assert denied and "would show a file that a defender answers without" in denied and "canary" not in denied.lower()
+    assert read_as(keyed, "defender", "Read", file_path=".plumbline/runs/r1/ledger.jsonl")
+    (keyed / "history.jsonl").symlink_to(ledger_path(keyed))
+    assert read_as(keyed, "defender", "Read", file_path=str(keyed / "history.jsonl"))
+    assert read_as(keyed, "defender", "Grep", pattern="agent_type", path=str(ledger_path(keyed)))
+    assert read_as(keyed, "defender", "Glob", pattern="**/ledger.jsonl") and read_as(keyed, "defender", "Glob", pattern="**/LEDGER.JSONL", path="src")
+    for other in ("prosecutor", "detective", "canary", "verifier", None):
+        assert read_as(keyed, other, "Read", file_path=str(ledger_path(keyed))) is None, other
 
 
 def test_the_denial_says_nothing_of_a_canary(keyed):
@@ -317,9 +355,16 @@ def test_the_denial_says_nothing_of_a_canary(keyed):
         "cd .plumbline/runs/r1/review/round-1 && cat canary-key.json",
         "cd .plumbline/runs/r1/review/round-1 && grep -r x .",
         "echo $(cat .plumbline/runs/r1/review/round-1/canary-key.json)",
+        "cat .plumbline/runs/r1/ledger.jsonl",
+        "grep canary .plumbline/runs/r1/ledger.jsonl",
+        "grep agent_type .plumbline/runs/r1/led*",
+        "tail -n 3 .plumbline/runs/r1/ledger.jsonl",
+        "cd .plumbline/runs/r1 && cat ledger.jsonl",
+        "wc -l .plumbline/runs/r1/*.jsonl",
+        "ls .plumbline/runs/r1",
     ],
 )
-def test_a_defenders_bash_does_not_reach_the_key(keyed, command):
+def test_a_defenders_bash_does_not_reach_the_key_or_the_ledger(keyed, command):
     reason = bash_as(keyed, command)
     assert reason and "would show a file that a defender answers without" in reason, command
 
@@ -327,8 +372,9 @@ def test_a_defenders_bash_does_not_reach_the_key(keyed, command):
 @pytest.mark.parametrize(
     "command",
     [
-        "cat .plumbline/runs/r1/review/round-1/prosecutor-canary.json",
+        "cat .plumbline/runs/r1/review/round-1/prosecutor-correctness-b.json",
         "cat .plumbline/runs/r1/review/round-1/prosecutor-correctness.json",
+        "cat .plumbline/runs/r1/plan.json",
         "grep -n retry src/app.py",
         "grep -rn retry src/",
         "grep -rn retry src",
@@ -347,10 +393,11 @@ def test_a_defenders_bash_still_reads_the_code_and_the_findings_records(keyed, c
     assert bash_as(keyed, command) is None, command
 
 
-def test_the_other_roles_and_the_main_session_read_the_key(keyed):
+def test_the_other_roles_and_the_main_session_read_the_key_and_the_ledger(keyed):
     for role in ("prosecutor", "detective", "canary", None):
         assert read_as(keyed, role, "Read", file_path=str(key_path(keyed))) is None, role
         assert bash_as(keyed, "cat .plumbline/runs/r1/review/round-1/canary-key.json", role) is None, role
+        assert bash_as(keyed, "cat .plumbline/runs/r1/ledger.jsonl", role) is None, role
 
 
 def test_without_a_key_nothing_changes_for_a_defender(ordinary):
@@ -359,7 +406,9 @@ def test_without_a_key_nothing_changes_for_a_defender(ordinary):
     assert read_as(ordinary, "defender", "Read", file_path=str(key_path(ordinary))) is None  # there is nothing to hide
     assert read_as(ordinary, "defender", "Grep", pattern="retry") is None
     assert read_as(ordinary, "defender", "Glob", pattern="**/canary-key.json") is None
-    for command in ("grep -rn retry .", "find . -name '*.json'", "cat canary-key.json", "ls -R .plumbline"):
+    assert read_as(ordinary, "defender", "Read", file_path=str(ledger_path(ordinary))) is None  # nor the ledger
+    assert read_as(ordinary, "defender", "Glob", pattern="**/ledger.jsonl") is None
+    for command in ("grep -rn retry .", "find . -name '*.json'", "cat canary-key.json", "ls -R .plumbline", "cat .plumbline/runs/r1/ledger.jsonl"):
         assert bash_as(ordinary, command) is None, command
 
 
@@ -372,20 +421,21 @@ def launch(repo, prompt, subagent="plumbline:defender", **fields):
 
 BRIEF = (
     "Run r1. You are defender-1. The findings records of this round: .plumbline/runs/r1/review/round-1/prosecutor-correctness.json, "
-    ".plumbline/runs/r1/review/round-1/prosecutor-tests.json, .plumbline/runs/r1/review/round-1/prosecutor-canary.json. Write your record to .plumbline/runs/r1/review/round-1/defender-1.json."
+    ".plumbline/runs/r1/review/round-1/prosecutor-tests.json, .plumbline/runs/r1/review/round-1/prosecutor-correctness-b.json. Write your record to .plumbline/runs/r1/review/round-1/defender-1.json."
 )
 
 
-def test_a_defenders_brief_lists_the_canarys_record_among_the_others_and_that_is_no_naming(calibration):
+def test_a_defenders_brief_lists_the_canarys_record_among_the_others_and_names_nothing(calibration):
     assert launch(calibration, BRIEF) is None
-    assert launch(calibration, BRIEF.replace("prosecutor-canary.json", "PROSECUTOR-CANARY.JSON")) is None
+    assert "canary" not in BRIEF.lower()  # the record's name is a prosecutor's: the brief has nothing to leave out
+    assert launch(calibration, BRIEF.replace("prosecutor-correctness-b.json", "prosecutor-canary.json"))  # the old name is a naming
 
 
 @pytest.mark.parametrize(
     "brief",
     [
         BRIEF + " The last of them is the canary's.",
-        BRIEF + " Answer canary-1 as you answer the rest.",
+        BRIEF + f" Answer {CID} as you answer the rest, the canary's.",
         BRIEF + " The key is in .plumbline/runs/r1/review/round-1/canary-key.json.",
         BRIEF + " CANARY",
         "The canary has planted a finding. " + BRIEF,
@@ -424,14 +474,14 @@ def test_a_canary_the_panel_refuted_is_reported_and_counted_nowhere(run_cli, cal
     file_findings(calibration, [finding("correctness-1", "BLOCKING")])
     plant(calibration)
     panel(calibration, [
-        [answer("correctness-1", "x"), answer("canary-1", "x", "refuted")],
-        [answer("correctness-1", "x"), answer("canary-1", "x", "refuted")],
-        [answer("correctness-1", "x"), answer("canary-1", "x")],
+        [answer("correctness-1", "x"), answer(CID, "x", "refuted")],
+        [answer("correctness-1", "x"), answer(CID, "x", "refuted")],
+        [answer("correctness-1", "x"), answer(CID, "x")],
     ])
     result = merge(run_cli, calibration)
     assert result.returncode == 0, result.stdout + result.stderr
     record = merged(calibration)
-    assert record["canary"] == {"finding_id": "canary-1", "refuted_by": ["defender-1", "defender-2"], "conceded_by": ["defender-3"]}
+    assert record["canary"] == {"finding_id": CID, "refuted_by": ["defender-1", "defender-2"], "conceded_by": ["defender-3"]}
     assert [f["id"] for f in record["findings"]] == ["correctness-1"] and record["survivors"] == ["correctness-1"]
     assert record["routes"] == {"builder": ["correctness-1"], "test-writer": [], "planner": []} and record["blockers_surviving"] == 1
     assert all(d["finding_id"] == "correctness-1" for d in record["defenses"]) and len(record["defenses"]) == 3  # the answers to the canary are in its field alone
@@ -443,19 +493,19 @@ def test_a_canary_the_panel_refuted_is_reported_and_counted_nowhere(run_cli, cal
 def test_a_canary_every_defender_conceded_is_the_rubber_stamp_the_run_measures(run_cli, calibration):
     file_findings(calibration, [finding("correctness-1", "BLOCKING")])
     plant(calibration)
-    panel(calibration, [[answer("correctness-1", "x"), answer("canary-1", "x")]] * 3)
+    panel(calibration, [[answer("correctness-1", "x"), answer(CID, "x")]] * 3)
     result = merge(run_cli, calibration)
-    assert merged(calibration)["canary"] == {"finding_id": "canary-1", "refuted_by": [], "conceded_by": ["defender-1", "defender-2", "defender-3"]}
+    assert merged(calibration)["canary"] == {"finding_id": CID, "refuted_by": [], "conceded_by": ["defender-1", "defender-2", "defender-3"]}
     assert "canary: refuted by 0 of 3 defenders; conceded by defender-1, defender-2, defender-3" in result.stdout
 
 
 def test_one_screening_defender_answers_the_canary_in_a_round_without_a_blocking_finding(run_cli, calibration):
     file_findings(calibration, [finding("correctness-1", "MAJOR")])
     plant(calibration)
-    put_part(calibration, "review", "screen-1", {"defender": "screen-1", "defenses": [answer("correctness-1", "screen-1"), answer("canary-1", "screen-1", "refuted")]})
+    put_part(calibration, "review", "screen-1", {"defender": "screen-1", "defenses": [answer("correctness-1", "screen-1"), answer(CID, "screen-1", "refuted")]})
     result = merge(run_cli, calibration)
     assert result.returncode == 0 and result.stderr == ""
-    assert merged(calibration)["canary"] == {"finding_id": "canary-1", "refuted_by": ["screen-1"], "conceded_by": []}
+    assert merged(calibration)["canary"] == {"finding_id": CID, "refuted_by": ["screen-1"], "conceded_by": []}
     assert "canary: refuted by 1 of 1 defender (screen-1)" in result.stdout
     assert merged(calibration)["survivors"] == ["correctness-1"]
 
@@ -463,7 +513,7 @@ def test_one_screening_defender_answers_the_canary_in_a_round_without_a_blocking
 def test_a_screening_defenders_claim_of_blocking_for_the_canary_asks_for_no_panel(run_cli, calibration):
     file_findings(calibration, [finding("correctness-1", "MAJOR")])
     plant(calibration)
-    put_part(calibration, "review", "screen-1", {"defender": "screen-1", "defenses": [answer("correctness-1", "screen-1"), answer("canary-1", "screen-1", claim="BLOCKING")]})
+    put_part(calibration, "review", "screen-1", {"defender": "screen-1", "defenses": [answer("correctness-1", "screen-1"), answer(CID, "screen-1", claim="BLOCKING")]})
     result = merge(run_cli, calibration)
     record = merged(calibration)
     assert record["panel_needed"] == [] and "panel needed" not in result.stdout and record["blockers_surviving"] == 0
@@ -474,7 +524,7 @@ def test_a_screening_defenders_claim_of_blocking_for_the_canary_asks_for_no_pane
 def test_a_canary_filed_as_blocking_is_still_no_blocker(run_cli, calibration):
     file_findings(calibration, [])
     plant(calibration, canary_finding(severity="BLOCKING"))
-    panel(calibration, [[answer("canary-1", "x")]] * 3)
+    panel(calibration, [[answer(CID, "x")]] * 3)
     result = merge(run_cli, calibration)
     record = merged(calibration)
     assert record["findings"] == [] and record["survivors"] == [] and record["blockers_surviving"] == 0
@@ -486,14 +536,14 @@ def test_a_refutation_of_the_canary_needs_a_quote_the_change_or_its_file_holds(r
     file_findings(calibration, [])
     plant(calibration)
     panel(calibration, [
-        [answer("canary-1", "x", "refuted", quote="return retry(url)")],
-        [answer("canary-1", "x", "refuted", quote="return somewhere_else(url)")],
-        [answer("canary-1", "x", "refuted", quote="")],
+        [answer(CID, "x", "refuted", quote="return retry(url)")],
+        [answer(CID, "x", "refuted", quote="return somewhere_else(url)")],
+        [answer(CID, "x", "refuted", quote="")],
     ])
     result = merge(run_cli, calibration)
-    assert merged(calibration)["canary"] == {"finding_id": "canary-1", "refuted_by": ["defender-1"], "conceded_by": []}
-    assert "defender 'defender-2' refuted 'canary-1' with a quote that is in neither the change nor src/app.py, which does not count" in result.stderr
-    assert "defender 'defender-3' refuted 'canary-1' without quoting code, which does not count" in result.stderr
+    assert merged(calibration)["canary"] == {"finding_id": CID, "refuted_by": ["defender-1"], "conceded_by": []}
+    assert f"defender 'defender-2' refuted '{CID}' with a quote that is in neither the change nor src/app.py, which does not count" in result.stderr
+    assert f"defender 'defender-3' refuted '{CID}' without quoting code, which does not count" in result.stderr
     assert "canary: refuted by 1 of 1 defender (defender-1)" in result.stdout  # the two that did not count are in neither list
 
 
@@ -503,14 +553,14 @@ def test_a_round_whose_defenders_did_not_run_has_a_canary_nobody_answered(run_cl
     file_findings(calibration, [finding("correctness-1", "MAJOR")])
     plant(calibration)
     record, problems, warnings = pl.merge_review(project, RUN, "review")
-    assert problems == [] and warnings == [] and record["canary"] == {"finding_id": "canary-1", "refuted_by": [], "conceded_by": []}
+    assert problems == [] and warnings == [] and record["canary"] == {"finding_id": CID, "refuted_by": [], "conceded_by": []}
     assert pl.canary_summary(record) == "no defender answered it"
 
 
 def test_the_canary_alone_is_a_round_to_answer(run_cli, calibration):
     file_findings(calibration, [])  # no prosecutor filed anything
     plant(calibration)
-    panel(calibration, [[answer("canary-1", "x", "refuted")]] * 3)
+    panel(calibration, [[answer(CID, "x", "refuted")]] * 3)
     result = merge(run_cli, calibration)
     assert result.returncode == 0 and merged(calibration)["findings"] == []
     assert "canary: refuted by 3 of 3 defenders (defender-1, defender-2, defender-3)" in result.stdout
@@ -530,7 +580,7 @@ def test_a_calibration_rounds_defenders_with_no_canary_to_answer_are_a_problem(r
     file_findings(calibration, [finding("correctness-1", "BLOCKING")])
     panel(calibration, [[answer("correctness-1", "x")]] * 3)
     out = problems_of(run_cli, calibration)
-    assert "this is a calibration run, and its defenders answered a round that has no canary: .plumbline/runs/r1/review/round-1/prosecutor-canary.json is missing" in out
+    assert "this is a calibration run, and its defenders answered a round that has no canary: .plumbline/runs/r1/review/round-1/canary-key.json is missing" in out
 
 
 def test_a_round_with_no_defender_yet_needs_no_canary_yet(run_cli, calibration):
@@ -541,13 +591,13 @@ def test_a_round_with_no_defender_yet_needs_no_canary_yet(run_cli, calibration):
 @pytest.mark.parametrize(
     "arrange,said",
     [
-        (lambda r: plant(r, key=None), "the canary left no key (.plumbline/runs/r1/review/round-1/canary-key.json)"),
-        (lambda r: put_part(r, "review", "canary-key", KEY, agent=False), "canary-key.json has no prosecutor-canary.json beside it"),
-        (lambda r: plant(r, key={"finding_id": "canary-9", "why_false": "x"}), "the key names 'canary-9', but the canary's finding is 'canary-1'"),
-        (lambda r: plant(r, key={"finding_id": "canary-1"}), "not a valid canary key: $.why_false: missing required key"),
-        (lambda r: plant(r, key={"finding_id": "canary-1", "why_false": "x", "more": 1}), "not a valid canary key: $.more: unexpected key"),
+        (lambda r: plant(r, key=None), "a second findings_record for lens 'correctness'"),
+        (lambda r: put_part(r, "review", "canary-key", KEY, agent=False), f"the key names '{CID}', but no findings record of the round holds that finding"),
+        (lambda r: plant(r, key={"finding_id": "correctness-9", "why_false": "x"}), "the key names 'correctness-9', but no findings record of the round holds that finding"),
+        (lambda r: plant(r, key={"finding_id": CID}), "not a valid canary key: $.why_false: missing required key"),
+        (lambda r: plant(r, key={"finding_id": CID, "why_false": "x", "more": 1}), "not a valid canary key: $.more: unexpected key"),
         (lambda r: plant(r, key=[1]), "not a valid canary key: $: expected object, got array"),
-        (lambda r: plant(r, canary_finding("correctness-1")), "the canary's finding id 'correctness-1' is also used in"),
+        (lambda r: plant(r, canary_finding("correctness-1"), key={**KEY, "finding_id": "correctness-1"}), "the key names 'correctness-1', which 2 findings records hold"),
     ],
     ids=["no-key", "key-alone", "key-names-another-finding", "key-without-why", "key-with-an-extra-field", "key-not-an-object", "id-of-a-prosecutor"],
 )
@@ -557,42 +607,91 @@ def test_a_canary_whose_files_do_not_agree_is_a_problem(run_cli, calibration, ar
     assert said in problems_of(run_cli, calibration)
 
 
-def test_a_canary_that_files_two_findings_or_none_or_another_lens_is_a_problem(run_cli, calibration):
+def test_a_second_record_for_a_lens_in_a_calibration_round_with_no_key_says_the_key_is_missing(run_cli, calibration):
+    file_findings(calibration, [finding("correctness-1", "MINOR")])
+    plant(calibration, key=None)
+    out = problems_of(run_cli, calibration)
+    assert "in a calibration run that is the canary's record, and canary-key.json, which says so, is missing" in out
+    panel(calibration, [[answer("correctness-1", "x")]] * 3)  # and a panel that answered a round with no key is a problem of its own
+    assert "its defenders answered a round that has no canary" in problems_of(run_cli, calibration)
+
+
+def test_a_canary_that_files_two_findings_or_none_or_a_lens_that_is_not_the_rounds_is_a_problem(run_cli, calibration):
     file_findings(calibration, [])
-    put_part(calibration, "review", "prosecutor-canary", {"lens": "canary", "findings": [canary_finding("canary-1"), canary_finding("canary-2")]})
+    put_part(calibration, "review", CANARY_STEM, {"lens": "correctness", "findings": [canary_finding(CID), canary_finding("correctness-3")]}, role="canary")
     put_part(calibration, "review", "canary-key", KEY, agent=False)
     assert "the canary files one finding (this record has 2)" in problems_of(run_cli, calibration)
-    put_part(calibration, "review", "prosecutor-canary", {"lens": "canary", "findings": []})
-    assert "the canary files one finding (this record has 0)" in problems_of(run_cli, calibration)
-    put_part(calibration, "review", "prosecutor-canary", {"lens": "correctness", "findings": [canary_finding()]})
-    assert "the canary's record carries lens 'correctness', not 'canary'" in problems_of(run_cli, calibration)
+    put_part(calibration, "review", CANARY_STEM, {"lens": "correctness", "findings": []}, role="canary")
+    assert f"the key names '{CID}', but no findings record of the round holds that finding" in problems_of(run_cli, calibration)
+    put_part(calibration, "review", CANARY_STEM, {"lens": "docs", "findings": [canary_finding(lens="docs")]}, role="canary")
+    assert "the canary's record carries lens 'docs', which is not one of this round's lenses (correctness, tests)" in problems_of(run_cli, calibration)
+    put_part(calibration, "review", CANARY_STEM, {"lens": "correctness", "findings": [canary_finding(lens="tests")]}, role="canary")
+    assert "the canary's finding carries another lens than its record ('correctness')" in problems_of(run_cli, calibration)
 
 
 def test_the_canarys_record_is_traced_to_the_canary_and_not_to_a_prosecutor(run_cli, calibration):
     file_findings(calibration, [])
-    put_part(calibration, "review", "prosecutor-canary", {"lens": "canary", "findings": [canary_finding()]}, agent=False)
+    put_part(calibration, "review", CANARY_STEM, {"lens": "correctness", "findings": [canary_finding()]}, agent=False)
     put_part(calibration, "review", "canary-key", KEY, agent=False)
-    assert "prosecutor-canary.json has no entry from plumbline:canary; run the canary" in problems_of(run_cli, calibration)
-    path = run_path(calibration, RUN, *ROUND, "prosecutor-canary.json")
+    assert f"{CANARY_STEM}.json has no entry from plumbline:canary; run the canary" in problems_of(run_cli, calibration)
+    path = run_path(calibration, RUN, *ROUND, f"{CANARY_STEM}.json")
     pl.append_ledger(calibration, RUN, {
         "kind": "agent", "agent_id": "p-1", "agent_type": "plumbline:prosecutor", "stage": "review", "record": pl.rel_path(calibration, path),
         "record_type": "findings_record", "record_sha256": pl.file_sha256(path), "valid": True, "blocks": 0,
     })
-    assert "the latest entry for .plumbline/runs/r1/review/round-1/prosecutor-canary.json is from plumbline:prosecutor, not plumbline:canary; run the canary" in problems_of(run_cli, calibration)
+    assert f"the latest entry for .plumbline/runs/r1/review/round-1/{CANARY_STEM}.json is from plumbline:prosecutor, not plumbline:canary; run the canary" in problems_of(run_cli, calibration)
 
 
 def test_the_gate_traces_the_canary_as_a_part_of_the_merge(run_cli, calibration):
     file_findings(calibration, [])
     plant(calibration)
-    panel(calibration, [[answer("canary-1", "x")]] * 3)
+    panel(calibration, [[answer(CID, "x")]] * 3)
     merge(run_cli, calibration)
     merge_entry = next(e for e in ledger(calibration) if e["kind"] == "merge")
-    assert ".plumbline/runs/r1/review/round-1/prosecutor-canary.json" in [part["path"] for part in merge_entry["parts"]]
-    assert run_cli("gate", RUN, "review", cwd=calibration).returncode == 0
-    path = run_path(calibration, RUN, *ROUND, "prosecutor-canary.json")
+    assert f".plumbline/runs/r1/review/round-1/{CANARY_STEM}.json" in [part["path"] for part in merge_entry["parts"]]
+    assert run_cli("gate", RUN, "review", cwd=calibration).returncode == 0  # the gate finds the canary's part by the key, the record's name and lens being a prosecutor's
+    path = run_path(calibration, RUN, *ROUND, f"{CANARY_STEM}.json")
     path.write_text(path.read_text(encoding="utf-8") + " ", encoding="utf-8")
     gate = run_cli("gate", RUN, "review", cwd=calibration)
-    assert gate.returncode == 1 and "prosecutor-canary.json changed after merge-review read it" in gate.stdout
+    assert gate.returncode == 1 and f"{CANARY_STEM}.json changed after merge-review read it" in gate.stdout
+
+
+def test_a_real_prosecutors_record_is_not_taken_for_the_canarys_by_the_gate(run_cli, calibration):
+    file_findings(calibration, [finding("correctness-1", "MINOR")])
+    plant(calibration)
+    panel(calibration, [[answer("correctness-1", "x"), answer(CID, "x")]] * 3)
+    assert merge(run_cli, calibration).returncode == 0
+    assert run_cli("gate", RUN, "review", cwd=calibration).returncode == 0
+    assert pl.names_canary(calibration, f".plumbline/runs/r1/review/round-1/{CANARY_STEM}.json", json.loads(run_path(calibration, RUN, *ROUND, f"{CANARY_STEM}.json").read_text(encoding="utf-8")))
+    prosecutor = json.loads(run_path(calibration, RUN, *ROUND, "prosecutor-correctness.json").read_text(encoding="utf-8"))
+    assert not pl.names_canary(calibration, ".plumbline/runs/r1/review/round-1/prosecutor-correctness.json", prosecutor)
+
+
+@pytest.mark.parametrize("stem,lens", [("prosecutor-tests-b", "tests"), ("prosecutor-correctness-c", "correctness"), ("zeta", "tests"), ("prosecutor-correctness-2", "correctness")])
+def test_the_canarys_record_is_found_by_the_key_whatever_its_name_and_lens(run_cli, calibration, stem, lens):
+    file_findings(calibration, [finding("correctness-1", "MINOR")])
+    fid = f"{lens}-4"
+    plant(calibration, canary_finding(fid, lens=lens), key={**KEY, "finding_id": fid}, stem=stem, lens=lens)
+    panel(calibration, [[answer("correctness-1", "x"), answer(fid, "x", "refuted")]] * 3)
+    result = merge(run_cli, calibration)
+    assert result.returncode == 0, result.stdout + result.stderr
+    record = merged(calibration)
+    assert record["canary"]["finding_id"] == fid and [f["id"] for f in record["findings"]] == ["correctness-1"]
+    assert run_cli("gate", RUN, "review", cwd=calibration).returncode == 0
+
+
+def test_a_canary_looks_like_a_prosecutor_to_a_defender_in_everything_but_the_key(calibration):
+    file_findings(calibration, [finding("correctness-1", "MINOR")])
+    plant(calibration)
+    round_dir = key_path(calibration).parent
+    names = sorted(p.name for p in round_dir.glob("*.json") if p.name != "canary-key.json")
+    assert names == ["prosecutor-correctness-b.json", "prosecutor-correctness.json", "prosecutor-tests.json"]  # it sorts beside the prosecutor of its lens
+    records = {n: json.loads((round_dir / n).read_text(encoding="utf-8")) for n in names}
+    for name, record in records.items():
+        assert pl.check_record("findings_record", record) == [], name
+        assert record["lens"] in ("correctness", "tests") and all(f["lens"] == record["lens"] and re.fullmatch(r"[a-z]+-[0-9]+", f["id"]) for f in record["findings"]), name
+        assert "canary" not in (round_dir / name).read_text(encoding="utf-8").lower(), name  # nothing a defender may read says what it is
+    assert all(len(r["findings"]) <= 1 for r in records.values()) and set(records["prosecutor-correctness-b.json"]) == set(records["prosecutor-correctness.json"])
 
 
 def test_the_canarys_files_are_ignored_with_a_warning_where_the_run_is_no_calibration_run(run_cli, ordinary):
@@ -604,18 +703,17 @@ def test_the_canarys_files_are_ignored_with_a_warning_where_the_run_is_no_calibr
     record = merged(ordinary)
     assert "canary" not in record and [f["id"] for f in record["findings"]] == ["correctness-1"]
     merge_entry = next(e for e in ledger(ordinary) if e["kind"] == "merge")
-    assert not [part for part in merge_entry["parts"] if "canary" in part["path"]]
+    assert not [part for part in merge_entry["parts"] if CANARY_STEM in part["path"]]
 
 
 def test_the_canarys_files_are_ignored_with_a_warning_where_the_stage_has_no_defenders(run_cli, repo):
     adopt_base(repo)
     start(run_cli, repo, "--calibrate", row="code.M")
     put_part(repo, "test-review", "prosecutor-tests", {"lens": "tests", "findings": []})
-    put_part(repo, "test-review", "prosecutor-canary", {"lens": "canary", "findings": [canary_finding()]})
-    put_part(repo, "test-review", "canary-key", KEY, agent=False)
+    plant(repo, canary_finding("tests-1", lens="tests"), key={**KEY, "finding_id": "tests-1"}, stem="prosecutor-tests-b", lens="tests", stage="test-review")
     result = run_cli("merge-review", RUN, "test-review", cwd=repo)
     assert result.returncode == 0 and "this stage has no defenders, so the canary's records were ignored" in result.stderr
-    assert "canary" not in read(repo, "test-review")
+    assert "canary" not in read(repo, "test-review") and read(repo, "test-review")["findings"] == []
 
 
 def test_a_calibration_run_does_not_ask_the_canary_of_a_stage_without_defenders(run_cli, repo):
@@ -631,9 +729,9 @@ def test_a_calibration_run_does_not_ask_the_canary_of_a_stage_without_defenders(
 def test_the_review_record_with_a_canary_renders_it_and_a_record_without_renders_as_before():
     record = sample("review_record")
     assert "Canary" not in pl.render_record("review_record", record)
-    record["canary"] = {"finding_id": "canary-1", "refuted_by": ["d1"], "conceded_by": ["d2", "d3"]}
+    record["canary"] = {"finding_id": CID, "refuted_by": ["d1"], "conceded_by": ["d2", "d3"]}
     out = pl.render_record("review_record", record)
-    assert "## Canary" in out and "`canary-1`, a finding planted to be false: refuted by 1 of 3 defenders (d1); conceded by d2, d3" in out
+    assert "## Canary" in out and f"`{CID}`, a finding planted to be false: refuted by 1 of 3 defenders (d1); conceded by d2, d3" in out
     assert pl.check_record("review_record", record) == []
 
 
@@ -642,7 +740,7 @@ def test_the_canary_field_has_the_three_keys_and_is_optional():
     assert "canary" not in schema["required"]
     assert schema["properties"]["canary"]["required"] == ["finding_id", "refuted_by", "conceded_by"]
     record = sample("review_record")
-    record["canary"] = {"finding_id": "canary-1", "refuted_by": []}
+    record["canary"] = {"finding_id": CID, "refuted_by": []}
     assert any(e.startswith("$.canary.conceded_by:") for e in pl.check_record("review_record", record))
 
 
@@ -658,7 +756,7 @@ def test_the_pass_record_of_a_calibration_run_carries_what_the_canary_measured_a
     run_entry(calibration, "verify", diff)
     file_findings(calibration, [finding("correctness-1", "MINOR")])
     plant(calibration)
-    panel(calibration, [[answer("correctness-1", "x"), answer("canary-1", "x", "refuted")]] * 3)
+    panel(calibration, [[answer("correctness-1", "x"), answer(CID, "x", "refuted")]] * 3)
     assert merge(run_cli, calibration).returncode == 0
     result = run_cli("pass", RUN, cwd=calibration)
     assert result.returncode == 0, result.stdout
@@ -676,8 +774,9 @@ def test_the_run_skill_explains_the_calibration_run_and_the_canarys_round():
     assert "PLUMBLINE plan --intent <intent> [--row <row>] [--spec <file>] --request-file <file> [--calibrate]" in start_section
     assert "`--calibrate` marks a calibration run" in start_section and "ask for it only when the builder wants to measure whether the defenders can refute a finding at all" in start_section
     prosecutors = between(body, "1. **Prosecutors.**", "2. **Defenders.**")
-    assert "In a calibration run, launch `plumbline:canary` in the same message as the prosecutors" in prosecutors
-    assert "`.../prosecutor-canary.json` and `.../canary-key.json`" in prosecutors
+    assert "Wait until every prosecutor has reported. In a calibration run, in a round whose stage has defenders, launch `plumbline:canary` then, in the foreground" in prosecutors
+    assert "the lenses of the round, the paths of the prosecutors' records and the round directory" in prosecutors
+    assert "writes its record `prosecutor-<lens>-b.json` and its key `canary-key.json` there" in prosecutors and "on the `RECORD:` line of its report" in prosecutors
     defenders = between(body, "2. **Defenders.**", "3. `PLUMBLINE merge-review")
     assert "In a calibration run the canary's record is one of the findings records: list its path with the others, written the same way, and say nothing of a canary" in defenders
     assert "The canary is a finding to answer, so launch the defenders the round's rule names even when no prosecutor filed a finding" in defenders
@@ -700,28 +799,37 @@ def test_the_readme_explains_calibration_runs_the_eighth_agent_and_the_canarys_h
     paragraph = section("Runs, gates and the pass record").split("**Calibration runs.**", 1)[1].split("\n\n", 1)[0]
     for needed in (
         "Whether defenders can refute at all is untested when they concede everything", "`plan --intent ... --calibrate` marks the run as a calibration run in its intake record",
-        "every review round that has defenders also gets a canary", "`plumbline:canary` (Sonnet) writes one plausible but false finding about the change as `prosecutor-canary.json` (a `findings_record` with lens `canary`, filed MAJOR) and `canary-key.json`",
-        "defenders' brief lists the canary's record among the prosecutors' records and names neither it nor the key",
-        "`merge-review` never counts the canary in the survivors, the routes, the blockers or the open findings",
+        "every review round that has defenders also gets a canary", "once the prosecutors have reported, `plumbline:canary` (Sonnet) reads what they filed and writes one plausible but false finding about the change, as a prosecutor would",
+        "a lens of the round, an id numbered after that lens's own (`security-3`) and the severity MAJOR", "in a record named for a second prosecutor of that lens (`prosecutor-security-b.json`, beside `prosecutor-security.json`)",
+        "`canary-key.json` (`{finding_id, why_false}`) in the round directory is the one file that says which finding is the canary's",
+        "defenders' brief lists the canary's record among the prosecutors' records and names neither it nor the key", "a defender's tools do not reach the key or the run's ledger",
+        "`merge-review` reads the key, takes out of the round the record that holds the finding it names, and never counts that finding in the survivors, the routes, the blockers or the open findings",
         "`canary` field of the review record", "`finding_id`, `refuted_by` (a refutation whose quote the change or the finding's file holds) and `conceded_by`", "canary: refuted by 2 of 3 defenders", "the pass record's notes",
         "A defender that concedes the canary is a rubber stamp",
     ):
         assert needed in paragraph, needed
     hooks = section("Hooks")
     assert "a defender does not read `canary-key.json`" in hooks and "a defender's brief that names the canary" in hooks
-    assert "`prosecutor-canary.json` and `canary-key.json`" in hooks
+    assert "or the `ledger.jsonl` of its run, which names the agent that wrote each record" in hooks
+    assert "`prosecutor-<lens>-b.json` and `canary-key.json`" in hooks and "prosecutor-canary" not in README
     records = {r[0].strip("`"): r for r in rows(section("Records"))}
     assert "whether it is a calibration run" in records["change_class"][2] and "`canary`" in records["review_record"][2]
 
 
 def test_the_limits_the_readme_lists_for_the_canary_are_real_today(keyed):
     limits = section("Limits")
-    assert "**The canary's key through a path the hook cannot read.**" in limits and "`P=<the round directory>/canary-; cat ${P}key.json`" in limits
-    assert "the record's own name, `prosecutor-canary.json`, and its lens, `canary`, are in front of every defender that reads the findings" in limits
+    assert "**The canary's key through a path the hook cannot read.**" in limits and "`P=<the round directory>/canary-; cat ${P}key.json`" in limits and "still reaches `canary-key.json` and the ledger" in limits
+    assert "the record's own name" not in limits and "its lens, `canary`" not in limits  # the record is a prosecutor's to a defender that reads the findings: the limit is gone
     assert bash_as(keyed, f"P={key_path(keyed).parent}/canary-; cat ${{P}}key.json") is None  # the hook reads the words, and a path put together by the shell is none
+    assert bash_as(keyed, f"P={ledger_path(keyed).parent}/led; cat ${{P}}ger.jsonl") is None
     assert bash_as(keyed, f"cat {key_path(keyed)}")  # while the plain spelling is held
-    record = json.loads(key_path(keyed).with_name("prosecutor-canary.json").read_text(encoding="utf-8"))
-    assert record["lens"] == "canary"  # what a defender reads
+    assert "**What the plugin and the transcripts say.**" in limits and "`agents/canary.md` says that the canary names its record `prosecutor-<lens>-b.json`" in limits
+    assert "prosecutor-<lens>-b.json" in (REPO / "agents" / "canary.md").read_text(encoding="utf-8")
+    assert read_as(keyed, "defender", "Read", file_path=str(REPO / "agents" / "canary.md")) is None  # a defender that looks can read it
+    assert read_as(keyed, "defender", "Read", file_path=str(Path.home() / ".claude" / "projects" / "slug" / "agent-x.jsonl")) is None  # and the transcripts
+    for name in ("prosecutor-correctness.json", f"{CANARY_STEM}.json"):
+        record = json.loads(key_path(keyed).with_name(name).read_text(encoding="utf-8"))
+        assert record["lens"] == "correctness" and "canary" not in json.dumps(record)  # what a defender reads of the findings: nothing tells the plant
 
 
 def test_a_defender_may_not_run_a_shell_at_all_so_sh_c_is_no_way_round(keyed):

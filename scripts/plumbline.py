@@ -78,8 +78,7 @@ RUNS_DIR = ".plumbline/runs"
 PASS_DIR = ".plumbline/pass"
 LEDGER_FILE = "ledger.jsonl"
 ACTIVE_FILE = "ACTIVE"  # .plumbline/runs/ACTIVE: the run id and a newline; written by `plan --intent`, read by the hooks
-CANARY_RECORD = "prosecutor-canary"  # the stem of the canary's findings record in a round directory, and of its key
-CANARY_KEY = "canary-key"
+CANARY_KEY = "canary-key"  # the stem of the canary's key in a round directory: the one file that says which finding is the canary's
 REQUEST_FILE = "request.md"  # .plumbline/runs/<run-id>/request.md: the request the run began with, which `plan --intent --request-file` stores
 IGNORE_ENTRY = ".plumbline/"
 IGNORE_EQUIVALENTS = {".plumbline", ".plumbline/", "/.plumbline", "/.plumbline/"}
@@ -2591,6 +2590,13 @@ def _agent_provenance(root: Path, run_id: str, stage: dict, ledger: list[dict]) 
     return _agent_entry_problems(entry, stage["role"], sha, "its record")
 
 
+def names_canary(root: Path, path: str, record: dict) -> bool:
+    """Does the key in the directory of this findings record (`path`, relative to the root) name one of the record's findings? Then the
+    record is the canary's: its name, its lens and its ids are a prosecutor's, so the key is what says which record the canary wrote."""
+    key, problem = load_json_file(root / Path(path).parent / f"{CANARY_KEY}.json")
+    return problem is None and isinstance(key, dict) and any(finding["id"] == key.get("finding_id") for finding in record["findings"])
+
+
 def _merge_provenance(root: Path, run_id: str, stage: dict, ledger: list[dict]) -> list[str]:
     """A review's record is what `merge-review` wrote (its ledger entry holds the record's hash), and each part it was
     built from is what its agent left (the agent's entry holds the part's hash)."""
@@ -2608,8 +2614,8 @@ def _merge_provenance(root: Path, run_id: str, stage: dict, ledger: list[dict]) 
             continue
         data, problem = load_json_file(root / path)
         role = PART_ROLES.get(_part_type(data)) if problem is None else None
-        if role == "prosecutor" and Path(path).stem == CANARY_RECORD:
-            role = "canary"
+        if role == "prosecutor" and names_canary(root, path, data):
+            role = "canary"  # nothing in the record or its name says so: the key beside it does
         if role is None:
             problems.append(f"{path} is no findings, defense or gaps record")
             continue
@@ -3071,34 +3077,44 @@ CANARY_KEY_SHAPE = {
 }
 
 
-def canary_of(directory: str, records: list[tuple[str, dict]], key: tuple[str, object] | None, owner: dict[str, str], defended: bool) -> tuple[dict | None, list[str]]:
-    """The canary's finding, and the problems with the canary's files, for a round of a calibration run that has defenders. The canary files
-    one finding in `prosecutor-canary.json` (lens canary), with an id no prosecutor used, and its key, `canary-key.json`, names that finding.
-    Defenders that answered a round with no canary are a problem too: a calibration run exists to measure them."""
-    if not records and key is None:
-        return None, ([f"this is a calibration run, and its defenders answered a round that has no canary: {directory}/{CANARY_RECORD}.json is missing"] if defended else [])
-    if not records:
-        return None, [f"{key[0]} has no {CANARY_RECORD}.json beside it"]
+def canary_record_of(key: tuple[str, object], records: list[tuple[str, dict]]) -> tuple[tuple[str, dict] | None, str | None]:
+    """The findings record the canary's key points to, as (record, None), or (None, the problem with the key). The canary's record carries a
+    real lens of the round, a prosecutor's kind of file name and a finding id in a prosecutor's shape, so the key is what tells it: the record
+    that holds the finding the key names. A key that is no valid key, that names no finding of the round, or that names one of several records
+    (finding ids are unique across a round) tells nothing."""
+    where, data = key
+    errors = validate(data, CANARY_KEY_SHAPE)
+    if errors:
+        return None, f"{where}: not a valid canary key: {errors[0]}"
+    held = [record for record in records if any(finding["id"] == data["finding_id"] for finding in record[1]["findings"])]
+    if not held:
+        return None, f"{where}: the key names '{data['finding_id']}', but no findings record of the round holds that finding"
+    if len(held) > 1:
+        return None, f"{where}: the key names '{data['finding_id']}', which {len(held)} findings records hold ({', '.join(w for w, _ in held)}); ids must be unique across the round"
+    return held[0], None
+
+
+def canary_of(
+    directory: str, key: tuple[str, object] | None, records: list[tuple[str, dict]], expected: list[str], defended: bool
+) -> tuple[tuple[str, dict] | None, list[tuple[str, dict]], list[str]]:
+    """Take the canary out of a round of a calibration run that has defenders, as (the canary's record, the other findings records, problems).
+    The canary files one finding, through a lens of the round, in a record of its own, and its key, `canary-key.json`, names that finding
+    (see canary_record_of). Defenders that answered a round with no canary are a problem too: a calibration run exists to measure them."""
+    if key is None:
+        return None, records, ([f"this is a calibration run, and its defenders answered a round that has no canary: {directory}/{CANARY_KEY}.json is missing"] if defended else [])
+    record, problem = canary_record_of(key, records)
+    if record is None:
+        return None, records, [problem]
+    others = [r for r in records if r is not record]
+    where, data = record
     problems: list[str] = []
-    where, data = records[0]  # the record's name is fixed, so a round has one at most
-    finding = None
-    if data["lens"] != "canary":
-        problems.append(f"{where}: the canary's record carries lens '{data['lens']}', not 'canary'")
     if len(data["findings"]) != 1:
         problems.append(f"{where}: the canary files one finding (this record has {len(data['findings'])})")
-    else:
-        finding = data["findings"][0]
-        if finding["id"] in owner:
-            problems.append(f"{where}: the canary's finding id '{finding['id']}' is also used in {owner[finding['id']]}; ids must be unique across the round")
-    if key is None:
-        problems.append(f"{where}: the canary left no key ({directory}/{CANARY_KEY}.json)")
-    else:
-        errors = validate(key[1], CANARY_KEY_SHAPE)
-        if errors:
-            problems.append(f"{key[0]}: not a valid canary key: {errors[0]}")
-        elif finding is not None and key[1]["finding_id"] != finding["id"]:
-            problems.append(f"{key[0]}: the key names '{key[1]['finding_id']}', but the canary's finding is '{finding['id']}'")
-    return (None if problems else finding), problems
+    if data["lens"] not in expected:
+        problems.append(f"{where}: the canary's record carries lens '{data['lens']}', which is not one of this round's lenses ({', '.join(expected)})")
+    if any(finding["lens"] != data["lens"] for finding in data["findings"]):
+        problems.append(f"{where}: the canary's finding carries another lens than its record ('{data['lens']}')")
+    return (None if problems else record), others, problems
 
 
 @dataclass
@@ -3158,7 +3174,6 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
     defense_records: list[tuple[str, dict]] = []
     screen_records: list[tuple[str, dict]] = []
     gaps_records: list[tuple[str, dict]] = []
-    canary_records: list[tuple[str, dict]] = []
     canary_key: tuple[str, object] | None = None  # where the key is, and what it holds
     for path in sorted(round_dir.glob("*.json")):
         where = rel_path(root, path)
@@ -3175,9 +3190,7 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
             errors = check_record(guess, data)
             problems.append(f"{where}: not a valid {guess}: {errors[0]}" + (f" (and {len(errors) - 1} more)" if len(errors) > 1 else ""))
             continue
-        if kind == "findings_record" and path.stem == CANARY_RECORD:
-            canary_records.append((where, data))
-        elif kind == "defense_record" and SCREEN_RECORD.fullmatch(path.stem):
+        if kind == "defense_record" and SCREEN_RECORD.fullmatch(path.stem):
             screen_records.append((where, data))
         else:
             {"findings_record": findings_records, "defense_record": defense_records, "gaps_record": gaps_records}[kind].append((where, data))
@@ -3185,13 +3198,19 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
     defenders = stage.get("defenders", 0)
     screening = stage.get("screen_defenders")  # how many screening defenders answer a round with no BLOCKING finding; None for a stage without screening
     screeners = screening or 0
-    if (canary_records or canary_key is not None) and not (run.calibrate and defenders):
+    defended = bool(defense_records if defenders else []) or bool(screen_records if screeners else [])
+    canary_record: tuple[str, dict] | None = None  # the findings record the canary's key points to: a prosecutor's in everything but that key
+    if run.calibrate and defenders:
+        canary_record, findings_records, canary_trouble = canary_of(rel_path(root, round_dir), canary_key, findings_records, expected, defended)
+        problems += canary_trouble
+    elif canary_key is not None:
         why = "this stage has no defenders" if run.calibrate else f"run '{run_id}' is not a calibration run"
         warnings.append(f"{why}, so the canary's records were ignored: the canary and its key count in a calibration run's rounds that have defenders")
-        canary_records, canary_key = [], None
+        left_out, _problem = canary_record_of(canary_key, findings_records)
+        findings_records = [record for record in findings_records if record is not left_out]
     used = [
         *((where, data, "prosecutor") for where, data in findings_records),
-        *((where, data, "canary") for where, data in canary_records),
+        *((where, data, "canary") for where, data in ([canary_record] if canary_record else [])),
         *((where, data, "defender") for where, data in (defense_records if defenders else [])),
         *((where, data, "defender") for where, data in (screen_records if screeners else [])),
         *((where, data, "detective") for where, data in gaps_records),
@@ -3217,7 +3236,8 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
     by_lens: dict[str, str] = {}
     for where, data in findings_records:
         if data["lens"] in by_lens:
-            problems.append(f"{where}: a second findings_record for lens '{data['lens']}' (the first is {by_lens[data['lens']]})")
+            keyless = f"; in a calibration run that is the canary's record, and {CANARY_KEY}.json, which says so, is missing" if run.calibrate and defenders and canary_key is None else ""
+            problems.append(f"{where}: a second findings_record for lens '{data['lens']}' (the first is {by_lens[data['lens']]}){keyless}")
         elif data["lens"] not in expected:
             problems.append(f"{where}: lens '{data['lens']}' is not one of this round's lenses ({', '.join(expected)})")
         else:
@@ -3243,11 +3263,9 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
                     owner[finding["id"]] = where
                     findings.append(finding)
 
-    defended = bool(defense_records if defenders else []) or bool(screen_records if screeners else [])
-    canary_finding, canary_trouble = canary_of(rel_path(root, round_dir), canary_records, canary_key, owner, defended) if run.calibrate and defenders else (None, [])
-    problems += canary_trouble
+    canary_finding = canary_record[1]["findings"][0] if canary_record else None
     canary_id = canary_finding["id"] if canary_finding else None
-    known = {**owner, **({canary_id: canary_records[0][0]} if canary_finding else {})}  # the defenders answer the canary's finding as they answer the others
+    known = {**owner, **({canary_id: canary_record[0]} if canary_record else {})}  # the defenders answer the canary's finding as they answer the others
     threshold = stage.get("survive_if_unrefuted_by", _majority(defenders)) if defenders else 0
     names = sorted({data["defender"] for _, data in defense_records}) if defenders else []
     screen_names = sorted({data["defender"] for _, data in screen_records}) if screeners else []

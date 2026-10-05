@@ -515,7 +515,7 @@ def test_a_cwd_that_is_a_repository_that_has_not_adopted_plumbline_is_left_alone
 
 # ------------------------------------------------- C-22: the review agents write their own files, in the current round
 
-FILES = {"prosecutor": "prosecutor-security.json", "defender": "defender-2.json", "detective": "detective.json", "canary": "prosecutor-canary.json"}
+FILES = {"prosecutor": "prosecutor-security.json", "defender": "defender-2.json", "detective": "detective.json", "canary": "prosecutor-security-b.json"}
 
 
 def round_path(stage, n, name, run="r1"):
@@ -545,15 +545,15 @@ def test_a_review_agent_writes_nobody_elses_file(started, role, other):
         ("prosecutor", ["prosecutor-security.json", "prosecutor-tests.json", "prosecutor-a.b_c-1.json"]),
         ("defender", ["defender-1.json", "defender-3.json", "defender-x.json", "screen-1.json", "screen-k.json"]),
         ("detective", ["detective.json"]),
-        ("canary", ["prosecutor-canary.json", "canary-key.json"]),
+        ("canary", ["prosecutor-security-b.json", "prosecutor-docs-b.json", "canary-key.json"]),
     ],
 )
 def test_each_review_role_has_the_file_names_of_its_role_only(started, role, names):
     for name in names:
         assert writes(started, role, round_path("review", 1, name)) is None, name
-    for name in ("prosecutor.json", "defender.json", "detective-1.json", "detective-x.json", "notes.json", "x.txt", "prosecutor-x.txt", "prosecutor-.json", "screen.json", "canary.json", "canary-key.txt"):
-        if name == "prosecutor-.json" and role == "prosecutor":
-            continue
+    for name in ("prosecutor.json", "defender.json", "detective-1.json", "detective-x.json", "notes.json", "x.txt", "prosecutor-x.txt", "prosecutor-.json", "screen.json", "canary.json", "canary-key.txt", "prosecutor-security-c.json", "prosecutor-canary.json"):
+        if name in ("prosecutor-.json", "prosecutor-security-c.json", "prosecutor-canary.json") and role == "prosecutor":
+            continue  # a name of a prosecutor's own kind: any lens, any suffix but the one the canary's record carries
         assert writes(started, role, round_path("review", 1, name)), (role, name)
 
 

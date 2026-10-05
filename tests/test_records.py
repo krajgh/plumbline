@@ -102,11 +102,10 @@ def test_the_per_agent_review_records_use_the_review_records_item_shapes():
     merged["required"].remove("evidence_unverified")
     del merged["properties"]["evidence_unverified"]
     del merged["properties"]["severity_raised_from"]
-    merged["properties"]["lens"]["enum"] = [*merged["properties"]["lens"]["enum"], "canary"]  # the findings record may be the canary's: its lens is not one a review runs
     assert pl.load_schema("findings_record")["properties"]["findings"]["items"] == merged
     assert pl.load_schema("defense_record")["properties"]["defenses"]["items"] == review["defenses"]["items"]
     assert pl.load_schema("gaps_record")["properties"]["gaps"]["items"] == review["gaps"]["items"]
-    assert pl.load_schema("findings_record")["properties"]["lens"]["enum"] == [*review["lenses"]["items"]["enum"], "canary"]
+    assert pl.load_schema("findings_record")["properties"]["lens"]["enum"] == review["lenses"]["items"]["enum"]  # the canary's record has a lens a review runs, as a prosecutor's does
 
 
 def test_a_findings_record_has_one_lens_and_a_defense_record_one_defender():

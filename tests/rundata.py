@@ -168,9 +168,10 @@ def now_hash(repo, run_id=RUN) -> str:
     return pl.change_hash(repo, merge_base_of(repo, run_id))
 
 
-def put_part(repo, stage_id, name, data, round_no=1, run_id=RUN, agent=True) -> Path:
+def put_part(repo, stage_id, name, data, round_no=1, run_id=RUN, agent=True, role=None) -> Path:
     """Write one agent's record of a review unit's round. A record that lacks the hash of the change gets the change as it is now; with
-    `agent` the ledger holds the agent's stop, as the hook would have entered it."""
+    `agent` the ledger holds the agent's stop, as the hook would have entered it, for the role the record's type says (a findings record is
+    a prosecutor's) or the `role` given: the canary's findings record is a prosecutor's to look at and the canary's in the ledger."""
     if isinstance(data, dict) and "diff_sha256" not in data and ({"lens", "defender", "gaps"} & set(data)):
         data = {**data, "diff_sha256": now_hash(repo, run_id)}
     path = run_path(repo, run_id, stage_id, f"round-{round_no}", f"{name}.json")
@@ -178,8 +179,7 @@ def put_part(repo, stage_id, name, data, round_no=1, run_id=RUN, agent=True) -> 
     path.write_text(data if isinstance(data, str) else json.dumps(data, indent=2), encoding="utf-8")
     if agent and isinstance(data, dict):
         kind = pl._part_type(data) or pl._guess_part_type(data)
-        role = "canary" if name == pl.CANARY_RECORD else PART_ROLES[kind]  # the canary's findings record is the canary's, not a prosecutor's
-        agent_stopped(repo, stage_id, path, role, kind, valid=not pl.check_record(kind, data), run_id=run_id, agent_id=f"agent-{name}")
+        agent_stopped(repo, stage_id, path, role or PART_ROLES[kind], kind, valid=not pl.check_record(kind, data), run_id=run_id, agent_id=f"agent-{name}")
     return path
 
 

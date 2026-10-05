@@ -66,7 +66,7 @@ OWN_RECORD = {
     "prosecutor": ".plumbline/runs/r1/review/round-1/prosecutor-security.json",
     "defender": ".plumbline/runs/r1/review/round-1/defender-1.json",
     "detective": ".plumbline/runs/r1/review/round-1/detective.json",
-    "canary": ".plumbline/runs/r1/review/round-1/prosecutor-canary.json",
+    "canary": ".plumbline/runs/r1/review/round-1/prosecutor-security-b.json",
 }
 
 
@@ -77,7 +77,7 @@ def test_every_agent_may_write_its_own_record(run_pre, started, role, tool, key)
 
 
 def test_the_review_agents_may_write_in_the_round_directories_of_the_test_review_too(run_pre, started):
-    for role, name in (("prosecutor", "prosecutor-tests.json"), ("defender", "defender-2.json"), ("defender", "screen-1.json"), ("detective", "detective.json"), ("canary", "prosecutor-canary.json"), ("canary", "canary-key.json")):
+    for role, name in (("prosecutor", "prosecutor-tests.json"), ("defender", "defender-2.json"), ("defender", "screen-1.json"), ("detective", "detective.json"), ("canary", "prosecutor-tests-b.json"), ("canary", "canary-key.json")):
         assert writes(run_pre, started, role, f".plumbline/runs/r1/test-review/round-1/{name}") is None, (role, name)
 
 

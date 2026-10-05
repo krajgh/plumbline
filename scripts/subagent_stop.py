@@ -9,7 +9,7 @@ prosecutor a findings_record, and so on) and that sits where that agent's record
 belong: in the run in progress (the one .plumbline/runs/ACTIVE names, else the
 newest run), at the path of a stage of the run's row that the agent's role serves
 (`<stage>.json`), or, for the review roles, at
-`<review stage>/round-<n>/<name>.json` (the canary's record, `prosecutor-canary.json`, is one of them).
+`<review stage>/round-<n>/<name>.json` (the canary's record, named as a second prosecutor's of a lens, is one of them).
 
 The report is the agent's final message. When that message has no RECORD line, the
 hook looks for the line in the report the agent handed back through SubagentHandback:
