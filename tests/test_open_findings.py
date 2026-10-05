@@ -235,6 +235,11 @@ def test_open_all_skips_a_run_that_did_not_pass_and_says_so_when_none_did(adopte
     assert open_json(run_cli, adopted, "--all") == {"runs": []}
 
 
+def test_open_all_skips_a_directory_that_is_no_run(run_cli, passed):
+    (passed / ".plumbline" / "runs" / "active").mkdir()  # a name the run ids refuse: it sits beside the run directories as ACTIVE does
+    assert [r["run_id"] for r in open_json(run_cli, passed, "--all")["runs"]] == ["r1"]
+
+
 def test_open_refuses_a_head_no_pass_record_covers_and_a_run_that_did_not_pass(run_cli, passed):
     docs_run(passed, leaving(), "r3")  # never passed
     named = run_cli("open", "r3", cwd=passed)

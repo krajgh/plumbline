@@ -4260,9 +4260,13 @@ def cmd_open(args) -> int:
         except OSError:
             candidates = []
         for name in candidates:
-            record, _why = run_pass_record(project, name)
+            try:
+                record, _why = run_pass_record(project, name)
+                when = run_pass_path(project, name).stat().st_mtime if record is not None else 0.0
+            except (PlumblineError, OSError):
+                continue  # a directory that is no run (a name the run ids refuse), or a record that went away while it was read
             if record is not None:
-                found.append((run_pass_path(project, name).stat().st_mtime, name, record))
+                found.append((when, name, record))
         entries = [open_entry(record) for _when, _name, record in sorted(found, key=lambda item: item[:2])]
     elif args.run_id:
         existing_run_dir(root, args.run_id)
