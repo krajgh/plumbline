@@ -6,6 +6,7 @@ Standard library only (Python 3.11 or newer).
     validate-pipeline [FILE] [--project PATH]
     classify [--project PATH] [--base REF] [--intent ID] [--row ROW] [--out FILE]
     plan [--project PATH] [--base REF] [--run-id ID] [--intent ID [--spec FILE] [--request-file FILE] [--calibrate]] [--row ROW]
+    plan --run RUN [--json] [--project PATH]
     check-record TYPE FILE
     render FILE [--type TYPE]
     init [--project PATH] [--graft]
@@ -3917,7 +3918,34 @@ def start_run(
     return []
 
 
+def plan_of_run(args) -> int:
+    """`plan --run RUN`: the plan of a run that has begun, as `plan --intent` printed it when the run started, rebuilt from the run's own files: its
+    intake record (judged by `load_run`: the ledger holds its hash), the request the ledger shows it stored and the records it supplied. Nothing is
+    written, so an agent that only reads the run, as the orchestrator does, gets the plan without the main session pasting it in."""
+    for name, given in (
+        ("--intent", args.intent), ("--spec", args.spec), ("--request-file", args.request_file), ("--calibrate", args.calibrate),
+        ("--row", args.row), ("--base", args.base), ("--run-id", args.run_id),
+    ):
+        if given:
+            raise PlumblineError(f"--run prints the plan of a run that has begun, so {name} does not go with it (it starts a run)")
+    project = _ready_project(args.project)
+    run_id = check_run_id(args.plan_run)
+    load_run(project, run_id)  # the run must exist, and its intake record must be the one `plan --intent` wrote
+    intake, _problems = read_stage_record(project.root, run_id, intake_stage_of(project.pipeline))
+    ledger = read_ledger(project.root, run_id)
+    plan = build_plan(project.pipeline, intake, run_id, project.commands, project.graft_enabled, latest_entry(ledger, "request") is not None)
+    for entry in plan["supplied"]:
+        shown = latest_entry(ledger, "supplied", stage=entry["stage"])
+        entry["source"] = shown.get("source") if shown else None
+    sys.stdout.write(json.dumps(plan, indent=2) + "\n")
+    return 0
+
+
 def cmd_plan(args) -> int:
+    if args.plan_run is not None:
+        return plan_of_run(args)
+    if args.json:
+        raise PlumblineError("--json goes with --run (the plan of a run that has begun); the plan is JSON all the same")
     starting = args.intent is not None  # `--intent` starts the run: it writes its intake record, so it needs a repository that has adopted plumbline
     project = _adopted_project(args.project) if starting else _ready_project(args.project)
     if args.spec and not starting:
@@ -4392,6 +4420,24 @@ def _stage_state(project: Project, run_id: str, stage: dict) -> tuple[str, list[
     return ("pass" if outcome.passed else "FAIL"), outcome.problems[:3]
 
 
+def status_rounds(project: Project, run: Run) -> str | None:
+    """`rounds: plan 1, tests 3, review 2`: the rounds each stage that has run took so far, counted as `pass` counts them (see rounds_taken), in
+    the order the stages run, or None while none has. The main session's stages (intake, reduce) and the ones an intent supplies are left out."""
+    ledger = read_ledger(project.root, run.run_id)
+    counts = []
+    for stage in run.stages:
+        if stage["record"] in ("change_class", "pass_record"):
+            continue
+        if stage.get("kind", "agent") == "review":
+            record, _problems = read_stage_record(project.root, run.run_id, stage)
+            taken = record["round"] if record is not None else 0
+        else:
+            taken = stage_agents(ledger, stage["id"])
+        if taken:
+            counts.append(f"{stage['id']} {taken}")
+    return "rounds: " + ", ".join(counts) if counts else None
+
+
 def cmd_status(args) -> int:
     project = _ready_project(args.project)
     root = project.root
@@ -4434,6 +4480,9 @@ def cmd_status(args) -> int:
         print(f"  {stage['id']:<13}{stage['record']:<15}{state:<10}{stage.get('gate') or '-'}")
         for problem in problems:
             print(f"      {problem}")
+    rounds = status_rounds(project, run)
+    if rounds:
+        print(rounds)
     return 0
 
 
@@ -4463,6 +4512,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--request-file", metavar="FILE", help="the request, as text: stored in the run as request.md, with its hash in the ledger; the spec review compares the spec with it")
     p.add_argument("--calibrate", action="store_true", help="mark the run as a calibration run: each review round with defenders also gets a canary, a planted false finding, to see whether they can refute one")
     p.add_argument("--row", metavar="ROW", help="declare the row (for example code.M) instead of measuring it: needed when nothing has changed yet")
+    p.add_argument("--run", dest="plan_run", metavar="RUN", help="print the plan of a run that has begun, as JSON, from its own files (no other option but --project and --json goes with it; nothing is written)")
+    p.add_argument("--json", action="store_true", help="with --run: the plan is always JSON, and this says so on the command line")
     p.set_defaults(run=cmd_plan)
 
     p = sub.add_parser("check-record", allow_abbrev=False, help="validate a record file against its schema")

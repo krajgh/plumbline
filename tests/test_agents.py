@@ -1,4 +1,4 @@
-"""The eight agents: pinned models, tools and turn limits, and prompts that state what to do."""
+"""The eight agents that write a record, and the orchestrator that runs them: pinned models, tools and turn limits, and prompts that state what to do."""
 import re
 
 import pytest
@@ -27,8 +27,8 @@ def agent(name):
     return frontmatter(AGENTS / f"{name}.md")
 
 
-def test_there_is_one_agent_for_each_record_an_agent_ends_with():
-    assert sorted(p.stem for p in AGENTS.glob("*.md")) == NAMES
+def test_there_is_one_agent_for_each_record_an_agent_ends_with_and_the_orchestrator_that_runs_them():
+    assert sorted(p.stem for p in AGENTS.glob("*.md")) == sorted([*NAMES, "orchestrator"])  # the orchestrator ends with a report and writes no record
     assert set(pl.AGENT_ROLES) == set(NAMES) == set(pl.AGENT_RECORDS)
 
 
@@ -259,7 +259,7 @@ def test_the_defender_knows_a_quote_counts_when_the_change_or_the_file_holds_it(
 
 def test_the_verifier_knows_the_gate_runs_the_same_commands_and_bounds_its_summaries():  # C-04, C-06
     body = agent("verifier")[1]
-    assert "the main session runs `plumbline.py gate`, which runs the same commands itself" in body
+    assert "the orchestrator runs `plumbline.py gate`, which runs the same commands itself" in body
     assert "at most 80 characters, made of letters, digits, spaces and the marks `, . : ; ( ) % / _ + -`" in body
     assert "`failing_acs` is empty and `tests.failed` is 0" in body
     pattern = pl.load_schema("verify_record")["properties"]["commands"]["items"]["properties"]["summary"]["pattern"]
@@ -276,7 +276,7 @@ def test_the_builders_brief_carries_the_text_of_findings_and_no_path_of_a_review
 def test_the_test_writer_names_tests_as_they_appear_in_their_file_because_the_gate_opens_it():  # C-05
     body = agent("test-writer")[1]
     assert "with `name` as the test appears in its file" in body and "the gate opens `file` and looks for it" in body
-    assert "the main session runs `plumbline.py gate`, which runs the repository's test command itself" in body
+    assert "the orchestrator runs `plumbline.py gate`, which runs the repository's test command itself" in body
     assert "as it appears in its file" in pl.load_schema("tests_record")["properties"]["tests"]["items"]["properties"]["name"]["description"]
 
 

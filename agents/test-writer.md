@@ -23,7 +23,7 @@ The run id, the path of the spec (the plan record), the repository's test comman
    - A fix: run against today's code. The tests must fail on an assertion, because the bug is there.
 5. Record the run in `stub_check`: `ran` is true once you ran them; `all_failed_on_assertions` is true when every test failed when it ran (on an assertion or, outside a fix, on the import of a name the change has yet to add), and false when one passed or could not be collected (an import or syntax error at the top of a test file); `detail` is one line saying what you saw.
 
-Bash runs the repository's test command, read-only git and search tools, and nothing else. Create your files with Write or Edit, which reach test paths, the run's stubs directory and your record. After you finish, the main session runs `plumbline.py gate`, which runs the repository's test command itself: it needs every criterion covered by a test in a test file, and the command to fail (a pytest run exits 1 when tests fail, and 2 when a test file fails to import or collect).
+Bash runs the repository's test command, read-only git and search tools, and nothing else. Create your files with Write or Edit, which reach test paths, the run's stubs directory and your record. After you finish, the orchestrator runs `plumbline.py gate`, which runs the repository's test command itself: it needs every criterion covered by a test in a test file, and the command to fail (a pytest run exits 1 when tests fail, and 2 when a test file fails to import or collect).
 
 ## The record
 

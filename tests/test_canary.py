@@ -790,7 +790,7 @@ def test_the_run_skill_explains_the_calibration_run_and_the_canarys_round():
 
 def test_the_readme_explains_calibration_runs_the_eighth_agent_and_the_canarys_hooks():
     plan_row = next(line for line in section("The command line", 3).splitlines() if line.startswith("| `plan "))
-    assert plan_row.startswith("| `plan [--project PATH] [--base REF] [--run-id ID] [--intent ID [--spec FILE] [--request-file FILE] [--calibrate]] [--row ROW]` |")
+    assert plan_row.startswith("| `plan [--project PATH] [--base REF] [--run-id ID] [--intent ID [--spec FILE] [--request-file FILE] [--calibrate]] [--row ROW] [--run RUN [--json]]` |")
     assert "`--calibrate` marks the run as a calibration run in its intake record" in plan_row
     agents = {r[0].strip("`"): r for r in rows(section("Agents"))}
     assert agents["plumbline:canary"][1:] == ["Sonnet", "Read, Grep, Glob, Bash, Write", "its records", "`findings_record`"]

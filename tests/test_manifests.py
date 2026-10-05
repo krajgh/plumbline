@@ -425,11 +425,11 @@ def test_the_layout_matches_the_spec():
         "hooks/hooks.json", "scripts/plumbline.py", "scripts/session_start.py", "scripts/subagent_stop.py", "scripts/pre_tool_use.py",
         "scripts/pre_tool_use.sh", "scripts/subagent_stop.sh", "pipeline/default.toml", "pipeline/templates/refactor.json",
         "skills/subagent-discipline/SKILL.md", "skills/init/SKILL.md", "skills/run/SKILL.md", "skills/override/SKILL.md", "skills/status/SKILL.md",
-        *(f"agents/{name}.md" for name in ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary")),
+        *(f"agents/{name}.md" for name in ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary", "orchestrator")),
     ):
         assert (REPO / path).is_file(), path
-    assert sorted(p.name for p in (REPO / "agents").iterdir()) == sorted(  # the eight agents, and nothing else
-        f"{name}.md" for name in ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary")
+    assert sorted(p.name for p in (REPO / "agents").iterdir()) == sorted(  # the eight agents that write a record and the orchestrator, and nothing else
+        f"{name}.md" for name in ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary", "orchestrator")
     )
     assert sorted(p.name for p in (REPO / "schemas").glob("*.json")) == sorted(
         f"{n}.json" for n in (
