@@ -574,11 +574,11 @@ def test_the_readme_describes_the_run_flow_the_legs_and_why():
     assert "through a new leg of the orchestrator" in text.split("**Resuming a run.**", 1)[1].split("\n\n", 1)[0]
 
 
-def test_the_readme_says_the_costs_figures_predate_the_orchestrator_and_promises_no_number():
+def test_the_readme_gives_the_orchestrators_measured_effect_as_a_direction_not_a_measure():
     text = readme_section("What a run costs")
-    note = next(line for line in text.splitlines() if line.startswith("- **These figures predate the orchestrator.**"))
-    assert "From 0.5.0 `plumbline:orchestrator` does it, on Sonnet at medium effort, in legs that `tokens` reports apart as `orchestration`" in note
-    assert "the next size-M run with the orchestrator in place measures the after, and no number is promised in advance" in note
+    note = next(line for line in text.splitlines() if line.startswith("- **With the orchestrator, from 0.5.0.**"))
+    assert "from 0.5.0 `plumbline:orchestrator` does it, on Sonnet at medium effort, in legs that `tokens` reports apart as `orchestration`" in note
+    assert "the main session made 15 calls (36 before)" in note and "That is one run each, on different bugs: a direction, not a measure." in note
     assert text.index(note) < text.index("- **There is no token cap.**")
 
 

@@ -162,6 +162,7 @@ def test_the_readme_gives_what_two_real_runs_cost_in_generic_terms_and_the_round
     assert rows["The main session, which orchestrates"] == ["26K output tokens, 114K cache writes, 5.3M cache reads", "13K output tokens, 58K cache writes, 2.3M cache reads"]
     assert "**The main session is the biggest spender.**" in text and "**The agents' output is a lower bound.**" in text and "`output_lower_bound`" in text
     assert "**There is no token cap.**" in text and "nothing bounds the main session" in text
+    assert "**With the orchestrator, from 0.5.0.**" in text and "the main session made 15 calls (36 before) and read 0.7M tokens from the cache (2.3M before)" in text and "the orchestrator made 13 calls and read 0.3M" in text
     # what the numbers must agree with: the sizes are M and S, the rows have eight and seven stages, and no stage used more rounds than the pipeline allows it
     assert pl.size_for(260, PIPELINE["sizes"]) == "M" and [s for s in PIPELINE["matrix"]["code"]["M"]["stages"] if s != "spec-review"] == [
         "intake", "plan", "tests", "test-review", "build", "verify", "review", "reduce"
