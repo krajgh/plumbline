@@ -253,16 +253,25 @@ def test_a_named_group_is_valid_in_the_node_that_runs_ponytails_hook_and_is_not_
 def test_the_status_line_gives_the_manifests_version_and_the_phase():
     status = section("Status").strip()
     version = json.loads((REPO / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))["version"]
-    assert version == "0.4.2" and status.startswith(f"Version {version}.")
-    assert "Phase 2, agents and enforcement, is done" in status
-    assert "Version 0.4.1 carried what the first real session found" in status and "Version 0.4.2 carries what the first real run found" in status
+    assert version == "0.5.0" and status.startswith(f"Version {version}.")
+    assert "Phase 2, agents and enforcement, is done: the eight agents" in status
+    assert "Version 0.4.1 carried what the first real session found" in status and "Version 0.4.2 carried what the first real run found" in status
     for fix in (
         "stubs go in the run and not in the change", "says whether it comes from the agent's record or from the measured run", "a size problem names the files that contribute most",
         "a matrix row can say where a failed gate goes", "launch agents without `model`", "`tokens` flags an output count that is a lower bound",
     ):
         assert fix in status, fix
     assert "Phase 3, light testing in a real session, is done" in status and "has begun" not in status and "The next phase is phase 3" not in status
-    assert "This is the first public release." in status and "Not yet published" not in status
+    assert "Version 0.4.2 was the first public release." in status and "Not yet published" not in status
+    assert "Version 0.5.0 carries, so far, what those two runs showed about the review:" in status
+    for item in (
+        "open findings last beyond the run (the pass record keeps them, `plumbline.py open` lists them and `status` counts them)", "a defender can claim a higher severity (`severity_claim` on a conceded verdict)",
+        "a full defender panel only when a prosecutor filed a BLOCKING finding (a screening defender answers otherwise, and `panel_needed` keeps the step)",
+        "a spec review after plan for size M and L (the run stores its request, and a `requirements` lens compares it with the spec)", "a canary finding in calibration runs only",
+    ):
+        assert item in status, item
+    assert "A run begun under 0.4.2 on a size-M or L row has no spec review, so its pass record no longer covers its commit under 0.5.0" in status
+    assert "it joins this same version" in status  # the orchestrator is part B of the same release
     assert "Phase 2b of 5" not in README
 
 

@@ -352,6 +352,43 @@ def test_a_spec_review_with_no_blocking_finding_needs_one_screening_defender_and
     assert run_cli("gate", RUN, "spec-review", cwd=stored).returncode == 0  # MAJOR is no blocker: the planner may take it up, or the run goes on
 
 
+# --- a run of 0.4.2
+
+
+def test_a_pass_record_of_0_4_2_for_a_size_m_run_no_longer_covers_its_commit(repo):
+    """The README says so: the push gate rebuilds a run's stages from the pipeline, and code.M has the spec review now."""
+    from helpers import commit_all
+    from rundata import build_note_record, change_of, intake_record, run_entry, verify_record, write_test_file, written_tests_record, review_record
+
+    adopt_base(repo)
+    write_test_file(repo)
+    commit_all(repo, "the tests")
+    diff = change_of(repo)
+    put(repo, "intake", intake_record("code.M", repo))
+    put(repo, "plan", spec_record())
+    put(repo, "tests", written_tests_record())
+    run_entry(repo, "tests", None, exit_code=1)
+    put(repo, "test-review", review_record(target="tests", diff=diff))
+    put(repo, "build", build_note_record())
+    put(repo, "verify", verify_record(diff=diff))
+    run_entry(repo, "verify", diff)
+    put(repo, "review", review_record(diff=diff))
+    old = pl.load_project(repo)  # the pipeline as 0.4.2 had it: no spec review in any row
+    old.pipeline["stage"] = [s for s in old.pipeline["stage"] if s["id"] != "spec-review"]
+    for size in ("M", "L"):
+        old.pipeline["matrix"]["code"][size]["stages"].remove("spec-review")
+    record, problems, run_copy = pl.make_pass_record(old, RUN)
+    assert record is not None, problems
+    head = pl.head_sha(repo)
+    pass_file = repo / ".plumbline" / "pass" / f"{head}.json"
+    pl.write_json_atomic(run_copy, record)
+    pl.write_json_atomic(pass_file, record)
+    pl.note_pass(repo, RUN, record, pass_file)
+    assert pl.coverage(repo, head, old)[0] == "pass"
+    how, why = pl.coverage(repo, head, pl.load_project(repo))
+    assert how is None and "stage 'spec-review'" in why
+
+
 # --- the hooks
 
 
