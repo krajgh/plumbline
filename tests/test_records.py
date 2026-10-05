@@ -59,6 +59,7 @@ OPTIONAL = {
     ("defense_record", "$.defenses[]"): {"severity_claim"},  # 0.5.0: only a defender that concedes a finding worse than filed writes one
     ("review_record", "$.defenses[]"): {"severity_claim"},
     ("review_record", "$.findings[]"): {"severity_raised_from"},  # only on a finding that merge-review raised
+    ("review_record", "$"): {"panel_needed"},  # 0.5.0: a review record from 0.4.2 has none
 }
 
 

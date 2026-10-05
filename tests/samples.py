@@ -108,6 +108,7 @@ _SAMPLES = {
         ],
         "blockers_surviving": 1,
         "routes": {"builder": ["F-1"], "test-writer": []},
+        "panel_needed": [],
         "diff_sha256": DIFF_HASH,
     },
     "findings_record": {

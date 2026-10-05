@@ -102,7 +102,7 @@ GATE_RECORDS = {
     "no_surviving_blockers": "review_record",
     "all_gates_passed": "pass_record",
 }
-REVIEW_ONLY_KEYS = ("target", "lenses", "defenders", "survive_if_unrefuted_by", "detective")
+REVIEW_ONLY_KEYS = ("target", "lenses", "defenders", "survive_if_unrefuted_by", "screen_defenders", "detective")
 # The gates that run the repository's own commands (see measure_stage): the verify stage's and the tests stage's.
 MEASURED_TESTS_GATES = ("tests_fail_on_stub", "reproduces_on_head")
 DEFAULT_COMMAND_TIMEOUT = 900  # seconds each declared command may run; `timeout` under [commands] changes it
@@ -449,6 +449,7 @@ STAGE_SHAPE = {
         "lenses": _TEXTS,
         "defenders": {"type": "integer", "minimum": 1},
         "survive_if_unrefuted_by": {"type": "integer", "minimum": 1},
+        "screen_defenders": {"type": "integer", "minimum": 0},
         "detective": {"type": "boolean"},
         "on_fail": {"type": "string"},
         "max_rounds": {"type": "integer", "minimum": 1},
@@ -616,6 +617,11 @@ def validate_pipeline(pl: dict) -> tuple[list[str], list[str]]:
                     errors.append(f"{where}: survive_if_unrefuted_by needs defenders")
                 elif stage["survive_if_unrefuted_by"] > stage["defenders"]:
                     errors.append(f"{where}: survive_if_unrefuted_by cannot exceed defenders")
+            if "screen_defenders" in stage:
+                if "defenders" not in stage:
+                    errors.append(f"{where}: screen_defenders needs defenders")
+                elif stage["screen_defenders"] > stage["defenders"]:
+                    errors.append(f"{where}: screen_defenders cannot exceed defenders")
         elif kind == "agent":
             if "role" not in stage:
                 errors.append(f"{where}: an agent stage needs a role")
@@ -1473,7 +1479,7 @@ def build_plan(pipeline: dict, record: dict, run_id: str, commands: dict | None 
             "lenses": lenses,
         }
         if kind == "review":
-            for key in ("target", "defenders", "survive_if_unrefuted_by", "detective"):
+            for key in ("target", "defenders", "survive_if_unrefuted_by", "screen_defenders", "detective"):
                 entry[key] = stage.get(key)
         stages.append(entry)
     return {
@@ -2502,6 +2508,14 @@ def _gate_no_surviving_blockers(review: dict, ctx: GateContext) -> list[str]:
         problems.append(f"blockers_surviving says {review['blockers_surviving']}, but the findings and survivors give {len(standing)}")
     if standing:
         problems.append(f"{len(standing)} blocker(s) survive: {', '.join(standing)}")
+    severity = {f["id"]: f["severity"] for f in review["findings"]}
+    for fid in dict.fromkeys(review.get("panel_needed", [])):  # the full panel has yet to defend these: the gate fails until it has, in this round
+        if fid not in ids:
+            problems.append(f"panel_needed names '{fid}', which is no finding of this round")
+        elif severity[fid] == "BLOCKING":
+            problems.append(f"finding {fid} was filed BLOCKING and only a screening defender answered it; {PANEL_FIX}")
+        else:
+            problems.append(f"the screening defender claims finding {fid} is BLOCKING; {PANEL_FIX}")
     if ctx.measuring and ctx.run is not None and _is_diff_review(ctx.stage):
         current = change_hash(ctx.root, ctx.run.merge_base)
         if review["diff_sha256"] != current:
@@ -2904,15 +2918,19 @@ def route_of(pipeline: dict, finding: dict) -> str:
 
 
 SEVERITIES = ("MINOR", "MAJOR", "BLOCKING")  # lowest first
+SCREEN_RECORD = re.compile(r"screen-[A-Za-z0-9._-]+")  # the stem of a screening defender's record, screen-<k>.json; the panel writes defender-<k>.json
+PANEL_FIX = "run the full panel for it in this round"  # how every problem of a finding that needs the full panel ends
 
 
-def severity_claims(findings: list[dict], survivors: list[str], defenses: list[dict], threshold: int, warnings: list[str]) -> dict[str, str]:
-    """The surviving findings whose severity the defenders raise, as {finding id: the new severity}. A defender that concedes a finding
-    may claim a severity for it (`severity_claim`). A claim equal to or below the severity the prosecutor filed is ignored, with a warning.
-    When at least `threshold` defenders claim a higher severity, the finding is raised to the highest level that many of them claimed:
-    the threshold-th highest claim, because a claim of BLOCKING asks for MAJOR as well."""
+def severity_claims(
+    findings: list[dict], survivors: list[str], defenses: list[dict], threshold: int, warnings: list[str]
+) -> dict[str, tuple[str, list[str]]]:
+    """The surviving findings whose severity the defenders raise, as {finding id: (the new severity, the defenders whose claims asked for it)}.
+    A defender that concedes a finding may claim a severity for it (`severity_claim`). A claim equal to or below the severity the prosecutor
+    filed is ignored, with a warning. When at least `threshold` defenders claim a higher severity, the finding is raised to the highest level
+    that many of them claimed: the threshold-th highest claim, because a claim of BLOCKING asks for MAJOR as well."""
     filed = {finding["id"]: finding["severity"] for finding in findings}
-    claims: dict[str, list[str]] = {}
+    claims: dict[str, list[tuple[str, str]]] = {}  # finding id -> (the severity claimed, by whom)
     for defense in defenses:
         claim = defense.get("severity_claim")
         if claim is None:
@@ -2921,13 +2939,75 @@ def severity_claims(findings: list[dict], survivors: list[str], defenses: list[d
         if SEVERITIES.index(claim) <= SEVERITIES.index(filed[fid]):
             warnings.append(f"defender '{defense['defender']}' claims {claim} for '{fid}', which is not above the {filed[fid]} the prosecutor filed, so the claim is ignored")
         else:
-            claims.setdefault(fid, []).append(claim)
+            claims.setdefault(fid, []).append((claim, defense["defender"]))
     raised = {}
     for fid in survivors:
-        higher = sorted(claims.get(fid, []), key=SEVERITIES.index, reverse=True)
+        higher = sorted(claims.get(fid, []), key=lambda made: SEVERITIES.index(made[0]), reverse=True)
         if threshold and len(higher) >= threshold:
-            raised[fid] = higher[threshold - 1]
+            level = higher[threshold - 1][0]
+            raised[fid] = (level, [who for claim, who in higher if SEVERITIES.index(claim) >= SEVERITIES.index(level)])
     return raised
+
+
+def screening_claims(
+    findings: list[dict], survivors: list[str], screened: set[str], screen_defenses: list[dict], warnings: list[str]
+) -> tuple[dict[str, tuple[str, list[str]]], set[str]]:
+    """What the screening defenders' claims do to the findings only they answered (`screened`), as (the findings raised, in the form
+    severity_claims has, and the findings that need the full panel). A claim of MAJOR raises a MINOR finding to MAJOR. A claim of BLOCKING raises nothing: it sends the finding to the
+    panel (`panel_needed`), which settles its severity in this round. So does a finding that was filed BLOCKING, because the full panel defends
+    those and only the panel can end one. A claim equal to or below the filed severity is ignored, with a warning."""
+    filed = {finding["id"]: finding["severity"] for finding in findings}
+    raised: dict[str, tuple[str, list[str]]] = {}
+    needed = {fid for fid in survivors if fid in screened and filed[fid] == "BLOCKING"}
+    for defense in screen_defenses:
+        claim, fid = defense.get("severity_claim"), defense["finding_id"]
+        if claim is None or fid not in screened:
+            continue
+        if SEVERITIES.index(claim) <= SEVERITIES.index(filed[fid]):
+            warnings.append(f"defender '{defense['defender']}' claims {claim} for '{fid}', which is not above the {filed[fid]} the prosecutor filed, so the claim is ignored")
+        elif fid in survivors:
+            if claim == "BLOCKING":
+                needed.add(fid)
+            elif filed[fid] == "MINOR":
+                raised[fid] = ("MAJOR", [*raised.get(fid, ("MAJOR", []))[1], defense["defender"]])
+    return raised, needed
+
+
+def _defense_entries(records: list[tuple[str, dict]], owner: dict[str, str], seen_pairs: set[tuple[str, str]], problems: list[str]) -> list[dict]:
+    """The entries of defense records that hold: each names its record's defender and a finding of the round, and answers it once."""
+    entries = []
+    for where, data in records:
+        for defense in data["defenses"]:
+            pair = (defense["finding_id"], defense["defender"])
+            if defense["defender"] != data["defender"]:
+                problems.append(f"{where}: an entry names defender '{defense['defender']}' in the record of defender '{data['defender']}'")
+            elif defense["finding_id"] not in owner:
+                problems.append(f"{where}: a defense of unknown finding '{defense['finding_id']}'")
+            elif pair in seen_pairs:
+                problems.append(f"{where}: defender '{defense['defender']}' defends finding '{defense['finding_id']}' more than once")
+            else:
+                seen_pairs.add(pair)
+                entries.append(defense)
+    return entries
+
+
+def _valid_refutations(defenses: list[dict], file_of: dict[str, str], evidence: "Evidence", warnings: list[str]) -> dict[str, set[str]]:
+    """Who refuted each finding: a verdict of `refuted` with a quote of at least MIN_QUOTE characters that occurs in the change's diff or in the
+    finding's file. A refutation without such a quote is a warning, and does not count."""
+    refuted_by: dict[str, set[str]] = {}
+    for defense in defenses:
+        if defense["verdict"] != "refuted":
+            continue
+        who, fid, quote = defense["defender"], defense["finding_id"], defense["quote"]
+        if not quote.strip():
+            warnings.append(f"defender '{who}' refuted '{fid}' without quoting code, which does not count")
+        elif len(normalise_quote(quote)) < MIN_QUOTE:
+            warnings.append(f"defender '{who}' refuted '{fid}' with a quote of fewer than {MIN_QUOTE} characters, which does not count")
+        elif not evidence.holds(quote, file_of[fid], MIN_QUOTE):
+            warnings.append(f"defender '{who}' refuted '{fid}' with a quote that is in neither the change nor {file_of[fid]}, which does not count")
+        else:
+            refuted_by.setdefault(fid, set()).add(who)
+    return refuted_by
 
 
 @dataclass
@@ -2937,6 +3017,7 @@ class MergeResult:
     warnings: list[str]
     parts: list[dict] = field(default_factory=list)  # [{path, sha256}] of the agents' records the review record was built from
     unverified: list[str] = field(default_factory=list)  # the findings whose evidence is in neither the diff nor the file, as `id (file:line)`
+    raised_by: dict[str, list[str]] = field(default_factory=dict)  # the findings whose severity was raised, and the defenders whose claims did it
 
 
 def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | None = None) -> MergeResult:
@@ -2949,7 +3030,10 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
     quote that occurs in the change's diff or in the finding's file; a defender that is silent on a finding, concedes it,
     or refutes without such a quote did not refute it. A finding whose own evidence is in neither place stays, and is
     marked evidence_unverified. A surviving finding that enough defenders claim a higher severity for is raised to it (see
-    severity_claims), and marked severity_raised_from. A stage without defenders lets every finding survive."""
+    severity_claims), and marked severity_raised_from. A finding that only screening defenders answered (`screen-<k>.json`, as many as
+    the stage's `screen_defenders`) stands unless one of them refuted it with a valid quote; their claims are read by screening_claims, and
+    a finding that needs the full panel goes in `panel_needed` until the panel's records cover it. A stage without defenders lets every
+    finding survive."""
     root = project.root
     stage = next((s for s in project.pipeline["stage"] if s["id"] == stage_id), None)
     if stage is None:
@@ -2981,6 +3065,7 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
     warnings: list[str] = []
     findings_records: list[tuple[str, dict]] = []
     defense_records: list[tuple[str, dict]] = []
+    screen_records: list[tuple[str, dict]] = []
     gaps_records: list[tuple[str, dict]] = []
     for path in sorted(round_dir.glob("*.json")):
         where = rel_path(root, path)
@@ -2994,12 +3079,18 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
             errors = check_record(guess, data)
             problems.append(f"{where}: not a valid {guess}: {errors[0]}" + (f" (and {len(errors) - 1} more)" if len(errors) > 1 else ""))
             continue
-        {"findings_record": findings_records, "defense_record": defense_records, "gaps_record": gaps_records}[kind].append((where, data))
+        if kind == "defense_record" and SCREEN_RECORD.fullmatch(path.stem):
+            screen_records.append((where, data))
+        else:
+            {"findings_record": findings_records, "defense_record": defense_records, "gaps_record": gaps_records}[kind].append((where, data))
 
     defenders = stage.get("defenders", 0)
+    screening = stage.get("screen_defenders")  # how many screening defenders answer a round with no BLOCKING finding; None for a stage without screening
+    screeners = screening or 0
     used = [
         *((where, data, "prosecutor") for where, data in findings_records),
         *((where, data, "defender") for where, data in (defense_records if defenders else [])),
+        *((where, data, "defender") for where, data in (screen_records if screeners else [])),
         *((where, data, "detective") for where, data in gaps_records),
     ]
 
@@ -3049,48 +3140,46 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
 
     threshold = stage.get("survive_if_unrefuted_by", _majority(defenders)) if defenders else 0
     names = sorted({data["defender"] for _, data in defense_records}) if defenders else []
+    screen_names = sorted({data["defender"] for _, data in screen_records}) if screeners else []
     seen_pairs: set[tuple[str, str]] = set()
-    defenses: list[dict] = []
-    for where, data in defense_records if defenders else []:
-        for defense in data["defenses"]:
-            pair = (defense["finding_id"], defense["defender"])
-            if defense["defender"] != data["defender"]:
-                problems.append(f"{where}: an entry names defender '{defense['defender']}' in the record of defender '{data['defender']}'")
-            elif defense["finding_id"] not in owner:
-                problems.append(f"{where}: a defense of unknown finding '{defense['finding_id']}'")
-            elif pair in seen_pairs:
-                problems.append(f"{where}: defender '{defense['defender']}' defends finding '{defense['finding_id']}' more than once")
-            else:
-                seen_pairs.add(pair)
-                defenses.append(defense)
+    defenses = _defense_entries(defense_records if defenders else [], owner, seen_pairs, problems)
+    screen_defenses = _defense_entries(screen_records if screeners else [], owner, seen_pairs, problems)
     if defenders and len(names) > defenders:
         problems.append(f"{len(names)} defenders reported ({', '.join(names)}) but the stage has {defenders}")
+    if screeners and len(screen_names) > screeners:
+        problems.append(f"{len(screen_names)} screening defenders reported ({', '.join(screen_names)}) but the stage has {screeners}")
     if not defenders and defense_records:
         warnings.append("this stage has no defenders, so its defense records were ignored and every finding survives")
-    if defenders and findings and len(names) < defenders:
-        warnings.append(f"only {len(names)} of {defenders} defenders reported; a missing defender did not refute anything")
+    if not screeners and screen_records:
+        warnings.append("this stage has no screening defenders, so its screen records were ignored")
+    panel_expected = screening is None or bool(names) or any(f["severity"] == "BLOCKING" for f in findings)  # a BLOCKING finding gets the full panel, and so does a stage without screening
+    if defenders and findings:
+        if panel_expected:
+            if len(names) < defenders:
+                warnings.append(f"only {len(names)} of {defenders} defenders reported; a missing defender did not refute anything")
+        elif screeners and len(screen_names) < screeners:
+            warnings.append(f"only {len(screen_names)} of {screeners} screening defenders reported; a missing screening defender did not refute anything")
     if problems:
         return MergeResult(None, problems, warnings)
 
     evidence = Evidence(root, change_diff_lines(root, run.merge_base, tree))
     file_of = {finding["id"]: finding["file"] for finding in findings}
     position = {finding["id"]: index for index, finding in enumerate(findings)}
-    refuted_by: dict[str, set[str]] = {}
-    for defense in defenses:
-        if defense["verdict"] != "refuted":
-            continue
-        who, fid, quote = defense["defender"], defense["finding_id"], defense["quote"]
-        if not quote.strip():
-            warnings.append(f"defender '{who}' refuted '{fid}' without quoting code, which does not count")
-        elif len(normalise_quote(quote)) < MIN_QUOTE:
-            warnings.append(f"defender '{who}' refuted '{fid}' with a quote of fewer than {MIN_QUOTE} characters, which does not count")
-        elif not evidence.holds(quote, file_of[fid], MIN_QUOTE):
-            warnings.append(f"defender '{who}' refuted '{fid}' with a quote that is in neither the change nor {file_of[fid]}, which does not count")
-        else:
-            refuted_by.setdefault(fid, set()).add(who)
-    survivors = [f["id"] for f in findings if defenders - len(refuted_by.get(f["id"], ())) >= threshold]
+    refuted_by = _valid_refutations(defenses, file_of, evidence, warnings)
+    screen_refuted_by = _valid_refutations(screen_defenses, file_of, evidence, warnings)
+    filed = {f["id"]: f["severity"] for f in findings}
+    screened = {d["finding_id"] for d in screen_defenses} - {d["finding_id"] for d in defenses}  # the findings only the screening defenders answered
+
+    def stands(fid: str) -> bool:
+        if fid in screened and filed[fid] != "BLOCKING":  # one valid refutation by a screening defender ends the finding: the panel's threshold is the panel's
+            return fid not in screen_refuted_by
+        return defenders - len(refuted_by.get(fid, ())) >= threshold  # a BLOCKING finding that only a screening defender answered stands, and asks for the panel
+
+    survivors = [f["id"] for f in findings if stands(f["id"])]
     raised = severity_claims(findings, survivors, defenses, threshold, warnings)
-    severity = {f["id"]: raised.get(f["id"], f["severity"]) for f in findings}
+    screen_raised, needed = screening_claims(findings, survivors, screened, screen_defenses, warnings)
+    raised.update(screen_raised)
+    severity = {f["id"]: raised[f["id"]][0] if f["id"] in raised else f["severity"] for f in findings}
     unverified = [f for f in findings if not evidence.holds(f["evidence"], f["file"])]
     unverified_ids = {f["id"] for f in unverified}
     marked = [
@@ -3101,23 +3190,24 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
     routes: dict[str, list[str]] = {"builder": [], "test-writer": []}
     for fid in survivors:
         routes[route_of(project.pipeline, by_id[fid])].append(fid)
-    defenses.sort(key=lambda d: (position[d["finding_id"]], d["defender"]))
+    answers = sorted([*defenses, *screen_defenses], key=lambda d: (position[d["finding_id"]], d["defender"]))
     record = {
         "target": stage["target"],
         "round": round_no,
         "lenses": expected,
         "findings": marked,
-        "defenses": defenses,
+        "defenses": answers,
         "survivors": survivors,
         "gaps": gaps_records[0][1]["gaps"] if gaps_records else [],
         "blockers_surviving": sum(1 for fid in survivors if severity[fid] == "BLOCKING"),
         "routes": routes,
+        "panel_needed": [f["id"] for f in findings if f["id"] in needed],
         "diff_sha256": current,
     }
     errors = check_record("review_record", record)
     if errors:
         raise PlumblineError("internal error: the merged review_record does not validate: " + "; ".join(errors[:3]))
-    return MergeResult(record, [], warnings, parts, [f"{f['id']} ({f['file']}:{f['line']})" for f in unverified])
+    return MergeResult(record, [], warnings, parts, [f"{f['id']} ({f['file']}:{f['line']})" for f in unverified], {fid: who for fid, (_level, who) in raised.items()})
 
 
 def merge_review(project: Project, run_id: str, stage_id: str, round_no: int | None = None) -> tuple[dict | None, list[str], list[str]]:
@@ -3771,18 +3861,21 @@ def route_lines(record: dict) -> list[str]:
     return lines
 
 
-def raise_lines(record: dict) -> list[str]:
+def raise_lines(record: dict, claimed_by: dict[str, list[str]]) -> list[str]:
     """One line for each finding whose severity `merge-review` raised, naming the defenders whose claims did it."""
-    lines = []
-    for f in record["findings"]:
-        if "severity_raised_from" not in f:
-            continue
-        asked = [
-            d["defender"] for d in record["defenses"]
-            if d["finding_id"] == f["id"] and "severity_claim" in d and SEVERITIES.index(d["severity_claim"]) >= SEVERITIES.index(f["severity"])
-        ]
-        lines.append(f"severity raised: {f['id']} from {f['severity_raised_from']} to {f['severity']} (claimed by {', '.join(asked)})")
-    return lines
+    return [
+        f"severity raised: {f['id']} from {f['severity_raised_from']} to {f['severity']} (claimed by {', '.join(claimed_by.get(f['id'], []))})"
+        for f in record["findings"]
+        if "severity_raised_from" in f
+    ]
+
+
+def panel_lines(record: dict) -> list[str]:
+    """The line that says which findings need the full panel in this round, when any does."""
+    ids = record.get("panel_needed", [])
+    if not ids:
+        return []
+    return [f"panel needed for {', '.join(ids)}: run the full panel for {'it' if len(ids) == 1 else 'them'} in this round, then run merge-review for the same round again"]
 
 
 def cmd_merge_review(args) -> int:
@@ -3806,7 +3899,9 @@ def cmd_merge_review(args) -> int:
         f"wrote {rel_path(project.root, path)}: round {record['round']}, {_plural(len(record['findings']), 'finding')}, "
         f"{len(record['survivors'])} surviving ({record['blockers_surviving']} blocking), {_plural(len(record['gaps']), 'gap')}"
     )
-    for line in raise_lines(record):
+    for line in raise_lines(record, result.raised_by):
+        print(line)
+    for line in panel_lines(record):
         print(line)
     for line in route_lines(record):
         print(line)
@@ -3820,11 +3915,11 @@ def open_next_round(root: Path, run_id: str, stage: dict, outcome: GateOutcome, 
     only in the highest round-<n> directory of their stage (the PreToolUse hook holds them to it) and `merge-review` merges the highest
     round by default, so the directory of round N+1 is made here, and the main session has no step of its own to take. Returns it, or
     None when the stage is no review, its rounds are used, the failure is the ledger's (a record that is missing, changed, or not traced
-    to its agents: that round is merged again, not left behind), or no blocker stands."""
+    to its agents: that round is merged again, not left behind), no blocker stands, or a finding still needs the full panel."""
     if stage.get("kind", "agent") != "review" or limit is None or round_no >= limit or not outcome.checked or outcome.data is None:
         return None
-    if not standing_blockers(outcome.data):
-        return None
+    if not standing_blockers(outcome.data) or outcome.data.get("panel_needed"):
+        return None  # a finding that needs the full panel is defended in this round: the next round opens once the panel has spoken
     directory = run_dir(root, run_id) / stage["id"] / f"round-{round_no + 1}"
     directory.mkdir(parents=True, exist_ok=True)
     return directory
@@ -3853,10 +3948,11 @@ def cmd_gate(args) -> int:
     outcome = evaluate_stage(project, args.run_id, stage, measure=True, run=run, run_problem=run_problem)
     round_no, limit = stage_round(stage, outcome.data, read_ledger(project.root, args.run_id))
     exhausted = False
+    awaiting = outcome.checked and outcome.data is not None and bool(outcome.data.get("panel_needed"))  # the full panel settles this failure, in this round: it uses up none
     if limit is not None and outcome.gate != "all_gates_passed":
         if round_no > limit:
             outcome.problems.append(f"round {round_no} is past the {limit} rounds stage '{stage['id']}' has")
-        exhausted = round_no > limit or (round_no == limit and bool(outcome.problems))
+        exhausted = round_no > limit or (round_no == limit and bool(outcome.problems) and not awaiting)
         outcome.passed = not outcome.problems
     append_ledger(project.root, args.run_id, ledger_gate_entry(outcome))
     verdict = "pass" if outcome.passed else "FAIL"

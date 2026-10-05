@@ -179,6 +179,14 @@
         }
       }
     },
+    "panel_needed": {
+      "description": "The findings that need the full defender panel in this round: those a screening defender claims are BLOCKING (a claim of BLOCKING never raises a finding by itself), and the BLOCKING findings that only a screening defender answered. The gate no_surviving_blockers fails while any is listed. Once the panel's records cover a finding, the panel's rule decides it and it leaves the list. Absent from a record written before 0.5.0.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
     "diff_sha256": {
       "description": "The sha256 of the change this round covered: the diff from the run's merge base to the files as they were when `merge-review` built this record, untracked files included. For a review of the diff, `pass` refuses when the diff of HEAD hashes differently, so a change edited after its review fails.",
       "type": "string",

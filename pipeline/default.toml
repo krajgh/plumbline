@@ -81,6 +81,7 @@ record = "review_record"
 lenses = ["correctness", "tests", "security", "data", "boundaries"]
 defenders = 3
 survive_if_unrefuted_by = 2     # a blocker stands when at least 2 of the 3 defenders fail to refute it
+screen_defenders = 1            # the panel of 3 defends only when a prosecutor filed a BLOCKING finding; otherwise 1 screening defender answers every finding (0: none runs, and every finding stands)
 detective = true                # runs only once no blocker stands
 gate = "no_surviving_blockers"
 on_fail = "build"

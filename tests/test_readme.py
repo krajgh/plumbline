@@ -460,8 +460,9 @@ def test_every_lane_file_test_config_file_and_test_output_the_hook_knows_is_in_t
 
 def test_the_review_file_names_of_the_hook_are_the_ones_the_readme_gives():
     text = section("Runs, gates and the pass record")
-    for name in pre.REVIEW_FILE_NAMES.values():
-        assert f"`{name}`" in text, name
+    for names in pre.REVIEW_FILE_NAMES.values():
+        for name in names:
+            assert f"`{name}`" in text, name
 
 
 def test_the_python_requirement_is_stated_and_the_scripts_check_it():

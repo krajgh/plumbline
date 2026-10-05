@@ -143,9 +143,9 @@ GIT_BUILTINS = frozenset(
 # The plumbline agents, and the review units' among them (which write under a review stage's round directories).
 ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")
 REVIEW_ROLES = ("prosecutor", "defender", "detective")
-# The file a review agent writes in a round directory, by role.
-REVIEW_FILES = {"prosecutor": r"prosecutor-[A-Za-z0-9._-]+\.json", "defender": r"defender-[A-Za-z0-9._-]+\.json", "detective": r"detective\.json"}
-REVIEW_FILE_NAMES = {"prosecutor": "prosecutor-<lens>.json", "defender": "defender-<n>.json", "detective": "detective.json"}
+# The files a review agent writes in a round directory, by role: the defender's are the panel's (defender-<n>.json) and a screening defender's (screen-<k>.json).
+REVIEW_FILES = {"prosecutor": r"prosecutor-[A-Za-z0-9._-]+\.json", "defender": r"(?:defender|screen)-[A-Za-z0-9._-]+\.json", "detective": r"detective\.json"}
+REVIEW_FILE_NAMES = {"prosecutor": ("prosecutor-<lens>.json",), "defender": ("defender-<n>.json", "screen-<k>.json"), "detective": ("detective.json",)}
 # A command of the main session concerns plumbline besides git and gh only if it mentions one of these.
 CARES = re.compile(r"plumbline|override|ledger")
 
@@ -2408,7 +2408,7 @@ def own_record_paths(pipeline: dict, role: str) -> list[str]:
     """Where an agent of `role` writes its record, as patterns for a message."""
     if role in REVIEW_ROLES:
         stages = [s["id"] for s in pipeline.get("stage", []) if s.get("kind") == "review"]
-        name = REVIEW_FILE_NAMES[role]
+        name = " or ".join(REVIEW_FILE_NAMES[role])
         return [f"{RUNS_DIR}/<run-id>/{stages[0] if len(stages) == 1 else '{' + ','.join(stages) + '}'}/round-<n>/{name}"] if stages else []
     return [f"{RUNS_DIR}/<run-id>/{s['id']}.json" for s in pipeline.get("stage", []) if s.get("kind", "agent") == "agent" and s.get("role") == role]
 
