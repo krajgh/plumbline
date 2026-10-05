@@ -53,7 +53,7 @@ MATCHER_VAR = "PONYTAIL_SUBAGENT_MATCHER"
 # The first alternative keeps ponytail on for every subagent that is not a plumbline agent; the second picks the three that make the change.
 MATCHER_EXAMPLE = "^(?!plumbline:)|^plumbline:(planner|test-writer|builder)$"
 MAKING_AGENTS = ("planner", "test-writer", "builder")
-ALL_AGENTS = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")
+ALL_AGENTS = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary")
 
 
 def one_line(text: str) -> str:

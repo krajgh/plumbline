@@ -11,7 +11,7 @@ from helpers import REPO, write
 from hookdata import tool_payload
 from rundata import adopt
 
-ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")
+ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary")
 ISOLATION = "plumbline: a run's records live in the main checkout, so plumbline:{role} runs there. Launch it without `isolation`."
 ROLE_RULE = "plumbline stages run through the plumbline:* agents"
 
@@ -76,7 +76,7 @@ def test_the_isolation_rule_is_silent_where_plumbline_is_not_adopted(repo):
 
 def test_the_pins_are_the_ones_in_the_agent_files():
     assert {role: pinned(role) for role in ROLES} == {
-        "planner": "sonnet", "test-writer": "sonnet", "builder": "sonnet", "verifier": "haiku", "prosecutor": "sonnet", "defender": "haiku", "detective": "sonnet"
+        "planner": "sonnet", "test-writer": "sonnet", "builder": "sonnet", "verifier": "haiku", "prosecutor": "sonnet", "defender": "haiku", "detective": "sonnet", "canary": "sonnet"
     }
     for role in ROLES:
         assert pre.pinned_model(pl, role) == pinned(role)
@@ -179,7 +179,7 @@ def test_the_denial_names_the_agent_and_the_agents_to_use(adopted):
     reason = launch(adopted, "general-purpose", prompt="see .plumbline/runs/r1/plan.json")
     assert reason == (
         "plumbline: plumbline stages run through the plumbline:* agents, so a brief about .plumbline/ goes to the stage's agent "
-        "(plumbline:planner, test-writer, builder, verifier, prosecutor, defender or detective), not to general-purpose."
+        "(plumbline:planner, test-writer, builder, verifier, prosecutor, defender, detective or canary), not to general-purpose."
     )
     assert reason.endswith("not to a general agent.") is False
     assert launch(adopted, False, prompt="see .plumbline/runs/r1/plan.json").endswith("not to a general agent.")

@@ -59,7 +59,8 @@ OPTIONAL = {
     ("defense_record", "$.defenses[]"): {"severity_claim"},  # 0.5.0: only a defender that concedes a finding worse than filed writes one
     ("review_record", "$.defenses[]"): {"severity_claim"},
     ("review_record", "$.findings[]"): {"severity_raised_from"},  # only on a finding that merge-review raised
-    ("review_record", "$"): {"panel_needed"},  # 0.5.0: a review record from 0.4.2 has none
+    ("review_record", "$"): {"panel_needed", "canary"},  # 0.5.0: a review record from 0.4.2 has no panel_needed, and only a calibration round has a canary
+    ("change_class", "$"): {"calibrate"},  # only the intake record of a calibration run has it
     ("review_record", "$.routes"): {"planner"},  # a record from 0.4.2 routes to two roles
 }
 
@@ -101,10 +102,11 @@ def test_the_per_agent_review_records_use_the_review_records_item_shapes():
     merged["required"].remove("evidence_unverified")
     del merged["properties"]["evidence_unverified"]
     del merged["properties"]["severity_raised_from"]
+    merged["properties"]["lens"]["enum"] = [*merged["properties"]["lens"]["enum"], "canary"]  # the findings record may be the canary's: its lens is not one a review runs
     assert pl.load_schema("findings_record")["properties"]["findings"]["items"] == merged
     assert pl.load_schema("defense_record")["properties"]["defenses"]["items"] == review["defenses"]["items"]
     assert pl.load_schema("gaps_record")["properties"]["gaps"]["items"] == review["gaps"]["items"]
-    assert pl.load_schema("findings_record")["properties"]["lens"]["enum"] == review["lenses"]["items"]["enum"]
+    assert pl.load_schema("findings_record")["properties"]["lens"]["enum"] == [*review["lenses"]["items"]["enum"], "canary"]
 
 
 def test_a_findings_record_has_one_lens_and_a_defense_record_one_defender():

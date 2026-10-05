@@ -299,7 +299,7 @@ def test_the_hook_finds_the_project_from_claude_project_dir_whatever_the_cwd(hom
 
 
 ENV_VAR = "PONYTAIL_SUBAGENT_MATCHER"
-AGENTS = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")
+AGENTS = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary")
 MAKING = ("planner", "test-writer", "builder")
 
 
@@ -378,9 +378,9 @@ def test_the_local_settings_win_over_the_project_settings_and_those_over_the_use
 @pytest.mark.parametrize(
     "value,said",
     [
-        (".*", "it also reaches verifier, prosecutor, defender, detective"),
-        ("plumbline", "it also reaches verifier, prosecutor, defender, detective"),
-        ("^plumbline:", "it also reaches verifier, prosecutor, defender, detective"),
+        (".*", "it also reaches verifier, prosecutor, defender, detective, canary"),
+        ("plumbline", "it also reaches verifier, prosecutor, defender, detective, canary"),
+        ("^plumbline:", "it also reaches verifier, prosecutor, defender, detective, canary"),
         ("builder", "it misses planner, test-writer"),
         ("^plumbline:builder$", "it misses planner, test-writer"),
         ("^plumbline:(planner|test-writer)$", "it misses builder"),

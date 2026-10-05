@@ -11,7 +11,7 @@ from helpers import CLI, DEFAULT_TOML, commit_all, git, write
 from hookdata import bash_payload, denial, start_run, stop_payload, tool_payload
 from rundata import adopt, put
 
-ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")
+ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary")
 
 
 def agent(role):
@@ -66,6 +66,7 @@ OWN_RECORD = {
     "prosecutor": ".plumbline/runs/r1/review/round-1/prosecutor-security.json",
     "defender": ".plumbline/runs/r1/review/round-1/defender-1.json",
     "detective": ".plumbline/runs/r1/review/round-1/detective.json",
+    "canary": ".plumbline/runs/r1/review/round-1/prosecutor-canary.json",
 }
 
 
@@ -76,8 +77,8 @@ def test_every_agent_may_write_its_own_record(run_pre, started, role, tool, key)
 
 
 def test_the_review_agents_may_write_in_the_round_directories_of_the_test_review_too(run_pre, started):
-    for role, name in (("prosecutor", "prosecutor-tests.json"), ("defender", "defender-2.json"), ("detective", "detective.json")):
-        assert writes(run_pre, started, role, f".plumbline/runs/r1/test-review/round-1/{name}") is None, role
+    for role, name in (("prosecutor", "prosecutor-tests.json"), ("defender", "defender-2.json"), ("defender", "screen-1.json"), ("detective", "detective.json"), ("canary", "prosecutor-canary.json"), ("canary", "canary-key.json")):
+        assert writes(run_pre, started, role, f".plumbline/runs/r1/test-review/round-1/{name}") is None, (role, name)
 
 
 @pytest.mark.parametrize("role", ROLES)
@@ -90,7 +91,7 @@ def test_an_agent_writes_only_its_own_record_never_another_agents(run_pre, adopt
 
 
 def test_a_review_agent_cannot_write_a_stage_record_or_a_path_outside_a_round_directory(run_pre, adopted):
-    for role in ("prosecutor", "defender", "detective"):
+    for role in ("prosecutor", "defender", "detective", "canary"):
         for path in (".plumbline/runs/r1/review.json", ".plumbline/runs/r1/review/prosecutor-x.json", ".plumbline/runs/r1/review/round-0/x.json",
                      ".plumbline/runs/r1/review/round-1/deep/x.json", ".plumbline/runs/r1/build.json", ".plumbline/runs/r1/intake.json",
                      ".plumbline/runs/r1/other-stage/round-1/x.json", ".plumbline/runs/r1/review/round-1/x.txt"):
@@ -662,7 +663,7 @@ def test_written_operands_are_what_a_writer_writes_or_removes(argv, expected):
 
 
 def test_the_hook_roles_are_the_pipelines_roles():
-    assert pre.ROLES == pl.AGENT_ROLES and pre.REVIEW_ROLES == ("prosecutor", "defender", "detective")
+    assert pre.ROLES == pl.AGENT_ROLES and pre.REVIEW_ROLES == ("prosecutor", "defender", "detective", "canary")
     assert pre.CONFIG_COMMANDS == pl.CONFIG_COMMANDS and pre.PASS_DIR == pl.PASS_DIR and pre.RUNS_DIR == pl.RUNS_DIR and pre.STUBS_DIR == pl.STUBS_DIR == "stubs"
     assert set(pre.GIT_READ) == {"diff", "show", "log", "status", "rev-parse", "merge-base", "ls-files", "grep", "blame"}
 

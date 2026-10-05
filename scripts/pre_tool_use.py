@@ -45,7 +45,13 @@ the paths the call names, so an agent whose working directory drifts is held all
       setup.cfg, noxfile.py and the files the repository's [commands] name to the main session.
   Agent
     - a plumbline agent is launched in the main checkout (no `isolation`) and with the model
-      its definition pins; another agent is not briefed on .plumbline/ paths.
+      its definition pins; another agent is not briefed on .plumbline/ paths; in a calibration
+      run a defender's brief does not name the canary (the file name prosecutor-canary.json,
+      which the brief lists among the findings records, is no naming).
+  Read, Grep, Glob and Bash, for the agent plumbline:defender, where a calibration run has a canary key
+    - canary-key.json, in a round directory, and a directory that holds one, are not read or searched:
+      Read, Grep and Glob are denied them, and so is a Bash command that names the key or runs a search
+      tool over it (a glob counts as what it matches).
   Read, Grep and Glob, for the agent plumbline:builder only
     - a path that matches the tests type of the pipeline, or is listed in the tests record
       of any run, is denied; under .plumbline/ only the active run's intake, plan and the
@@ -67,6 +73,7 @@ if sys.version_info < (3, 11):  # plumbline.py reads TOML with tomllib: answer "
 
 import base64
 import contextlib
+import glob
 import json
 import os
 import re
@@ -141,11 +148,22 @@ GIT_BUILTINS = frozenset(
 )
 
 # The plumbline agents, and the review units' among them (which write under a review stage's round directories).
-ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")
-REVIEW_ROLES = ("prosecutor", "defender", "detective")
-# The files a review agent writes in a round directory, by role: the defender's are the panel's (defender-<n>.json) and a screening defender's (screen-<k>.json).
-REVIEW_FILES = {"prosecutor": r"prosecutor-[A-Za-z0-9._-]+\.json", "defender": r"(?:defender|screen)-[A-Za-z0-9._-]+\.json", "detective": r"detective\.json"}
-REVIEW_FILE_NAMES = {"prosecutor": ("prosecutor-<lens>.json",), "defender": ("defender-<n>.json", "screen-<k>.json"), "detective": ("detective.json",)}
+ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary")
+REVIEW_ROLES = ("prosecutor", "defender", "detective", "canary")
+# The files a review agent writes in a round directory, by role: the defender's are the panel's (defender-<n>.json) and a screening defender's (screen-<k>.json),
+# the canary's are its record and its key, and the file named for the canary is the canary's alone.
+REVIEW_FILES = {
+    "prosecutor": r"prosecutor-(?!canary\.json)[A-Za-z0-9._-]+\.json",
+    "defender": r"(?:defender|screen)-[A-Za-z0-9._-]+\.json",
+    "detective": r"detective\.json",
+    "canary": r"(?:prosecutor-canary|canary-key)\.json",
+}
+REVIEW_FILE_NAMES = {
+    "prosecutor": ("prosecutor-<lens>.json",), "defender": ("defender-<n>.json", "screen-<k>.json"), "detective": ("detective.json",),
+    "canary": ("prosecutor-canary.json", "canary-key.json"),
+}
+CANARY_KEY_FILE = "canary-key.json"  # in the round directory of a calibration run: what tells the canary's finding from the others, which the defenders do not read
+CANARY_RECORD_FILE = "prosecutor-canary.json"
 # A command of the main session concerns plumbline besides git and gh only if it mentions one of these.
 CARES = re.compile(r"plumbline|override|ledger")
 
@@ -1576,7 +1594,7 @@ def bash_reason(data: dict) -> str | None:
 
     rules = [(override_reason, pl, steps)]
     if role is not None:
-        rules.append((role_command_reason, pl, role, steps, Path(cwd)))
+        rules += [(role_command_reason, pl, role, steps, Path(cwd)), (canary_command_reason, pl, role, steps, Path(cwd))]
     rules += [(protected_command_reason, pl, steps), (gate_reason, pl, command, Path(cwd), steps)]
     for rule in rules:
         reason = _guarded(*rule)
@@ -1861,6 +1879,116 @@ def builder_reason(data: dict) -> str | None:
             if hit:
                 return _blind_message(view, hit[0], hit[1], tool if tool != "Read" else None, named)
     return None
+
+
+# ------------------------------- the defenders' blindness to the canary's key
+#
+# A calibration run plants a false finding, the canary's, and the key to it (canary-key.json) lies in the round directory. A defender that read the key
+# would be answering the key and not the code, so a defender's Read, Grep, Glob and Bash do not reach it. The rules look only where a key exists: no key,
+# no calibration run, and nothing here changes what a defender does.
+
+
+def canary_keys(root: Path) -> list[Path]:
+    """The canary keys of the repository's runs: only a calibration run's round directories hold one."""
+    try:
+        return sorted((root / RUNS_DIR).glob(f"*/*/round-*/{CANARY_KEY_FILE}"))
+    except OSError:
+        return []
+
+
+def shows_canary_key(keys: list[Path], target: Path) -> Path | None:
+    """The first canary key that reading or searching `target` would show: the key itself, or a directory it lies in, at any depth."""
+    for candidate in dict.fromkeys((target, Path(os.path.realpath(target)))):
+        for key in keys:
+            for real in dict.fromkeys((key, Path(os.path.realpath(key)))):
+                if candidate == real or candidate in real.parents:
+                    return key
+    return None
+
+
+def _key_message(what: str) -> str:
+    return (
+        f"plumbline: {what} would show a file that a defender answers without: the run keeps its own key to the round there. "
+        "Read the findings records of the round and the code, and search a directory of source, for example src/."
+    )
+
+
+def defender_reason(data: dict) -> str | None:
+    """A defender's Read, Grep or Glob of a canary key, or of a directory that holds one, is denied; so is a Glob whose pattern names the key."""
+    if data.get("agent_type") != "plumbline:defender":
+        return None
+    tool, tool_input, cwd = data.get("tool_name"), data.get("tool_input") or {}, data.get("cwd")
+    if not isinstance(tool_input, dict) or not isinstance(cwd, str) or not cwd:
+        return None
+    import plumbline as pl
+
+    here = Path(cwd)
+    if tool == "Read":
+        named = tool_input.get("file_path")
+        if not isinstance(named, str) or not named:
+            return None
+        target, shown = _join(here, named), f"a Read of {named}"
+    elif tool in ("Grep", "Glob"):
+        named = tool_input.get("path")
+        base = _join(here, named) if isinstance(named, str) and named.strip() else here  # a search without a path starts where the agent is
+        pattern = tool_input.get("pattern") if tool == "Glob" and isinstance(tool_input.get("pattern"), str) else None
+        target, shown = (_join(base, _static_prefix(pattern)) if pattern else base), f"a {tool} of {named if isinstance(named, str) and named.strip() else 'the working directory'}"
+        if pattern and CANARY_KEY_FILE.lower() in pattern.lower() and any(canary_keys(root) for root in adopted_roots(pl, anchors_of(here, base))):
+            return _key_message(f"a Glob for {pattern}")
+    else:
+        return None
+    for root in adopted_roots(pl, anchors_of(here, target)):
+        keys = canary_keys(root)
+        if keys and shows_canary_key(keys, target):
+            return _key_message(shown)
+    return None
+
+
+RECURSIVE_GREP = re.compile(r"-[A-Za-z]*[rR][A-Za-z]*|--recursive|--dereference-recursive")
+RG_UNFILTERED = {"-u", "-uu", "-uuu", "--no-ignore", "--no-ignore-vcs", "--no-ignore-dot", "--no-ignore-parent", "--hidden", "-."}  # ripgrep skips what git ignores, and dot directories, without these
+
+
+def canary_command_reason(pl, role: str, steps: list["Step"], cwd: Path) -> str | None:
+    """A defender's Bash does not reach a canary key: a word that names the key, or a search tool whose operands (a glob counts as what it matches, and a
+    recursive search with no operand as the directory it runs in) take in the key or a directory that holds it."""
+    if role != "defender":
+        return None
+    for root in adopted_roots(pl, anchors_of(cwd, *_anchor_paths(steps))):
+        keys = canary_keys(root)
+        if not keys:
+            continue
+        for step in steps:
+            if any(CANARY_KEY_FILE.lower() in word.lower() for word in step.raw):
+                return _key_message(f"`{' '.join(step.raw)[:100]}`")
+            name = os.path.basename(step.argv[0]) if step.argv else ""
+            if name not in SEARCH_TOOLS:
+                continue
+            args = step.argv[1:]
+            operands = [word.split("=", 1)[1] if word.startswith("--") and "=" in word else word for word in args if not word.startswith("-") or word == "-"]
+            paths: list[Path] = []
+            for word in operands:
+                joined = _join(step.cwd, word)
+                paths += [Path(match) for match in glob.glob(str(joined))] if re.search(r"[*?\[]", word) else ([joined] if _exists(joined) else [])
+            implicit = (
+                (name in ("grep", "egrep", "fgrep") and any(RECURSIVE_GREP.fullmatch(arg) for arg in args))
+                or name == "find"
+                or (name == "rg" and any(arg in RG_UNFILTERED for arg in args))
+                or (name == "ls" and any(arg.startswith("-") and not arg.startswith("--") and "R" in arg for arg in args))
+            )
+            for target in paths or ([step.cwd] if implicit else []):
+                if shows_canary_key(keys, target):
+                    return _key_message(f"`{' '.join(step.raw)[:100]}`")
+    return None
+
+
+def calibrating(pl, root: Path) -> bool:
+    """Is the run in progress a calibration run? Its intake record says so."""
+    run = active_run(pl, root)
+    stage = next((s for s in _pipeline_of(pl, root).get("stage", []) if s.get("record") == "change_class"), None)
+    if run is None or stage is None:
+        return False
+    data, _problem = pl.load_json_file(root / RUNS_DIR / run / f"{stage['id']}.json")
+    return isinstance(data, dict) and data.get("calibrate") is True
 
 
 # ---------------------------------------------- what an agent may do
@@ -2625,22 +2753,28 @@ def agent_launch_reason(data: dict) -> str | None:
         return None
     subagent = tool_input.get("subagent_type")
     plumbline_agent = isinstance(subagent, str) and subagent.startswith("plumbline:")
+    text = f"{tool_input.get('prompt', '')}\n{tool_input.get('description', '')}"
+    names_canary = subagent == "plumbline:defender" and bool(re.search(r"canary", re.sub(re.escape(CANARY_RECORD_FILE), "", text, flags=re.I), re.I))
     if plumbline_agent:
-        if tool_input.get("isolation") is None and tool_input.get("model") is None:
+        if tool_input.get("isolation") is None and tool_input.get("model") is None and not names_canary:
             return None
-    else:
-        text = f"{tool_input.get('prompt', '')}\n{tool_input.get('description', '')}"
-        if not re.search(r"\.plumbline[/\\]", text, re.I):
-            return None
+    elif not re.search(r"\.plumbline[/\\]", text, re.I):
+        return None
     import plumbline as pl
 
-    if not adopted_roots(pl, anchors_of(Path(cwd))):
+    roots = adopted_roots(pl, anchors_of(Path(cwd)))
+    if not roots:
         return None
+    if names_canary and any(calibrating(pl, root) for root in roots):
+        return (
+            "plumbline: a defender's brief lists the findings records of the round alike, the canary's among them, and names neither the canary nor its key. "
+            "Leave the word out of the brief."
+        )
     if not plumbline_agent:
         who = subagent if isinstance(subagent, str) and subagent else "a general agent"
         return (
             f"plumbline: plumbline stages run through the plumbline:* agents, so a brief about .plumbline/ goes to the stage's agent "
-            f"(plumbline:planner, test-writer, builder, verifier, prosecutor, defender or detective), not to {who}."
+            f"(plumbline:planner, test-writer, builder, verifier, prosecutor, defender, detective or canary), not to {who}."
         )
     if tool_input.get("isolation") is not None:
         return f"plumbline: a run's records live in the main checkout, so {subagent} runs there. Launch it without `isolation`."
@@ -2693,7 +2827,7 @@ def decide(data) -> str | None:
         if tool in ("Bash", "PowerShell", "Monitor"):
             return bash_reason(data)
         if tool in ("Read", "Grep", "Glob"):
-            return builder_reason(data)
+            return builder_reason(data) or defender_reason(data)
         if tool in ("Edit", "Write", "NotebookEdit"):
             return write_reason(data)
         if tool in ("Agent", "Task"):  # the tool has been called both

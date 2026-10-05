@@ -5,8 +5,8 @@
   "additionalProperties": false,
   "properties": {
     "lens": {
-      "description": "The one lens this prosecutor reviewed through.",
-      "enum": ["correctness", "tests", "security", "data", "boundaries", "docs", "requirements"]
+      "description": "The one lens this prosecutor reviewed through, or `canary` for the record of a calibration run's canary, which files one false finding to test the defenders.",
+      "enum": ["correctness", "tests", "security", "data", "boundaries", "docs", "requirements", "canary"]
     },
     "findings": {
       "description": "Every finding, each with its own evidence. Finding ids must be unique across the prosecutors of a round, so prefix them with the lens (for example security-1).",
@@ -21,7 +21,7 @@
             "minLength": 1
           },
           "lens": {
-            "enum": ["correctness", "tests", "security", "data", "boundaries", "docs", "requirements"]
+            "enum": ["correctness", "tests", "security", "data", "boundaries", "docs", "requirements", "canary"]
           },
           "file": {
             "type": "string",

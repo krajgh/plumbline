@@ -5,7 +5,7 @@ Standard library only (Python 3.11 or newer).
 
     validate-pipeline [FILE] [--project PATH]
     classify [--project PATH] [--base REF] [--intent ID] [--row ROW] [--out FILE]
-    plan [--project PATH] [--base REF] [--run-id ID] [--intent ID [--spec FILE] [--request-file FILE]] [--row ROW]
+    plan [--project PATH] [--base REF] [--run-id ID] [--intent ID [--spec FILE] [--request-file FILE] [--calibrate]] [--row ROW]
     check-record TYPE FILE
     render FILE [--type TYPE]
     init [--project PATH] [--graft]
@@ -78,6 +78,8 @@ RUNS_DIR = ".plumbline/runs"
 PASS_DIR = ".plumbline/pass"
 LEDGER_FILE = "ledger.jsonl"
 ACTIVE_FILE = "ACTIVE"  # .plumbline/runs/ACTIVE: the run id and a newline; written by `plan --intent`, read by the hooks
+CANARY_RECORD = "prosecutor-canary"  # the stem of the canary's findings record in a round directory, and of its key
+CANARY_KEY = "canary-key"
 REQUEST_FILE = "request.md"  # .plumbline/runs/<run-id>/request.md: the request the run began with, which `plan --intent --request-file` stores
 IGNORE_ENTRY = ".plumbline/"
 IGNORE_EQUIVALENTS = {".plumbline", ".plumbline/", "/.plumbline", "/.plumbline/"}
@@ -129,6 +131,7 @@ AGENT_RECORDS = {
     "prosecutor": "findings_record",
     "defender": "defense_record",
     "detective": "gaps_record",
+    "canary": "findings_record",
 }
 AGENT_ROLES = tuple(AGENT_RECORDS)  # the roles a [roles.<name>] policy may describe
 REVIEW_PART_TYPES = ("findings_record", "defense_record", "gaps_record")
@@ -1492,6 +1495,7 @@ def build_plan(pipeline: dict, record: dict, run_id: str, commands: dict | None 
         "run_id": run_id,
         "pipeline": pipeline["name"],
         "intent": intent,
+        "calibrate": record.get("calibrate") is True,
         "row": record["row"],
         "size": record["size"],
         "lines": record["lines"],
@@ -1652,6 +1656,8 @@ def _render_change_class(d) -> list[str]:
         f"Types: {', '.join(_s(t) for t in _list(d.get('types'))) or 'none'}."
     )
     out += ["", f"- Intent: `{_s(d.get('intent'))}`", f"- Base: `{_s(d.get('base'))}`, merge base `{_short(d.get('merge_base'))}`", f"- Head: `{_short(d.get('head'))}`"]
+    if d.get("calibrate") is True:
+        out.append("- A calibration run: each review round with defenders also has a canary")
     out += ["", "## Files", ""]
     files = _list(d.get("files"))
     if files:
@@ -1796,6 +1802,8 @@ def _render_review_record(d) -> list[str]:
         out += _section("Survivors for the planner", _get(routes, "planner"))
     if _get(d, "panel_needed"):
         out += _section("Findings that need the full panel", _get(d, "panel_needed"))
+    if isinstance(_get(d, "canary"), dict):
+        out += _section("Canary", [f"`{_s(_get(d['canary'], 'finding_id'))}`, a finding planted to be false: {canary_summary(d)}"])
     out += _section("Gaps", d.get("gaps"), _gap_text)
     return out
 
@@ -2111,6 +2119,7 @@ class Run:
     supplied: list[dict] = field(default_factory=list)  # the stages whose records the intent supplies instead of running them
     base: str = ""  # the intake record's base ref and merge base: the change is measured from there
     merge_base: str = ""
+    calibrate: bool = False  # a calibration run: every review round that has defenders also gets a canary
 
 
 def intake_stage_of(pipeline: dict) -> dict:
@@ -2143,7 +2152,9 @@ def load_run(project: Project, run_id: str) -> Run:
         raise PlumblineError(f"the run's intake record does not fit this repository's pipeline: {exc}") from None
     except (KeyError, TypeError):
         raise PlumblineError(f"the run's row {data['row']!r} is not a row of this repository's pipeline") from None
-    return Run(project.root, run_id, data["row"], stages, effective.lenses, effective.note, data["intent"], supplied, data["base"], data["merge_base"])
+    return Run(
+        project.root, run_id, data["row"], stages, effective.lenses, effective.note, data["intent"], supplied, data["base"], data["merge_base"], data.get("calibrate") is True
+    )
 
 
 # ------------------------------------------------------------------ gates
@@ -2597,6 +2608,8 @@ def _merge_provenance(root: Path, run_id: str, stage: dict, ledger: list[dict]) 
             continue
         data, problem = load_json_file(root / path)
         role = PART_ROLES.get(_part_type(data)) if problem is None else None
+        if role == "prosecutor" and Path(path).stem == CANARY_RECORD:
+            role = "canary"
         if role is None:
             problems.append(f"{path} is no findings, defense or gaps record")
             continue
@@ -3053,6 +3066,41 @@ def _valid_refutations(defenses: list[dict], file_of: dict[str, str], evidence: 
     return refuted_by
 
 
+CANARY_KEY_SHAPE = {
+    "type": "object", "required": ["finding_id", "why_false"], "additionalProperties": False, "properties": {"finding_id": _TEXT, "why_false": _TEXT},
+}
+
+
+def canary_of(directory: str, records: list[tuple[str, dict]], key: tuple[str, object] | None, owner: dict[str, str], defended: bool) -> tuple[dict | None, list[str]]:
+    """The canary's finding, and the problems with the canary's files, for a round of a calibration run that has defenders. The canary files
+    one finding in `prosecutor-canary.json` (lens canary), with an id no prosecutor used, and its key, `canary-key.json`, names that finding.
+    Defenders that answered a round with no canary are a problem too: a calibration run exists to measure them."""
+    if not records and key is None:
+        return None, ([f"this is a calibration run, and its defenders answered a round that has no canary: {directory}/{CANARY_RECORD}.json is missing"] if defended else [])
+    if not records:
+        return None, [f"{key[0]} has no {CANARY_RECORD}.json beside it"]
+    problems: list[str] = []
+    where, data = records[0]  # the record's name is fixed, so a round has one at most
+    finding = None
+    if data["lens"] != "canary":
+        problems.append(f"{where}: the canary's record carries lens '{data['lens']}', not 'canary'")
+    if len(data["findings"]) != 1:
+        problems.append(f"{where}: the canary files one finding (this record has {len(data['findings'])})")
+    else:
+        finding = data["findings"][0]
+        if finding["id"] in owner:
+            problems.append(f"{where}: the canary's finding id '{finding['id']}' is also used in {owner[finding['id']]}; ids must be unique across the round")
+    if key is None:
+        problems.append(f"{where}: the canary left no key ({directory}/{CANARY_KEY}.json)")
+    else:
+        errors = validate(key[1], CANARY_KEY_SHAPE)
+        if errors:
+            problems.append(f"{key[0]}: not a valid canary key: {errors[0]}")
+        elif finding is not None and key[1]["finding_id"] != finding["id"]:
+            problems.append(f"{key[0]}: the key names '{key[1]['finding_id']}', but the canary's finding is '{finding['id']}'")
+    return (None if problems else finding), problems
+
+
 @dataclass
 class MergeResult:
     record: dict | None
@@ -3110,11 +3158,16 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
     defense_records: list[tuple[str, dict]] = []
     screen_records: list[tuple[str, dict]] = []
     gaps_records: list[tuple[str, dict]] = []
+    canary_records: list[tuple[str, dict]] = []
+    canary_key: tuple[str, object] | None = None  # where the key is, and what it holds
     for path in sorted(round_dir.glob("*.json")):
         where = rel_path(root, path)
         data, problem = load_json_file(path)
         if problem:
             problems.append(f"{where}: {problem}")
+            continue
+        if path.stem == CANARY_KEY:
+            canary_key = (where, data)
             continue
         kind = _part_type(data)
         if kind is None:
@@ -3122,7 +3175,9 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
             errors = check_record(guess, data)
             problems.append(f"{where}: not a valid {guess}: {errors[0]}" + (f" (and {len(errors) - 1} more)" if len(errors) > 1 else ""))
             continue
-        if kind == "defense_record" and SCREEN_RECORD.fullmatch(path.stem):
+        if kind == "findings_record" and path.stem == CANARY_RECORD:
+            canary_records.append((where, data))
+        elif kind == "defense_record" and SCREEN_RECORD.fullmatch(path.stem):
             screen_records.append((where, data))
         else:
             {"findings_record": findings_records, "defense_record": defense_records, "gaps_record": gaps_records}[kind].append((where, data))
@@ -3130,8 +3185,13 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
     defenders = stage.get("defenders", 0)
     screening = stage.get("screen_defenders")  # how many screening defenders answer a round with no BLOCKING finding; None for a stage without screening
     screeners = screening or 0
+    if (canary_records or canary_key is not None) and not (run.calibrate and defenders):
+        why = "this stage has no defenders" if run.calibrate else f"run '{run_id}' is not a calibration run"
+        warnings.append(f"{why}, so the canary's records were ignored: the canary and its key count in a calibration run's rounds that have defenders")
+        canary_records, canary_key = [], None
     used = [
         *((where, data, "prosecutor") for where, data in findings_records),
+        *((where, data, "canary") for where, data in canary_records),
         *((where, data, "defender") for where, data in (defense_records if defenders else [])),
         *((where, data, "defender") for where, data in (screen_records if screeners else [])),
         *((where, data, "detective") for where, data in gaps_records),
@@ -3183,12 +3243,20 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
                     owner[finding["id"]] = where
                     findings.append(finding)
 
+    defended = bool(defense_records if defenders else []) or bool(screen_records if screeners else [])
+    canary_finding, canary_trouble = canary_of(rel_path(root, round_dir), canary_records, canary_key, owner, defended) if run.calibrate and defenders else (None, [])
+    problems += canary_trouble
+    canary_id = canary_finding["id"] if canary_finding else None
+    known = {**owner, **({canary_id: canary_records[0][0]} if canary_finding else {})}  # the defenders answer the canary's finding as they answer the others
     threshold = stage.get("survive_if_unrefuted_by", _majority(defenders)) if defenders else 0
     names = sorted({data["defender"] for _, data in defense_records}) if defenders else []
     screen_names = sorted({data["defender"] for _, data in screen_records}) if screeners else []
     seen_pairs: set[tuple[str, str]] = set()
-    defenses = _defense_entries(defense_records if defenders else [], owner, seen_pairs, problems)
-    screen_defenses = _defense_entries(screen_records if screeners else [], owner, seen_pairs, problems)
+    defenses = _defense_entries(defense_records if defenders else [], known, seen_pairs, problems)
+    screen_defenses = _defense_entries(screen_records if screeners else [], known, seen_pairs, problems)
+    canary_answers = [d for d in [*defenses, *screen_defenses] if d["finding_id"] == canary_id]  # kept out of everything that counts: only the canary's own field has them
+    defenses = [d for d in defenses if d["finding_id"] != canary_id]
+    screen_defenses = [d for d in screen_defenses if d["finding_id"] != canary_id]
     if defenders and len(names) > defenders:
         problems.append(f"{len(names)} defenders reported ({', '.join(names)}) but the stage has {defenders}")
     if screeners and len(screen_names) > screeners:
@@ -3236,6 +3304,13 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
     for fid in survivors:
         routes[route_of(project.pipeline, by_id[fid])].append(fid)
     answers = sorted([*defenses, *screen_defenses], key=lambda d: (position[d["finding_id"]], d["defender"]))
+    canary = None
+    if canary_finding is not None:
+        refuted = _valid_refutations(canary_answers, {canary_id: canary_finding["file"]}, evidence, warnings)
+        canary = {
+            "finding_id": canary_id, "refuted_by": sorted(refuted.get(canary_id, ())),
+            "conceded_by": sorted({d["defender"] for d in canary_answers if d["verdict"] == "conceded"}),
+        }
     record = {
         "target": stage["target"],
         "round": round_no,
@@ -3247,6 +3322,7 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
         "blockers_surviving": sum(1 for fid in survivors if severity[fid] == "BLOCKING"),
         "routes": routes,
         "panel_needed": [f["id"] for f in findings if f["id"] in needed],
+        **({"canary": canary} if canary is not None else {}),
         "diff_sha256": current,
     }
     errors = check_record("review_record", record)
@@ -3543,6 +3619,7 @@ def make_pass_record(project: Project, run_id: str) -> tuple[dict | None, list[s
     entries: list[dict] = []
     open_findings: list[dict] = []
     gaps: list[dict] = []
+    canaries: list[str] = []
     supplied_ids = {s["id"] for s in run.supplied}
     for stage in [*run.supplied, *run.stages]:
         if stage is reduce_stage:
@@ -3558,6 +3635,8 @@ def make_pass_record(project: Project, run_id: str) -> tuple[dict | None, list[s
             found, missing = open_items(stage["id"], outcome.data)
             open_findings += found
             gaps += missing
+            if canary_summary(outcome.data):
+                canaries.append(f"calibration run: the canary of {stage['id']}, round {outcome.data['round']}: {canary_summary(outcome.data)}")
     reduce_id = reduce_stage["id"] if reduce_stage else "reduce"
     reduce_path = run_dir(root, run_id) / f"{reduce_id}.json"
     if reduce_stage is not None and reduce_stage.get("gate") == "all_gates_passed" and not problems:
@@ -3576,6 +3655,7 @@ def make_pass_record(project: Project, run_id: str) -> tuple[dict | None, list[s
         notes.insert(0, run.note)
     if run.supplied:
         notes.append(f"intent {run.intent}: the record of {', '.join(sorted(supplied_ids))} was supplied, not written by an agent")
+    notes += canaries  # the review files do not outlast the run: what the canary measured does
     record = {
         "commit": head, "run_id": run_id, "row": run.row, "stages": entries, "tokens": tokens, "verdict": "pass", "notes": notes,
         "open_findings": open_findings, "gaps": gaps,
@@ -3797,7 +3877,7 @@ def start_run(
     by_id = {s["id"]: s for s in project.pipeline["stage"]}
     run = Run(  # the run as it will be, judged before its intake record exists
         root, run_id, record["row"], [effective_stage(by_id[sid], effective) for sid in effective.stages], effective.lenses, effective.note,
-        record["intent"], [effective_stage(by_id[sid], effective) for sid in effective.supplied], record["base"], record["merge_base"],
+        record["intent"], [effective_stage(by_id[sid], effective) for sid in effective.supplied], record["base"], record["merge_base"], record.get("calibrate") is True,
     )
     for stage in run.supplied:
         path = run_dir(root, run_id) / f"{stage['id']}.json"
@@ -3826,10 +3906,14 @@ def cmd_plan(args) -> int:
         raise PlumblineError("--spec goes with --intent (the intent that supplies the spec)")
     if args.request_file and not starting:
         raise PlumblineError("--request-file goes with --intent (the run that stores the request)")
+    if args.calibrate and not starting:
+        raise PlumblineError("--calibrate goes with --intent (the run it marks as a calibration run)")
     request = read_request(args.request_file) if args.request_file else None
     intent = args.intent or DEFAULT_INTENT
     run_id = check_run_id(args.run_id if args.run_id is not None else default_run_id(project.root))
     record = classify(project.root, project.pipeline, args.base, intent, args.row)
+    if args.calibrate:
+        record["calibrate"] = True  # only a calibration run's intake record has the key
     effective = effective_row(project.pipeline, record["row"], intent)
     plan = build_plan(project.pipeline, record, run_id, project.commands, project.graft_enabled, request is not None)
     if starting:
@@ -3944,6 +4028,24 @@ def raise_lines(record: dict, claimed_by: dict[str, list[str]]) -> list[str]:
     ]
 
 
+def canary_summary(record: dict) -> str | None:
+    """How the defenders answered the canary of a round, in a few words: None for a round without one. A defender that refuted it
+    with no quote the change or its file holds is in neither list, and merge-review warned about it."""
+    canary = record.get("canary")
+    if canary is None:
+        return None
+    refuted, conceded = canary["refuted_by"], canary["conceded_by"]
+    answered = len(refuted) + len(conceded)
+    if not answered:
+        return "no defender answered it"
+    text = f"refuted by {len(refuted)} of {answered} {'defender' if answered == 1 else 'defenders'}"
+    if refuted:
+        text += f" ({', '.join(refuted)})"
+    if conceded:
+        text += f"; conceded by {', '.join(conceded)}"
+    return text
+
+
 def panel_lines(record: dict) -> list[str]:
     """The line that says which findings need the full panel in this round, when any does."""
     ids = record.get("panel_needed", [])
@@ -3979,6 +4081,8 @@ def cmd_merge_review(args) -> int:
         print(line)
     for line in route_lines(record):
         print(line)
+    if canary_summary(record):
+        print(f"canary: {canary_summary(record)}")
     if result.unverified:
         print(f"evidence found in neither the change nor its file (the findings stay, marked evidence_unverified): {', '.join(result.unverified)}")
     return 0
@@ -4335,6 +4439,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--intent", metavar="ID", help="start the run with this intent: writes its intake record and copies the record the intent supplies")
     p.add_argument("--spec", metavar="FILE", help="the spec that an intent which supplies one (spec-supplied, fix) takes as the plan record")
     p.add_argument("--request-file", metavar="FILE", help="the request, as text: stored in the run as request.md, with its hash in the ledger; the spec review compares the spec with it")
+    p.add_argument("--calibrate", action="store_true", help="mark the run as a calibration run: each review round with defenders also gets a canary, a planted false finding, to see whether they can refute one")
     p.add_argument("--row", metavar="ROW", help="declare the row (for example code.M) instead of measuring it: needed when nothing has changed yet")
     p.set_defaults(run=cmd_plan)
 

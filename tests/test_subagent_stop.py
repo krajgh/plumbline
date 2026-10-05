@@ -21,7 +21,7 @@ PLAN_LINE = "Planned it.\nRECORD: .plumbline/runs/r1/plan.json"
 # the record each plumbline agent must end with, written out here as the oracle
 RECORD_OF = {
     "planner": "spec", "test-writer": "tests_record", "builder": "build_note", "verifier": "verify_record",
-    "prosecutor": "findings_record", "defender": "defense_record", "detective": "gaps_record",
+    "prosecutor": "findings_record", "defender": "defense_record", "detective": "gaps_record", "canary": "findings_record",
 }
 
 

@@ -15,6 +15,7 @@ SPEC_ROLES = {
     "prosecutor": {"writes": ["record"], "commands": ["git-read", "search", "graft"]},
     "defender": {"writes": ["record"], "commands": ["git-read", "search"]},
     "detective": {"writes": ["record"], "commands": ["git-read", "search", "graft"]},
+    "canary": {"writes": ["record"], "commands": ["git-read", "search"]},
 }
 
 

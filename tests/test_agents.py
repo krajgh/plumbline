@@ -1,4 +1,4 @@
-"""The seven agents: pinned models, tools and turn limits, and prompts that state what to do."""
+"""The eight agents: pinned models, tools and turn limits, and prompts that state what to do."""
 import re
 
 import pytest
@@ -18,6 +18,7 @@ EXPECTED = {
     "prosecutor": ("sonnet", ["Read", "Grep", "Glob", "Bash", "Write"]),
     "defender": ("haiku", ["Read", "Grep", "Glob", "Bash", "Write"]),
     "detective": ("sonnet", ["Read", "Grep", "Glob", "Bash", "Write"]),
+    "canary": ("sonnet", ["Read", "Grep", "Glob", "Bash", "Write"]),
 }
 NAMES = sorted(EXPECTED)
 
@@ -50,8 +51,8 @@ def test_the_model_and_the_tools_are_pinned_as_the_spec_says(name):
     assert [t.strip() for t in fields["tools"].split(",")] == tools
 
 
-def test_planner_test_writer_builder_prosecutor_and_detective_run_on_sonnet_and_verifier_and_defender_on_haiku():
-    assert {n for n in NAMES if agent(n)[0]["model"] == "sonnet"} == {"planner", "test-writer", "builder", "prosecutor", "detective"}
+def test_planner_test_writer_builder_prosecutor_detective_and_canary_run_on_sonnet_and_verifier_and_defender_on_haiku():
+    assert {n for n in NAMES if agent(n)[0]["model"] == "sonnet"} == {"planner", "test-writer", "builder", "prosecutor", "detective", "canary"}
     assert {n for n in NAMES if agent(n)[0]["model"] == "haiku"} == {"verifier", "defender"}
 
 
@@ -115,7 +116,7 @@ def test_the_agents_that_make_the_change_name_ponytails_ladder(name):
     assert "ponytail's ladder" in agent(name)[1]
 
 
-@pytest.mark.parametrize("name", ["verifier", "prosecutor", "defender", "detective"])
+@pytest.mark.parametrize("name", ["verifier", "prosecutor", "defender", "detective", "canary"])
 def test_the_agents_that_only_check_do_not_carry_ponytails_ladder(name):
     assert "ponytail" not in agent(name)[1]
 
@@ -201,7 +202,7 @@ def test_the_test_writer_creates_its_files_with_write_or_edit_and_its_record_wit
     assert "Write the record with the Write tool." in body
 
 
-@pytest.mark.parametrize("name", ["prosecutor", "defender", "detective"])
+@pytest.mark.parametrize("name", ["prosecutor", "defender", "detective", "canary"])
 def test_a_review_agent_is_told_the_round_directory_is_there_already_or_write_makes_it(name):
     body = agent(name)[1]
     assert "the round directory is there already, or Write makes it" in body
@@ -238,7 +239,7 @@ def test_the_planner_writes_at_size_l_a_split_proposal():
     assert "split_proposal" in agent("planner")[1]
 
 
-@pytest.mark.parametrize("name", ["prosecutor", "defender", "detective"])
+@pytest.mark.parametrize("name", ["prosecutor", "defender", "detective", "canary"])
 def test_a_review_agent_copies_the_hash_of_the_change_from_its_brief_into_its_record(name):  # C-09
     body = agent(name)[1]
     assert "diff_sha256" in pl.load_schema(pl.AGENT_RECORDS[name])["required"]

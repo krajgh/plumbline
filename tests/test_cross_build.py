@@ -24,7 +24,7 @@ from rundata import (
 )
 from samples import sample
 
-ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")
+ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary")
 ACTIVE = ".plumbline/runs/ACTIVE"
 
 

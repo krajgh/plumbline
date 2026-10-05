@@ -180,6 +180,10 @@ commands = ["git-read", "search"]
 writes = ["record"]
 commands = ["git-read", "search", "graft"]
 
+[roles.canary]                  # runs only in a calibration run, beside the prosecutors: writes prosecutor-canary.json and canary-key.json in the round directory, and nothing else
+writes = ["record"]
+commands = ["git-read", "search"]
+
 # Intents: why a change is made, next to its type and size. The row selects stages; the intent then
 # removes stages (skip), or supplies the record a removed stage would have written (supplies), which is
 # validated against that stage's schema at intake. `gates` replaces a stage's gate, `lenses` the lenses

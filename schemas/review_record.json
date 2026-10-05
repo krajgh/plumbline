@@ -186,6 +186,32 @@
         }
       }
     },
+    "canary": {
+      "description": "Present only in a round of a calibration run that has defenders: how the defenders answered the canary, the false finding planted to test them. The canary is in none of findings, survivors, routes, blockers_surviving or the open findings. A defender in `refuted_by` refuted it with a quote the change or its file holds; one in `conceded_by` agreed with it, and a defender that conceded a finding that is false is a rubber stamp.",
+      "type": "object",
+      "required": ["finding_id", "refuted_by", "conceded_by"],
+      "additionalProperties": false,
+      "properties": {
+        "finding_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "refuted_by": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "conceded_by": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
     "panel_needed": {
       "description": "The findings that need the full defender panel in this round: those a screening defender claims are BLOCKING (a claim of BLOCKING never raises a finding by itself), and the BLOCKING findings that only a screening defender answered. The gate no_surviving_blockers fails while any is listed. Once the panel's records cover a finding, the panel's rule decides it and it leaves the list. Absent from a record written before 0.5.0.",
       "type": "array",

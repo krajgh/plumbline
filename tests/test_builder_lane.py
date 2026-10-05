@@ -17,8 +17,8 @@ from helpers import DEFAULT_TOML, commit_all, git, write
 from hookdata import activate_run, bash_payload, start_run, tool_payload
 from rundata import adopt, build_note_record, intake_record, put, put_part, spec_record, verify_record, written_tests_record
 
-ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")
-REVIEW_ROLES = ("prosecutor", "defender", "detective")
+ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary")
+REVIEW_ROLES = ("prosecutor", "defender", "detective", "canary")
 BUILDER = "plumbline:builder"
 
 
@@ -515,7 +515,7 @@ def test_a_cwd_that_is_a_repository_that_has_not_adopted_plumbline_is_left_alone
 
 # ------------------------------------------------- C-22: the review agents write their own files, in the current round
 
-FILES = {"prosecutor": "prosecutor-security.json", "defender": "defender-2.json", "detective": "detective.json"}
+FILES = {"prosecutor": "prosecutor-security.json", "defender": "defender-2.json", "detective": "detective.json", "canary": "prosecutor-canary.json"}
 
 
 def round_path(stage, n, name, run="r1"):
@@ -543,14 +543,15 @@ def test_a_review_agent_writes_nobody_elses_file(started, role, other):
     "role,names",
     [
         ("prosecutor", ["prosecutor-security.json", "prosecutor-tests.json", "prosecutor-a.b_c-1.json"]),
-        ("defender", ["defender-1.json", "defender-3.json", "defender-x.json"]),
+        ("defender", ["defender-1.json", "defender-3.json", "defender-x.json", "screen-1.json", "screen-k.json"]),
         ("detective", ["detective.json"]),
+        ("canary", ["prosecutor-canary.json", "canary-key.json"]),
     ],
 )
 def test_each_review_role_has_the_file_names_of_its_role_only(started, role, names):
     for name in names:
         assert writes(started, role, round_path("review", 1, name)) is None, name
-    for name in ("prosecutor.json", "defender.json", "detective-1.json", "detective-x.json", "notes.json", "x.txt", "prosecutor-x.txt", "prosecutor-.json"):
+    for name in ("prosecutor.json", "defender.json", "detective-1.json", "detective-x.json", "notes.json", "x.txt", "prosecutor-x.txt", "prosecutor-.json", "screen.json", "canary.json", "canary-key.txt"):
         if name == "prosecutor-.json" and role == "prosecutor":
             continue
         assert writes(started, role, round_path("review", 1, name)), (role, name)

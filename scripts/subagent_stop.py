@@ -8,8 +8,8 @@ validates against the record type of that agent (a planner writes a spec, a
 prosecutor a findings_record, and so on) and that sits where that agent's records
 belong: in the run in progress (the one .plumbline/runs/ACTIVE names, else the
 newest run), at the path of a stage of the run's row that the agent's role serves
-(`<stage>.json`), or, for the three review roles, at
-`<review stage>/round-<n>/<name>.json`.
+(`<stage>.json`), or, for the review roles, at
+`<review stage>/round-<n>/<name>.json` (the canary's record, `prosecutor-canary.json`, is one of them).
 
 The report is the agent's final message. When that message has no RECORD line, the
 hook looks for the line in the report the agent handed back through SubagentHandback:
@@ -135,7 +135,7 @@ def placement_problems(pl, root: Path, run_id: str | None, parts: tuple[str, ...
         run = pl.load_run(project, run_id)
     except pl.PlumblineError as exc:
         return [], [f"the place of the record in the run was not checked: {exc}"], None
-    review_role = role in ("prosecutor", "defender", "detective")
+    review_role = role in ("prosecutor", "defender", "detective", "canary")
     stage_id = parts[1][: -len(".json")] if len(parts) == 2 and parts[1].endswith(".json") else parts[1] if len(parts) > 2 else None
     mine = [s for s in run.stages if (s.get("kind", "agent") == "review") == review_role and (review_role or s.get("role") == role)]
     if stage_id not in [s["id"] for s in mine]:

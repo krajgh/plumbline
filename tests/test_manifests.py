@@ -269,9 +269,9 @@ def test_the_run_skill_launches_every_plumbline_agent_without_a_model_because_ea
     body = run_skill()
     paragraph = between(body, "**Launch every plumbline agent", "**Every brief**")
     assert "without `model`" in paragraph and "each is pinned in its definition" in paragraph and "Leave `isolation` out as well" in paragraph
-    assert "Sonnet for the planner, test-writer, builder, prosecutor and detective; Haiku for the verifier and defender" in paragraph
+    assert "Sonnet for the planner, test-writer, builder, prosecutor, detective and canary; Haiku for the verifier and defender" in paragraph
     pins = {name: frontmatter(REPO / "agents" / f"{name}.md")[0]["model"] for name in pl.AGENT_ROLES}  # what the agent files say, which is what the paragraph repeats
-    assert sorted(n for n, model in pins.items() if model == "sonnet") == sorted(["planner", "test-writer", "builder", "prosecutor", "detective"])
+    assert sorted(n for n, model in pins.items() if model == "sonnet") == sorted(["planner", "test-writer", "builder", "prosecutor", "detective", "canary"])
     assert sorted(n for n, model in pins.items() if model == "haiku") == ["defender", "verifier"]
     assert "(without `model`: the defender is pinned to Haiku)" in between(body, "2. **Defenders.**", "3. `PLUMBLINE merge-review")
     assert "model:" not in body  # no launch in the skill names a model
@@ -425,11 +425,11 @@ def test_the_layout_matches_the_spec():
         "hooks/hooks.json", "scripts/plumbline.py", "scripts/session_start.py", "scripts/subagent_stop.py", "scripts/pre_tool_use.py",
         "scripts/pre_tool_use.sh", "scripts/subagent_stop.sh", "pipeline/default.toml", "pipeline/templates/refactor.json",
         "skills/subagent-discipline/SKILL.md", "skills/init/SKILL.md", "skills/run/SKILL.md", "skills/override/SKILL.md", "skills/status/SKILL.md",
-        *(f"agents/{name}.md" for name in ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")),
+        *(f"agents/{name}.md" for name in ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary")),
     ):
         assert (REPO / path).is_file(), path
-    assert sorted(p.name for p in (REPO / "agents").iterdir()) == sorted(  # the seven agents, and nothing else
-        f"{name}.md" for name in ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")
+    assert sorted(p.name for p in (REPO / "agents").iterdir()) == sorted(  # the eight agents, and nothing else
+        f"{name}.md" for name in ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary")
     )
     assert sorted(p.name for p in (REPO / "schemas").glob("*.json")) == sorted(
         f"{n}.json" for n in (

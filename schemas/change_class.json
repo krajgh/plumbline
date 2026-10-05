@@ -83,6 +83,10 @@
       "type": "string",
       "pattern": "^[a-z][a-z0-9_-]*$"
     },
+    "calibrate": {
+      "description": "True for a calibration run (`plan --intent --calibrate`): every review round that has defenders also gets a canary, a planted false finding, to find out whether the defenders can refute a finding at all. Present only in the intake record of a calibration run.",
+      "type": "boolean"
+    },
     "symlinks": {
       "description": "Paths of the symbolic links among the files.",
       "type": "array",

@@ -13,7 +13,7 @@ from hookdata import bash_payload, denial
 from rundata import adopt
 from test_manifests import frontmatter
 
-ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective")
+ROLES = ("planner", "test-writer", "builder", "verifier", "prosecutor", "defender", "detective", "canary")
 REASON = "The pipeline cannot run offline; a one-line typo fix, reviewed by hand."
 DENIAL = (
     "plumbline: `plumbline.py override` is the builder's command, and the builder types it: /plumbline:override followed by the reason. "

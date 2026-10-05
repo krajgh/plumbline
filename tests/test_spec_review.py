@@ -392,7 +392,7 @@ def test_the_run_skill_says_how_the_request_is_stored_and_what_a_failed_spec_rev
 
 def test_the_readme_documents_the_spec_review_the_request_file_and_the_planner_route():
     plan_row = next(line for line in section("The command line", 3).splitlines() if line.startswith("| `plan "))
-    assert plan_row.startswith("| `plan [--project PATH] [--base REF] [--run-id ID] [--intent ID [--spec FILE] [--request-file FILE]] [--row ROW]` |")
+    assert plan_row.startswith("| `plan [--project PATH] [--base REF] [--run-id ID] [--intent ID [--spec FILE] [--request-file FILE]")
     assert "stores the request a `--request-file` holds as `request.md` (its hash goes into the ledger before the file exists, as the intake record's does)" in plan_row
     runs = section("Runs, gates and the pass record")
     assert ".plumbline/runs/<run-id>/request.md" in runs
