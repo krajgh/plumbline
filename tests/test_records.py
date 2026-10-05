@@ -56,6 +56,9 @@ def _objects(schema, path="$"):
 # is written next to it: a record from an earlier version has to stay valid, because the push gate reads a run's records again.
 OPTIONAL = {
     ("pass_record", "$"): {"open_findings", "gaps"},  # 0.5.0: a pass record from 0.4.2 has neither
+    ("defense_record", "$.defenses[]"): {"severity_claim"},  # 0.5.0: only a defender that concedes a finding worse than filed writes one
+    ("review_record", "$.defenses[]"): {"severity_claim"},
+    ("review_record", "$.findings[]"): {"severity_raised_from"},  # only on a finding that merge-review raised
 }
 
 
@@ -92,9 +95,10 @@ def test_the_per_agent_review_records_use_the_review_records_item_shapes():
     # each is a piece of a review_record; the shapes are written out three times
     # because the schema subset has no references, so this is what keeps them equal
     review = pl.load_schema("review_record")["properties"]
-    merged = json.loads(json.dumps(review["findings"]["items"]))  # the merged record's findings carry one more field: whether their evidence was found
+    merged = json.loads(json.dumps(review["findings"]["items"]))  # the merged record's findings carry one more field, whether their evidence was found, and an optional one
     merged["required"].remove("evidence_unverified")
     del merged["properties"]["evidence_unverified"]
+    del merged["properties"]["severity_raised_from"]
     assert pl.load_schema("findings_record")["properties"]["findings"]["items"] == merged
     assert pl.load_schema("defense_record")["properties"]["defenses"]["items"] == review["defenses"]["items"]
     assert pl.load_schema("gaps_record")["properties"]["gaps"]["items"] == review["gaps"]["items"]

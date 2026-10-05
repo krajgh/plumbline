@@ -399,9 +399,23 @@ def load_schema(name: str) -> dict:
     return schema
 
 
+def _claims_on_concessions(data) -> list[str]:
+    """A defender that refutes a finding says its claim is wrong, so only a conceded verdict carries a `severity_claim`."""
+    return [
+        f"{_child(f'$.defenses[{index}]', 'severity_claim')}: only a conceded verdict carries a severity claim (this one is {entry['verdict']})"
+        for index, entry in enumerate(data["defenses"])
+        if "severity_claim" in entry and entry["verdict"] != "conceded"
+    ]
+
+
+RECORD_RULES = {"defense_record": _claims_on_concessions, "review_record": _claims_on_concessions}  # what a schema of this subset cannot say
+
+
 def check_record(type_name: str, data) -> list[str]:
-    """Errors (each with its JSON path) of `data` as a record of `type_name`."""
-    return validate(data, load_schema(type_name))
+    """Errors (each with its JSON path) of `data` as a record of `type_name`: what its schema says, and, for a record that is valid
+    by its schema, the rules the schema cannot say (RECORD_RULES)."""
+    errors = validate(data, load_schema(type_name))
+    return errors or RECORD_RULES.get(type_name, lambda _data: [])(data)
 
 
 # ---------------------------------------------------------------- pipeline
@@ -1726,11 +1740,14 @@ def _finding_lines(f) -> list[str]:
         lines.append(f"  - Outside the code: {_s(_get(f, 'outside_code'))}")
     if _get(f, "evidence_unverified") is True:
         lines.append("  - The evidence was found in neither the change nor its file (unverified).")
+    if _get(f, "severity_raised_from") is not None:
+        lines.append(f"  - Severity raised from {_s(_get(f, 'severity_raised_from'))} by the defenders' claims.")
     return lines
 
 
 def _defense_text(x) -> str:
-    return f"{_s(_get(x, 'finding_id'))}, {_s(_get(x, 'defender'))}: {_s(_get(x, 'verdict'))}. {_s(_get(x, 'reason'))}"
+    claim = f" (claims {_s(_get(x, 'severity_claim'))})" if _get(x, "severity_claim") is not None else ""
+    return f"{_s(_get(x, 'finding_id'))}, {_s(_get(x, 'defender'))}: {_s(_get(x, 'verdict'))}{claim}. {_s(_get(x, 'reason'))}"
 
 
 def _gap_text(g) -> str:
@@ -2886,6 +2903,33 @@ def route_of(pipeline: dict, finding: dict) -> str:
     return "test-writer" if finding["lens"] == TESTS_LENS or file_type(pipeline, os.path.normpath(finding["file"]).replace(os.sep, "/")) == TESTS_TYPE else "builder"
 
 
+SEVERITIES = ("MINOR", "MAJOR", "BLOCKING")  # lowest first
+
+
+def severity_claims(findings: list[dict], survivors: list[str], defenses: list[dict], threshold: int, warnings: list[str]) -> dict[str, str]:
+    """The surviving findings whose severity the defenders raise, as {finding id: the new severity}. A defender that concedes a finding
+    may claim a severity for it (`severity_claim`). A claim equal to or below the severity the prosecutor filed is ignored, with a warning.
+    When at least `threshold` defenders claim a higher severity, the finding is raised to the highest level that many of them claimed:
+    the threshold-th highest claim, because a claim of BLOCKING asks for MAJOR as well."""
+    filed = {finding["id"]: finding["severity"] for finding in findings}
+    claims: dict[str, list[str]] = {}
+    for defense in defenses:
+        claim = defense.get("severity_claim")
+        if claim is None:
+            continue
+        fid = defense["finding_id"]
+        if SEVERITIES.index(claim) <= SEVERITIES.index(filed[fid]):
+            warnings.append(f"defender '{defense['defender']}' claims {claim} for '{fid}', which is not above the {filed[fid]} the prosecutor filed, so the claim is ignored")
+        else:
+            claims.setdefault(fid, []).append(claim)
+    raised = {}
+    for fid in survivors:
+        higher = sorted(claims.get(fid, []), key=SEVERITIES.index, reverse=True)
+        if threshold and len(higher) >= threshold:
+            raised[fid] = higher[threshold - 1]
+    return raised
+
+
 @dataclass
 class MergeResult:
     record: dict | None
@@ -2904,7 +2948,8 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
     not refute it (the majority when the stage sets none). A defender refutes a finding by a verdict of `refuted` with a
     quote that occurs in the change's diff or in the finding's file; a defender that is silent on a finding, concedes it,
     or refutes without such a quote did not refute it. A finding whose own evidence is in neither place stays, and is
-    marked evidence_unverified. A stage without defenders lets every finding survive."""
+    marked evidence_unverified. A surviving finding that enough defenders claim a higher severity for is raised to it (see
+    severity_claims), and marked severity_raised_from. A stage without defenders lets every finding survive."""
     root = project.root
     stage = next((s for s in project.pipeline["stage"] if s["id"] == stage_id), None)
     if stage is None:
@@ -3044,10 +3089,14 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
         else:
             refuted_by.setdefault(fid, set()).add(who)
     survivors = [f["id"] for f in findings if defenders - len(refuted_by.get(f["id"], ())) >= threshold]
-    severity = {f["id"]: f["severity"] for f in findings}
+    raised = severity_claims(findings, survivors, defenses, threshold, warnings)
+    severity = {f["id"]: raised.get(f["id"], f["severity"]) for f in findings}
     unverified = [f for f in findings if not evidence.holds(f["evidence"], f["file"])]
     unverified_ids = {f["id"] for f in unverified}
-    marked = [{**f, "evidence_unverified": f["id"] in unverified_ids} for f in findings]
+    marked = [
+        {**f, "severity": severity[f["id"]], "evidence_unverified": f["id"] in unverified_ids, **({"severity_raised_from": f["severity"]} if f["id"] in raised else {})}
+        for f in findings
+    ]
     by_id = {f["id"]: f for f in findings}
     routes: dict[str, list[str]] = {"builder": [], "test-writer": []}
     for fid in survivors:
@@ -3722,6 +3771,20 @@ def route_lines(record: dict) -> list[str]:
     return lines
 
 
+def raise_lines(record: dict) -> list[str]:
+    """One line for each finding whose severity `merge-review` raised, naming the defenders whose claims did it."""
+    lines = []
+    for f in record["findings"]:
+        if "severity_raised_from" not in f:
+            continue
+        asked = [
+            d["defender"] for d in record["defenses"]
+            if d["finding_id"] == f["id"] and "severity_claim" in d and SEVERITIES.index(d["severity_claim"]) >= SEVERITIES.index(f["severity"])
+        ]
+        lines.append(f"severity raised: {f['id']} from {f['severity_raised_from']} to {f['severity']} (claimed by {', '.join(asked)})")
+    return lines
+
+
 def cmd_merge_review(args) -> int:
     project = _ready_project(args.project)
     result = merge_round(project, args.run_id, args.stage, args.round)
@@ -3743,6 +3806,8 @@ def cmd_merge_review(args) -> int:
         f"wrote {rel_path(project.root, path)}: round {record['round']}, {_plural(len(record['findings']), 'finding')}, "
         f"{len(record['survivors'])} surviving ({record['blockers_surviving']} blocking), {_plural(len(record['gaps']), 'gap')}"
     )
+    for line in raise_lines(record):
+        print(line)
     for line in route_lines(record):
         print(line)
     if result.unverified:

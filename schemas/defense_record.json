@@ -35,6 +35,10 @@
           "reason": {
             "type": "string",
             "minLength": 1
+          },
+          "severity_claim": {
+            "description": "Only on a `conceded` verdict, and only when the finding is worse than its severity says (for example, it breaks a stated acceptance criterion, which is BLOCKING under the rubric): the severity it deserves. `reason` then names the rubric clause. When at least `survive_if_unrefuted_by` defenders claim a higher severity than the finding's, `merge-review` raises the finding to the highest level that many of them claimed. A claim equal to or below the filed severity is ignored.",
+            "enum": ["BLOCKING", "MAJOR", "MINOR"]
           }
         }
       }

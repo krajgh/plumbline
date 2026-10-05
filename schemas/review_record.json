@@ -75,6 +75,10 @@
           "evidence_unverified": {
             "description": "True when `merge-review` did not find the finding's evidence in the change's diff or in the current content of the finding's file. Such a finding stays; the flag says its quote could not be checked.",
             "type": "boolean"
+          },
+          "severity_raised_from": {
+            "description": "Present only on a finding whose severity `merge-review` raised, because enough defenders claimed a higher one (`severity_claim` on a conceded verdict): the severity the prosecutor filed. `severity` is the raised one.",
+            "enum": ["MINOR", "MAJOR"]
           }
         }
       }
@@ -105,6 +109,10 @@
           "reason": {
             "type": "string",
             "minLength": 1
+          },
+          "severity_claim": {
+            "description": "Only on a `conceded` verdict, and only when the finding is worse than its severity says (for example, it breaks a stated acceptance criterion, which is BLOCKING under the rubric): the severity it deserves. `reason` then names the rubric clause. When at least `survive_if_unrefuted_by` defenders claim a higher severity than the finding's, `merge-review` raises the finding to the highest level that many of them claimed. A claim equal to or below the filed severity is ignored.",
+            "enum": ["BLOCKING", "MAJOR", "MINOR"]
           }
         }
       }
