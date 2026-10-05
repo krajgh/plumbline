@@ -363,7 +363,7 @@ def test_the_exit_statuses_of_gate_and_of_a_pytest_run_are_the_codes_the_readme_
 
 
 @pytest.fixture
-def flow(repo, run_cli, run_stop, tmp_path):
+def flow(repo, run_cli, run_stop, run_pre, tmp_path):
     """A refactor run through the real CLI and the real SubagentStop hook, from `plan --intent` to `pass`: every kind of ledger entry."""
     adopt_base(repo, commands={"test": CONTROLLED})
     write(repo / "src" / "retry.py", "def retry(url):\n    return url\n")
@@ -380,6 +380,10 @@ def flow(repo, run_cli, run_stop, tmp_path):
     assert stop.returncode == 0 and stop.stdout == "", stop.stdout
     write(run / "build.json", json.dumps(build_note_record()))
     stop = run_stop(stop_payload(repo, "plumbline:builder", "built\nRECORD: .plumbline/runs/r1/build.json", agent_id="b-1"), repo)
+    assert stop.returncode == 0 and stop.stdout == "", stop.stdout
+    resume = run_pre(tool_payload(repo, "SendMessage", {"to": "b-1", "summary": "again", "message": "check your record"}, agent_type="plumbline:orchestrator"), repo)  # the orchestrator sends the builder back
+    assert resume.returncode == 0 and resume.stdout == "", resume.stdout
+    stop = run_stop(stop_payload(repo, "plumbline:builder", "built again\nRECORD: .plumbline/runs/r1/build.json", agent_id="b-1"), repo)  # it leaves the record as it was, and the stop is entered all the same
     assert stop.returncode == 0 and stop.stdout == "", stop.stdout
     digest = json.loads(cli("check-diff", "--run", RUN).stdout)["diff_sha256"]
     write(run / "verify.json", json.dumps(verify_record(diff=digest)))
@@ -398,7 +402,7 @@ def flow(repo, run_cli, run_stop, tmp_path):
 def test_the_ledger_table_names_every_kind_of_entry_a_run_writes_and_only_fields_the_entries_hold(flow):
     text = section("Runs, gates and the pass record").split("**The ledger**", 1)[1].split("**Provenance.**", 1)[0]
     table = {r[0].strip("`"): r for r in rows(text)}
-    assert set(table) == {entry["kind"] for entry in flow} == {"intake", "request", "supplied", "agent", "leg", "merge", "run", "gate", "pass"}
+    assert set(table) == {entry["kind"] for entry in flow} == {"intake", "request", "supplied", "agent", "leg", "resume", "merge", "run", "gate", "pass"}
     nested = {key for entry in flow if entry["kind"] == "run" for command in entry["commands"] for key in command}
     assert nested == {"name", "cmd", "exit_code", "seconds"}  # `timed_out` and `junit` are written only where they apply (tested with the commands table)
     for kind, (_kind, written_by, holds) in table.items():
@@ -407,6 +411,8 @@ def test_the_ledger_table_names_every_kind_of_entry_a_run_writes_and_only_fields
             assert token in seen or (kind == "run" and (token in nested or token in ("timed_out", "junit"))), (kind, token)
         assert "at" in seen  # every entry says when it was written
     assert "SubagentStop" in table["agent"][1] and "SubagentStop" in table["leg"][1] and "merge-review" in table["merge"][1] and "`pass`" in table["pass"][1]
+    assert "PreToolUse" in table["resume"][1] and "SendMessage" in table["resume"][1]
+    assert [e["agent_id"] for e in flow if e["kind"] == "agent" and e["agent_id"] == "b-1"] == ["b-1", "b-1"]  # the builder's second stop is entered: a resume entry came between
     assert "plan --intent" in table["intake"][1] and "plan --intent" in table["supplied"][1] and "`gate`" in table["run"][1]
     assert {e["stage"] for e in flow if e["kind"] == "run"} == {"verify"}  # `gate` runs commands for a verify or tests stage
     assert {e["stage"] for e in flow if e["kind"] == "gate"} >= {"plan", "verify", "review"}  # the supplied plan's gate is entered by `plan --intent`

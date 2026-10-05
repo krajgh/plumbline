@@ -58,7 +58,7 @@ def test_the_orchestrator_writes_nothing_and_runs_only_plumbline_and_git_summari
     text = DEFAULT_TOML.read_text(encoding="utf-8")
     comment = text[text.index("# Role policies"):text.index("[roles.planner]")]
     assert "plumbline-run is the commands of `plumbline.py` that run a run's stages: check-diff, gate, merge-review, status, tokens," in comment
-    assert "check-record, open, and `plan --run RUN --json` (the plan of a run that has begun), and not `plan --intent`, `pass`, `override` or `init`" in comment
+    assert "check-record, open, wait, and `plan --run RUN --json` (the plan of a run that has begun), and not `plan --intent`, `pass`, `override` or `init`" in comment
     assert "git-meta is git's summary views: status, rev-parse, log (no patch), branch --show-current, and diff only with --stat, --numstat or --name-only" in comment
     assert "the orchestrator, which launches the stage agents and writes no record, lists none" in comment
 

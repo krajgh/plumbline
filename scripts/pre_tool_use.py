@@ -34,7 +34,7 @@ the paths the call names, so an agent whose working directory drifts is held all
       read-only git and search classes take no leading VAR=value, and no git option
       that runs a program or writes a file, in any abbreviation git accepts.
     - the orchestrator's classes are plumbline-run (plumbline.py's check-diff, gate, merge-review,
-      status, tokens, check-record and open, and `plan --run RUN --json`: no `plan --intent`, `pass`,
+      status, tokens, check-record, open and wait, and `plan --run RUN --json`: no `plan --intent`, `pass`,
       `override` or `init`) and git-meta (git status, rev-parse, log, branch --show-current, and diff
       with --stat, --numstat or --name-only: nothing that prints a patch). It has no search class,
       so `cat` and `grep` of source are refused, and no VAR=value goes before either class.
@@ -57,6 +57,10 @@ the paths the call names, so an agent whose working directory drifts is held all
       its definition pins; another agent is not briefed on .plumbline/ paths; in a calibration
       run a defender's brief does not name the canary (its record is listed among the findings
       records under a prosecutor's kind of name, so that nothing names it).
+  SendMessage, for the orchestrator
+    - only to an agent id that an `agent` entry of the active run's ledger holds, so to a stage agent that has
+      stopped in the run. The message is entered in that ledger as a `resume` ({kind, agent_id, at}): it wakes
+      the agent in the background, and `wait` and the gates read the entry. The main session's SendMessage is its own.
   Read, Grep, Glob and Bash, for the agent plumbline:defender, where a calibration run has a canary key
     - canary-key.json, in a round directory, the ledger.jsonl of its run (it names the agent that wrote
       each record, the canary's among them), and a directory that holds either are not read or searched:
@@ -2508,7 +2512,7 @@ def _search_only(argv: list[str]) -> bool:
     return True
 
 
-PLUMBLINE_RUN = ("check-diff", "gate", "merge-review", "status", "tokens", "check-record", "open")  # the commands of the plumbline-run class, besides `plan --run`
+PLUMBLINE_RUN = ("check-diff", "gate", "merge-review", "status", "tokens", "check-record", "open", "wait")  # the commands of the plumbline-run class, besides `plan --run`
 GIT_CONTENT_LONG = (  # long options of git diff and git log (and status) that print what the files say: a patch, a word diff, a verbose status
     "patch", "unified", "word-diff", "word-diff-regex", "color-words", "patch-with-stat", "patch-with-raw", "combined", "cc", "binary", "diff-merges", "verbose",
 )
@@ -2534,7 +2538,7 @@ def _plan_run_only(args: list[str]) -> bool:
 
 
 def _plumbline_run(pl, argv: list[str]) -> bool:
-    """Is this one of the plumbline-run commands: `plumbline.py` check-diff, gate, merge-review, status, tokens, check-record or open, or `plan --run`?"""
+    """Is this one of the plumbline-run commands: `plumbline.py` check-diff, gate, merge-review, status, tokens, check-record, open or wait, or `plan --run`?"""
     found = plumbline_args(pl, argv)
     if found is None:
         return False
@@ -2970,6 +2974,40 @@ def agent_launch_reason(data: dict) -> str | None:
     return None
 
 
+def send_message_reason(data: dict) -> str | None:
+    """SendMessage wakes an agent that has stopped. The orchestrator uses it to send a stage agent back to its work, and it messages only an
+    agent its run knows: one whose id an `agent` entry of the active run's ledger holds. Such a message is entered in that ledger as a
+    `resume`, {kind, agent_id, at}: the message returns at once and the agent works on in the background, so the entry is how `wait` knows the
+    agent's next stop is the answer, and how a gate knows its record may still change. The main session's SendMessage is its own: let through,
+    and not entered (`wait` then counts the stops after it began)."""
+    if data.get("agent_type") != f"plumbline:{ORCHESTRATOR}":
+        return None
+    tool_input, cwd = data.get("tool_input"), data.get("cwd")
+    if not isinstance(tool_input, dict) or not isinstance(cwd, str) or not cwd:
+        return None
+    import plumbline as pl
+
+    roots = adopted_roots(pl, anchors_of(Path(cwd)))
+    if not roots:
+        return None
+    named = tool_input.get("to")
+    first_run = None
+    for root in roots:
+        run = active_run(pl, root)
+        first_run = first_run or run
+        if run is None or not isinstance(named, str):
+            continue
+        if named in {entry.get("agent_id") for entry in pl.read_ledger(root, run) if entry.get("kind") == "agent"}:
+            pl.append_ledger(root, run, {"kind": "resume", "agent_id": named})
+            return None
+    who = f"`{named}`" if isinstance(named, str) and named.strip() else "the message's `to`"
+    where = f"the ledger of run {first_run}" if first_run else "the ledger of the run in progress (no run is in progress)"
+    return (
+        f"plumbline: the orchestrator sends a message only to an agent of its own run, by the id its launch gave, and {who} is not one: no `agent` entry of {where} holds that id. "
+        "Resume an agent that has stopped in this run (its id is the `agent_id` of its entries in the ledger), or launch the stage's agent again."
+    )
+
+
 def write_reason(data: dict) -> str | None:
     """Edit, Write and NotebookEdit: nobody writes the protected files, and an agent writes inside its role's targets."""
     tool_input, cwd = data.get("tool_input"), data.get("cwd")
@@ -3016,6 +3054,8 @@ def decide(data) -> str | None:
             return write_reason(data)
         if tool in ("Agent", "Task"):  # the tool has been called both
             return agent_launch_reason(data)
+        if tool == "SendMessage":
+            return send_message_reason(data)
         return None
     finally:
         _CACHE = None

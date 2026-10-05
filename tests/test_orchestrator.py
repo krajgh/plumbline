@@ -54,7 +54,7 @@ def test_the_prompt_names_the_commands_it_runs_and_they_are_the_cli_s():
     _, body = orchestrator()
     commands = next(a for a in pl.build_parser()._actions if getattr(a, "choices", None)).choices
     named = {m.group(1) for m in re.finditer(r"PLUMBLINE ([a-z][a-z-]+)", body)}
-    assert named == {"status", "plan", "check-diff", "gate", "merge-review"}  # the commands it spells out (tokens, check-record and open are its to run, not its procedure)
+    assert named == {"status", "plan", "check-diff", "gate", "merge-review", "wait"}  # the commands it spells out (tokens, check-record and open are its to run, not its procedure)
     assert named <= set(commands)
     assert "`PLUMBLINE` below stands for `python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/plumbline.py\"`" in body
 
@@ -78,6 +78,42 @@ def test_the_prompt_writes_the_turn_discipline_in():
     assert "Write no narration." in discipline
     assert "Brief each agent with paths and hashes. It reads the files itself, so your briefs carry no file content." in discipline
     assert "run_in_background: true" not in body and "`run_in_background: false`" in body
+
+
+def test_after_every_send_message_the_prompt_waits_for_the_agent_before_any_gate_and_writes_its_commands_literally():
+    body = orchestrator()[1]
+    discipline = between(body, "## Turn discipline", "## Where the run stands")
+    assert "After every SendMessage, run `PLUMBLINE wait <run id> <agent id>` for that agent before any gate, with the Bash tool's `timeout` set to 600000." in discipline
+    assert "SendMessage returns at once and the agent keeps working, and `wait` returns when the ledger shows its stop." in discipline
+    assert "so learn from `wait` that an agent has finished, and run `gate` once it has." in discipline  # a gate is not a way to ask whether an agent has finished
+    assert "When `wait` exits 1 the agent is still working: run it again once, and hand back as an error when it times out a second time." in discipline
+    assert "Write every command literally, with the run id, the agent id and the paths spelled out: the hook refuses a shell variable, a function and `sleep`, and each refusal costs a turn." in discipline
+    tools = between(body, "## Your tools", "## Turn discipline")
+    assert "by the id its launch gave, and returns at once while the agent works on in the background" in tools and "`merge-review`, `wait`, `tokens`" in tools
+    failing = between(body, "## When a gate fails", "## A decision comes back")
+    assert "(then `wait` for it, as the turn discipline says, before the gate)" in failing
+    assert "`wait`" in between(body, "An agent that comes back marked partial", "## Review units")
+
+
+def test_the_prompts_wait_command_is_the_clis_with_its_timeout_under_the_bash_tools_limit():
+    body = orchestrator()[1]
+    commands = next(a for a in pl.build_parser()._actions if getattr(a, "choices", None)).choices
+    assert "wait" in commands and {o for a in commands["wait"]._actions for o in a.option_strings} >= {"--timeout"}
+    timeout = int(re.search(r"`timeout` set to (\d+)", body).group(1))
+    assert timeout == 600000 and pl.DEFAULT_WAIT_TIMEOUT * 1000 < timeout  # the default wait ends before the Bash tool does
+
+
+def test_a_hand_back_states_item_by_item_whether_the_builders_decision_is_met_and_recommends_shipping_only_when_all_are():
+    body = orchestrator()[1]
+    decision = between(body, "## A decision comes back", "- **Fix the open findings**")
+    assert "Read the decision as a list of items" in decision and "the hand-back states for each item whether it is met" in decision
+    ending = between(body, "## Hand back", "## Finish")
+    assert "When your brief began with the builder's decision (an instruction), `stopped` states item by item whether the decision is fully met" in ending
+    assert "one short clause per item, met or unmet, with the finding, test or gate that shows it, inside the 15 lines" in ending
+    assert "Passing gates can leave part of an instruction untouched, so check each item against the records." in ending
+    assert "Recommend shipping only when every item is met; while one is unmet, the recommended option is to finish it." in ending
+    report = ending.split("Your report is at most 15 lines:", 1)[1].split("```\n")[1]
+    assert len(report.splitlines()) <= 15 and "decision" not in report  # the report's own form is as it was: the items go in `stopped`
 
 
 def test_a_leg_starts_from_the_run_id_and_reads_where_the_run_stands_in_one_call():
@@ -212,7 +248,7 @@ def test_the_failure_routes_are_the_skills_with_hand_backs_where_the_main_sessio
 
 
 def test_a_partial_agent_is_resumed_once_and_then_the_leg_hands_back():
-    assert "resume it once with SendMessage, and hand back as an error when it comes back partial again" in orchestrator()[1]
+    assert "resume it once with SendMessage and `wait` for it, and hand back as an error when it comes back partial again" in orchestrator()[1]
 
 
 def test_the_prompt_says_where_the_report_goes_when_the_harness_asks_for_it_through_subagent_handback():
@@ -586,13 +622,13 @@ def test_the_readme_limits_name_what_is_left_open_about_the_orchestrator():
     limits = readme_section("Limits")
     group = limits.split("**The orchestrator**", 1)[1].split("**Measured runs**", 1)[0]
     assert "- **Its lane is a guard rail like the others.**" in group and "(`junit-<stage>.xml`) and the test-writer's stubs, and nothing hides them from it" in group
-    assert "`SendMessage`, which it uses to resume a stage agent, is not among the tools the matcher names" in group
+    assert "SendMessage" not in group  # the hook names it now (0.5.1): the orchestrator resumes only agents of its own run, and the hook enters the resume
     assert "whether the harness honours the frontmatter `effort` and restricts the agent to its `tools` was not tested" in group and "the run skill's fallback applies" in group
     assert "A leg that reaches it stops without a report, and the main session starts another leg" in group
     assert "`maxTurns` is 200" in group and orchestrator()[0]["maxTurns"] == "200"
     from test_manifests import HOOKS, load
 
-    assert "SendMessage" not in load(HOOKS)["hooks"]["PreToolUse"][0]["matcher"]  # the limit is real today
+    assert "SendMessage" in load(HOOKS)["hooks"]["PreToolUse"][0]["matcher"].split("|")  # and the limit is closed: the matcher names it
 
 
 def test_the_readme_status_says_what_0_5_0_carries():

@@ -22,7 +22,9 @@ and its sha256 at that moment, whether it is valid, and where the agent's transc
 (`tokens` reads it). The sha256 is what lets the gates tell later that the record is
 still the one the agent left. A stop that leaves what the agent's latest entry already
 holds (the same record, hash and validity) adds no entry: an agent that the harness asks
-again for its report stops again, and is still one agent, in one round. An agent of an
+again for its report stops again, and is still one agent, in one round. An agent that was
+resumed since (the ledger has a `resume` entry for it after its latest entry) is entered
+at its next stop all the same. An agent of an
 unknown `plumbline:` role is let go, and entered as invalid ("unknown plumbline role").
 
 The orchestrator (`plumbline:orchestrator`) runs a leg of a run for the main session. It is no stage's agent and ends with a report, so no
@@ -240,11 +242,14 @@ def enter(pl, root: Path, run_id: str, entry: dict) -> None:
     """Append a stop to the run's ledger, unless the agent's latest entry holds what this stop would add: the same record with
     the same hash and validity. An agent that stops again with the record it left (the harness asks it again for a report it
     has not delivered) stays one entry, and so one round; one that changes its record, or whether it is valid, is entered
-    again. A stop without an agent id cannot be matched to an earlier one, and is always appended."""
+    again. A stop without an agent id cannot be matched to an earlier one, and is always appended. An agent that was resumed since its
+    latest entry (a `resume` entry follows it) is entered even when it left everything as it was: `wait` looks for that stop, and an agent
+    sent back to its work has answered whether or not it changed anything."""
     agent_id = entry.get("agent_id")
     if isinstance(agent_id, str) and agent_id:
-        last = pl.latest_entry(pl.read_ledger(root, run_id), "agent", agent_id=agent_id)
-        if last is not None and all(last.get(key) == entry.get(key) for key in ("record", "record_sha256", "valid")):
+        ledger = pl.read_ledger(root, run_id)
+        last = pl.latest_entry(ledger, "agent", agent_id=agent_id)
+        if last is not None and all(last.get(key) == entry.get(key) for key in ("record", "record_sha256", "valid")) and not pl.resumed_since(ledger, last):
             return
     pl.append_ledger(root, run_id, entry)
 

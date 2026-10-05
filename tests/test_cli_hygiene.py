@@ -27,7 +27,7 @@ def subparsers():
 def test_every_parser_of_the_cli_refuses_abbreviations_of_its_options():
     parser, commands = subparsers()
     assert parser.allow_abbrev is False
-    assert len(commands) == 14 and all(sub.allow_abbrev is False for sub in commands.values())
+    assert len(commands) == 15 and all(sub.allow_abbrev is False for sub in commands.values())
 
 
 def test_an_abbreviated_reason_writes_no_override(run_cli, repo):  # OV-ABBR: the reviewer's reproduction
@@ -46,6 +46,7 @@ def test_an_abbreviated_reason_writes_no_override(run_cli, repo):  # OV-ABBR: th
         ("status", "--proj", "."), ("status", "--ru", "r1"), ("gate", "r1", "verify", "--proj", "."), ("plan", "--int", "feature"), ("plan", "--ro", "code.S"),
         ("classify", "--ba", "main"), ("classify", "--inte", "fix"), ("check-diff", "--ru", "r1"), ("merge-review", "r1", "review", "--rou", "1"),
         ("override", "--run", "r1", "--rea", REASON), ("validate-pipeline", "--proj", "."), ("init", "--gra"), ("render", "x.json", "--ty", "spec"), ("open", "--al"), ("open", "--js"),
+        ("wait", "r1", "a1", "--time", "1"),
     ],
 )
 def test_no_option_of_any_command_can_be_shortened(run_cli, repo, command):

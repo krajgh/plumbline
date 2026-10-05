@@ -153,7 +153,7 @@ note = "The planner proposes a split into changes of size M or smaller; nothing 
 #             search is read-only shell tools (grep, rg, cat, head, tail, wc, sed -n, ls, find without -exec or -delete);
 #             plumbline-check is `plumbline.py check-diff`; graft is the graft wrapper, where graft is on;
 #             plumbline-run is the commands of `plumbline.py` that run a run's stages: check-diff, gate, merge-review, status, tokens,
-#             check-record, open, and `plan --run RUN --json` (the plan of a run that has begun), and not `plan --intent`, `pass`, `override` or `init`;
+#             check-record, open, wait, and `plan --run RUN --json` (the plan of a run that has begun), and not `plan --intent`, `pass`, `override` or `init`;
 #             git-meta is git's summary views: status, rev-parse, log (no patch), branch --show-current, and diff only with --stat, --numstat or --name-only.
 #             A role with no commands has no Bash at all (`plumbline.py check-record` is allowed to every role that has some).
 [roles.planner]

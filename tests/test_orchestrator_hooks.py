@@ -143,7 +143,6 @@ def test_the_lane_is_silent_where_plumbline_is_not_adopted(repo):
 
 def test_the_other_tools_are_not_read_by_this_rule(started):
     assert as_orchestrator(started, "WebFetch", {"url": "x"}) is None
-    assert as_orchestrator(started, "SendMessage", {"to": "a", "message": "b"}) is None
 
 
 def test_the_lane_through_the_hook_process(run_pre, started):
@@ -269,7 +268,7 @@ def test_the_orchestrator_runs_nothing_else(started, command, said):
 def test_the_denial_names_what_the_orchestrator_may_run(started):
     reason = runs(started, "cat src/app.py")
     assert reason == (
-        "plumbline: the orchestrator's Bash may run only `plumbline.py` check-diff, gate, merge-review, status, tokens, check-record and open, and `plan --run RUN --json`; "
+        "plumbline: the orchestrator's Bash may run only `plumbline.py` check-diff, gate, merge-review, status, tokens, check-record, open and wait, and `plan --run RUN --json`; "
         "git's summary views (status, rev-parse, log with no patch, branch --show-current, and diff with --stat, --numstat or --name-only); "
         "`plumbline.py check-record TYPE FILE` to check your record. `cat src/app.py` is none of these."
     )

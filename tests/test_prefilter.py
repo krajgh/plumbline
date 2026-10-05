@@ -345,7 +345,7 @@ def test_the_pre_tool_use_matcher_lists_monitor_beside_bash():
     [group] = hooks_json()["PreToolUse"]
     tools = group["matcher"].split("|")
     assert "Monitor" in tools and "Bash" in tools and "PowerShell" in tools
-    assert set(tools) == {"Bash", "PowerShell", "Monitor", "Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit", "Agent"}
+    assert set(tools) == {"Bash", "PowerShell", "Monitor", "Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit", "Agent", "SendMessage"}
     assert group["matcher"].replace("|", "").isalpha()  # letters and | only: an exact list of tool names
 
 

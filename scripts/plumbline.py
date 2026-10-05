@@ -12,6 +12,7 @@ Standard library only (Python 3.11 or newer).
     init [--project PATH] [--graft]
     merge-review RUN STAGE [--round N] [--project PATH]
     gate RUN STAGE [--project PATH]
+    wait RUN AGENT_ID [--timeout SECONDS] [--project PATH]
     tokens RUN [--project PATH]
     pass RUN [--project PATH]
     open [RUN] [--all] [--json] [--project PATH]
@@ -34,7 +35,10 @@ repository's own [commands] for a verify stage and a tests stage, and enters wha
 happened in the ledger. `pass` measures the change again and refuses a row that
 selects stages the run lacks. A review that fails with blockers standing and rounds
 left gets its next round's directory from `gate`: the review agents write only in
-the highest round-<n> directory of their stage.
+the highest round-<n> directory of their stage. An agent that was resumed (the PreToolUse
+hook enters a `resume` for the orchestrator's message to it) is working again until
+its next stop: `wait` blocks until the ledger shows that stop, and a gate that meets
+the agent in between fails at once and runs nothing.
 
 Exit status: 0 on success; 1 when what was checked is invalid, a gate fails, or
 a command refuses (init over an existing plumbline.toml, pass on a dirty tree);
@@ -145,6 +149,9 @@ DEFAULT_INTENT = "feature"
 TEMPLATE_DIR = PIPELINE_DIR / "templates"
 ID_PATTERN = r"^[a-z][a-z0-9_-]*$"
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+AGENT_ID_PATTERN = RUN_ID_PATTERN  # the harness's agent ids (such as a00c9fd37f4b4ada1) are letters and digits: the same plain shape as a run id
+WAIT_POLL_SECONDS = 2  # how often `wait` reads the ledger
+DEFAULT_WAIT_TIMEOUT = 540  # seconds `wait` waits: under the 10 minutes the Bash tool lets a command run
 
 # Paths every "matches everything" type must match (see validate_pipeline).
 PROBE_PATHS = ("a", ".a", "a.b", "a/b", "a/b/c.d", ".github/workflows/x.yml", "dir with space/f g")
@@ -2060,6 +2067,26 @@ def latest_entry(ledger: list[dict], kind: str, **fields) -> dict | None:
     return None
 
 
+def resumed_since(ledger: list[dict], entry: dict | None) -> bool:
+    """Was the agent of this `agent` entry (an entry of `ledger`) resumed after the stop the entry records? The PreToolUse hook enters a
+    `resume` for each message the orchestrator sends to an agent that has stopped, so an agent whose latest `resume` comes after its latest
+    stop is working again, and its record may still change under a hash the ledger holds from before."""
+    agent_id = (entry or {}).get("agent_id")
+    if not (isinstance(agent_id, str) and agent_id):
+        return False
+    position = next((i for i, other in enumerate(ledger) if other is entry), None)
+    return position is not None and any(other.get("kind") == "resume" and other.get("agent_id") == agent_id for other in ledger[position + 1 :])
+
+
+def stop_after_resume(ledger: list[dict], agent_id: str, floor: int) -> dict | None:
+    """The first stop of this agent that the ledger shows after its latest `resume` entry (by the order of the entries: a stop entered
+    before `wait` began counts, so a fast agent leaves no race), or None while the agent is working. An agent with no `resume` entry has
+    only the stops after the first `floor` entries, which is what the ledger held when the wait began."""
+    resumes = [i for i, entry in enumerate(ledger) if entry.get("kind") == "resume" and entry.get("agent_id") == agent_id]
+    start = resumes[-1] + 1 if resumes else floor
+    return next((entry for entry in ledger[start:] if entry.get("kind") == "agent" and entry.get("agent_id") == agent_id), None)
+
+
 def latest_run_id(root: Path) -> str | None:
     """The run touched most recently: the newest file in a run directory wins."""
     best: tuple[float, str] | None = None
@@ -2587,13 +2614,17 @@ GATE_CHECKS = {
 PART_ROLES = {AGENT_RECORDS[role]: role for role in ("prosecutor", "defender", "detective")}  # findings_record -> prosecutor, ...
 
 
-def _agent_entry_problems(entry: dict | None, role: str, sha: str | None, what: str) -> list[str]:
-    """Does this ledger entry show that plumbline:<role> stopped with a valid record whose hash is `sha`?"""
+def _agent_entry_problems(entry: dict | None, role: str, sha: str | None, what: str, ledger: list[dict] | None = None, run_id: str = "RUN") -> list[str]:
+    """Does this ledger entry show that plumbline:<role> stopped with a valid record whose hash is `sha`? With the `ledger` it came from, an
+    agent that was resumed since (see resumed_since) has not stopped with its record yet, and the answer says so before any hash is compared:
+    its record may be the old one or half of the new one, and a gate that ran now would measure a change the agent is still making."""
     expected = AGENT_PREFIX + role
     if entry is None:
         return [f"{what} has no entry from {expected}; run the {role}"]
     if entry.get("agent_type") != expected:
         return [f"the latest entry for {what} is from {entry.get('agent_type')}, not {expected}; run the {role}"]
+    if ledger is not None and resumed_since(ledger, entry):
+        return [f"{expected} (agent {entry['agent_id']}) was resumed after it stopped and has not stopped since, so {what} may still change; run `plumbline.py wait {run_id} {entry['agent_id']}` first"]
     if entry.get("valid") is not True:
         return [f"{expected}'s last stop left {what} invalid; run the {role} again"]
     if entry.get("record_sha256") != sha:
@@ -2604,7 +2635,7 @@ def _agent_entry_problems(entry: dict | None, role: str, sha: str | None, what: 
 def _agent_provenance(root: Path, run_id: str, stage: dict, ledger: list[dict]) -> list[str]:
     entry = latest_entry(ledger, "agent", stage=stage["id"])
     sha = file_sha256(run_dir(root, run_id) / f"{stage['id']}.json")
-    return _agent_entry_problems(entry, stage["role"], sha, "its record")
+    return _agent_entry_problems(entry, stage["role"], sha, "its record", ledger, run_id)
 
 
 def names_canary(root: Path, path: str, record: dict) -> bool:
@@ -2636,7 +2667,7 @@ def _merge_provenance(root: Path, run_id: str, stage: dict, ledger: list[dict]) 
         if role is None:
             problems.append(f"{path} is no findings, defense or gaps record")
             continue
-        problems += _agent_entry_problems(latest_entry(ledger, "agent", record=path), role, sha, path)
+        problems += _agent_entry_problems(latest_entry(ledger, "agent", record=path), role, sha, path, ledger, run_id)
     return problems
 
 
@@ -2879,8 +2910,8 @@ def evaluate_stage(
     """The stage's record must exist and validate, and the ledger must trace it; then its gate, if it has one, must pass.
     With `measure`, a gate that measures (verify_green, tests_fail_on_stub, reproduces_on_head) first runs the repository's
     commands and enters the run in the ledger; without it, such a gate reads the latest run the ledger holds. The trace is checked
-    before anything runs: a record changed after its agent stopped returns at once with that problem, so that a gate asked for
-    too early costs no test run."""
+    before anything runs: a record changed after its agent stopped, or whose agent was resumed and is working again, returns at once
+    with that problem, so that a gate asked for too early costs no test run."""
     root = project.root
     path = run_dir(root, run_id) / f"{stage['id']}.json"
     gate = stage.get("gate")
@@ -3245,7 +3276,7 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
     for where, data, role in used:
         sha = file_sha256(root / where)
         parts.append({"path": where, "sha256": sha})
-        problems += _agent_entry_problems(latest_entry(ledger, "agent", record=where), role, sha, where)
+        problems += _agent_entry_problems(latest_entry(ledger, "agent", record=where), role, sha, where, ledger, run_id)
         if data["diff_sha256"] != current:
             problems.append(
                 f"{where}: it covers the change {data['diff_sha256'][:12]}, but the files now hash to {current[:12]}; "
@@ -4224,6 +4255,40 @@ def cmd_gate(args) -> int:
     return 0 if outcome.passed else (3 if exhausted else 1)
 
 
+def check_agent_id(agent_id: str) -> str:
+    if not AGENT_ID_PATTERN.fullmatch(agent_id):
+        raise PlumblineError(f"agent id {agent_id!r} must be letters, digits, '.', '_' or '-', and start with a letter or digit (the id the launch of the agent gave)")
+    return agent_id
+
+
+def cmd_wait(args) -> int:
+    """Block until the run's ledger shows a stop of this agent after its latest `resume` entry: exit 0 then, 1 when `--timeout` seconds pass first.
+    SendMessage wakes a stage agent in the background and returns at once, and the orchestrator has no tool that waits, so this is the tool: it
+    reads the ledger file every WAIT_POLL_SECONDS and calls no model. The comparison is with the resume entry the PreToolUse hook made, so an agent
+    that stopped before `wait` began is seen; with no resume entry it is with the entries the ledger held when the wait began."""
+    root = resolve_root(args.project, require_git=True)
+    run_id = check_run_id(args.run_id)
+    existing_run_dir(root, run_id)
+    agent_id = check_agent_id(args.agent_id)
+    if args.timeout < 0:
+        raise PlumblineError("--timeout is a number of seconds, 0 or more")
+    floor = len(read_ledger(root, run_id))
+    deadline = time.monotonic() + args.timeout
+    while True:
+        stop = stop_after_resume(read_ledger(root, run_id), agent_id, floor)
+        if stop is not None:
+            kind = f" ({stop['agent_type']})" if isinstance(stop.get("agent_type"), str) else ""
+            record = f"; its record is {stop['record']}, {'valid' if stop.get('valid') is True else 'not valid'}" if isinstance(stop.get("record"), str) else ""
+            print(f"agent {agent_id}{kind} has stopped{record}")
+            return 0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(WAIT_POLL_SECONDS, remaining))
+    print(f"agent {agent_id} has not stopped after {args.timeout} s; run `wait` again or hand back")
+    return 1
+
+
 def cmd_tokens(args) -> int:
     root = resolve_root(args.project, require_git=True)
     tokens, notes = tokens_for_run(root, args.run_id)
@@ -4597,6 +4662,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("stage")
     p.add_argument("--project", metavar="PATH")
     p.set_defaults(run=cmd_gate)
+
+    p = sub.add_parser("wait", allow_abbrev=False, help="block until an agent that was resumed has stopped again, as the run's ledger shows: exit 0 then, 1 when --timeout seconds pass first (it polls the ledger, and calls no model)")
+    p.add_argument("run_id", metavar="RUN")
+    p.add_argument("agent_id", metavar="AGENT_ID", help="the id of the agent, as its launch gave it (and as SendMessage names it)")
+    p.add_argument("--timeout", type=int, default=DEFAULT_WAIT_TIMEOUT, metavar="SECONDS", help=f"how long to wait (default {DEFAULT_WAIT_TIMEOUT}, under the 10 minutes the Bash tool allows)")
+    p.add_argument("--project", metavar="PATH")
+    p.set_defaults(run=cmd_wait)
 
     p = sub.add_parser("tokens", allow_abbrev=False, help="print the token usage of a run's agents, per model, as JSON")
     p.add_argument("run_id", metavar="RUN")

@@ -17,8 +17,8 @@ The run id. After a hand-back that needed the builder, it also gives the builder
 
 ## Your tools
 
-- Agent launches the stage agents, `plumbline:<role>` only. SendMessage resumes one of them.
-- Bash runs plumbline's commands (`status`, `plan --run`, `check-diff`, `gate`, `merge-review`, `tokens`, `check-record` and `open`) and git's summary views (`status`, `rev-parse`, `log`, `branch --show-current`, and `diff` with `--stat`, `--numstat` or `--name-only`). Everything else is the stage agents' or the main session's work.
+- Agent launches the stage agents, `plumbline:<role>` only. SendMessage resumes one of them, by the id its launch gave, and returns at once while the agent works on in the background.
+- Bash runs plumbline's commands (`status`, `plan --run`, `check-diff`, `gate`, `merge-review`, `wait`, `tokens`, `check-record` and `open`) and git's summary views (`status`, `rev-parse`, `log`, `branch --show-current`, and `diff` with `--stat`, `--numstat` or `--name-only`). Everything else is the stage agents' or the main session's work.
 - Read (and Grep and Glob, where your session has them) reaches the run's directory, `.plumbline/runs/<run id>/`, where the records, the ledger and the round directories are. Source and tests stay with the stage agents.
 
 ## Turn discipline
@@ -29,6 +29,8 @@ Every turn of yours reads your whole context again, and a run is long, so spend 
 - Put the plumbline commands that are independent of each other's output in ONE Bash call, one command to a line.
 - Write no narration. Your next message is a tool call, until your report.
 - Brief each agent with paths and hashes. It reads the files itself, so your briefs carry no file content.
+- After every SendMessage, run `PLUMBLINE wait <run id> <agent id>` for that agent before any gate, with the Bash tool's `timeout` set to 600000. SendMessage returns at once and the agent keeps working, and `wait` returns when the ledger shows its stop. A gate run earlier measures files the agent is still changing, so learn from `wait` that an agent has finished, and run `gate` once it has. When `wait` exits 1 the agent is still working: run it again once, and hand back as an error when it times out a second time.
+- Write every command literally, with the run id, the agent id and the paths spelled out: the hook refuses a shell variable, a function and `sleep`, and each refusal costs a turn.
 
 ## Where the run stands
 
@@ -61,7 +63,7 @@ Every brief gives: the run id, the path of the request, the path where the agent
 - builder: the plan record. From the second round, the failing criteria and error types of the verify record (an `AC-<n>` and the kind of error), and the text of the surviving findings that `merge-review` printed under "for the builder", verbatim. The builder has no Bash and works from the spec and the source, so its brief carries no test file, test name, assertion or tests-lens finding, and no path of a review file: those stay with the test-writer and with you.
 - verifier: the commands from the plan, the plan record, the tests record when the row has one, and the run id (it runs `check-diff --run <run id>`, and its `commands[].summary` is one short line such as `13 passed`). When `check-diff` reports a problem about the row, the change has outgrown the run: hand back (see "Where the run stands"), and leave the builder out of it.
 
-An agent that comes back marked partial ran out of turns, and its stage was too big: resume it once with SendMessage, and hand back as an error when it comes back partial again.
+An agent that comes back marked partial ran out of turns, and its stage was too big: resume it once with SendMessage and `wait` for it, and hand back as an error when it comes back partial again.
 
 ## Review units
 
@@ -94,13 +96,13 @@ Start each round with `PLUMBLINE check-diff --run <run id>`: it prints the `merg
 - The surviving findings under "for the test-writer" go to the test-writer, which revises the tests; then run `tests`, `verify` and `review` again. Once the build exists, the tests stage records its run of the test command and no longer expects the tests to fail.
 - A review of the tests goes back to `tests`.
 
-Send a stage back by resuming its agent with SendMessage, giving it the problems, or by launching a fresh agent with the problems in its brief: either is a new attempt under the rounds rule. `gate` exits 3 when the stage has used its rounds. When it exits 3, or when `on_fail` is `main`, hand back (see "Hand back"): the builder decides whether to start a new run or to skip the pipeline.
+Send a stage back by resuming its agent with SendMessage, giving it the problems (then `wait` for it, as the turn discipline says, before the gate), or by launching a fresh agent with the problems in its brief: either is a new attempt under the rounds rule. `gate` exits 3 when the stage has used its rounds. When it exits 3, or when `on_fail` is `main`, hand back (see "Hand back"): the builder decides whether to start a new run or to skip the pipeline.
 
 Each problem of the tests and verify gates starts with where it comes from: `the agent's record` (what the agent typed) or `the measured run` (what `gate` saw when it ran the repository's commands). A problem of the record goes back to the agent that wrote it. A problem of the measured run is about the change or the tests, except when it says the commands could not run (`no test command is declared`): that one is the builder's to settle in `plumbline.toml`, so hand back.
 
 ## A decision comes back
 
-When your brief gives the builder's decision, act on it first.
+When your brief gives the builder's decision, act on it first. Read the decision as a list of items (each case or behaviour it asks for) and keep the list beside your work, because the hand-back states for each item whether it is met.
 
 - **Fix the open findings** (the last leg ended with every gate passed and non-blocking findings or gaps left): the findings are those the decision names, else all of them. `PLUMBLINE merge-review <run id> <stage id> --round <n>` for the round that passed prints their text again. Brief the builder and the test-writer as in "When a gate fails", then run `verify`, then the review again. No blocker stood, so `gate` opened no new round: the review agents write in the round directory the stage has, over the old records, and `merge-review` refuses any old record the new pass leaves, because it covers another change, and names it; run that agent again.
 - **Ship:** hand back with every gate passed.
@@ -124,6 +126,8 @@ open: <finding id, severity, one line; one line each (six at most, then "and <n>
 ```
 
 When every gate has passed and nothing is left open, `stopped` says so and `options` reads "the main session commits and records the pass". In a calibration run the report carries the `canary:` line `merge-review` printed.
+
+When your brief began with the builder's decision (an instruction), `stopped` states item by item whether the decision is fully met: one short clause per item, met or unmet, with the finding, test or gate that shows it, inside the 15 lines. Passing gates can leave part of an instruction untouched, so check each item against the records. Recommend shipping only when every item is met; while one is unmet, the recommended option is to finish it.
 
 ## Finish
 

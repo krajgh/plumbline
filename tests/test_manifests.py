@@ -103,7 +103,7 @@ def test_hooks_json_registers_session_start_pre_tool_use_and_subagent_stop():
     [hook] = group["hooks"]
     assert hook["type"] == "command" and hook["timeout"] == 10
     [group] = hooks["PreToolUse"]
-    assert group["matcher"] == "Bash|PowerShell|Monitor|Read|Grep|Glob|Edit|Write|NotebookEdit|Agent"  # letters and | only: an exact list of tool names; Monitor runs a shell command as Bash does
+    assert group["matcher"] == "Bash|PowerShell|Monitor|Read|Grep|Glob|Edit|Write|NotebookEdit|Agent|SendMessage"  # letters and | only: an exact list of tool names; Monitor runs a shell command as Bash does
     [hook] = group["hooks"]
     assert hook["type"] == "command" and hook["timeout"] == 30
     [group] = hooks["SubagentStop"]
