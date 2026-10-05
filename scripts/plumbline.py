@@ -2878,7 +2878,9 @@ def evaluate_stage(
 ) -> GateOutcome:
     """The stage's record must exist and validate, and the ledger must trace it; then its gate, if it has one, must pass.
     With `measure`, a gate that measures (verify_green, tests_fail_on_stub, reproduces_on_head) first runs the repository's
-    commands and enters the run in the ledger; without it, such a gate reads the latest run the ledger holds."""
+    commands and enters the run in the ledger; without it, such a gate reads the latest run the ledger holds. The trace is checked
+    before anything runs: a record changed after its agent stopped returns at once with that problem, so that a gate asked for
+    too early costs no test run."""
     root = project.root
     path = run_dir(root, run_id) / f"{stage['id']}.json"
     gate = stage.get("gate")

@@ -1,6 +1,7 @@
 """Measured gates: `gate` runs the repository's own [commands] for a verify stage (test, lint, typecheck, build) and for a tests stage (the
 test command, which must fail), enters what happened in the ledger, and compares it with what the agent typed. A test run may not change
 the files that steer git and the agents (TC-PERSIST), and a pytest run keeps the inventory of tests from shrinking."""
+import inspect
 import shlex
 import sys
 import time
@@ -733,3 +734,74 @@ def test_a_stale_junit_file_is_not_mistaken_for_the_fresh_one(run_cli, repo):
     gate(run_cli, repo)
     [entry] = run_entries(repo)
     assert "junit" not in entry["commands"][0] and not junit.exists()
+
+
+# --- the trace comes before any command: a gate asked for too early costs no test run
+
+
+class CommandRunner:
+    """A stand-in for plumbline's runner of declared commands: it records what it was asked to run, and ends 0."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, root, command, timeout, junit=None):
+        self.calls.append(command)
+        return {"cmd": command, "exit_code": 0, "seconds": 0.0}
+
+
+@pytest.fixture
+def runner(monkeypatch):
+    stub = CommandRunner()
+    monkeypatch.setattr(pl, "run_declared_command", stub)
+    return stub
+
+
+def gate_here(repo, capsys, stage="verify"):
+    """`gate` in this process, so that the runner stub is the one it uses: (its exit status, what it printed)."""
+    code = pl.main(["gate", RUN, stage, "--project", str(repo)])
+    return code, capsys.readouterr().out
+
+
+def test_a_gate_on_a_record_changed_after_the_agents_stop_runs_no_measured_command(repo, runner, capsys):
+    repo_with(repo, test=exits(0))
+    verify_now(repo)
+    path = run_path(repo, RUN, "verify.json")
+    path.write_text(path.read_text(encoding="utf-8") + " ", encoding="utf-8")  # edited after the verifier stopped
+    code, out = gate_here(repo, capsys)
+    assert code == 1 and "its record changed after plumbline:verifier stopped; run the verifier again" in out
+    assert runner.calls == [] and run_entries(repo) == []  # no command was run, and no run was entered in the ledger
+
+
+def test_the_tests_gate_on_a_record_changed_after_the_test_writers_stop_runs_no_measured_command(tested, runner, capsys):
+    path = run_path(tested, RUN, "tests.json")
+    path.write_text(path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+    code, out = gate_here(tested, capsys, "tests")
+    assert code == 1 and "its record changed after plumbline:test-writer stopped; run the test-writer again" in out
+    assert runner.calls == [] and run_entries(tested, "tests") == []
+
+
+def test_a_gate_on_a_record_that_no_agent_left_runs_no_measured_command_either(repo, runner, capsys):
+    repo_with(repo, test=exits(0))
+    put(repo, "verify", {"green": True}, agent=False)  # written by hand, and no valid record
+    assert gate_here(repo, capsys)[0] == 1 and runner.calls == []
+    put(repo, "verify", verify_record(), agent=False)  # a valid one, and still no agent's entry
+    code, out = gate_here(repo, capsys)
+    assert code == 1 and "has no entry from plumbline:verifier" in out and runner.calls == []
+
+
+def test_the_same_gates_on_traced_records_do_run_their_commands_so_the_stub_is_the_proof(repo, runner, capsys):
+    repo_with(repo, test=exits(0))
+    verify_now(repo)
+    gate_here(repo, capsys)
+    assert runner.calls == [exits(0)] and len(run_entries(repo)) == 1
+
+
+def test_the_readme_says_the_trace_comes_before_the_commands_and_the_code_does_that(repo):
+    from test_readme import README, section
+
+    assert "The trace comes first, before any command runs: a gate asked for too early, while the agent still edits its record, costs no test run." in section("Runs, gates and the pass record")
+    row = next(line for line in README.splitlines() if line.startswith("| `gate RUN STAGE` |"))
+    assert "once the record is traced to its agent: a record changed after its agent stopped fails the gate at once, and nothing is run" in row
+    source = inspect.getsource(pl.evaluate_stage)
+    assert source.index("provenance_problems(") < source.index("measure_stage(")  # the order of the code is the order the README states
