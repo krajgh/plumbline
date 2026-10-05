@@ -126,7 +126,7 @@ def test_a_leg_starts_from_the_run_id_and_reads_where_the_run_stands_in_one_call
     for key in ("`stages`", "`role` or `kind`", "`reads` as paths", "record `path`", "`gate`", "`on_fail`", "`max_rounds`", "`lenses`", "`request` file", "`record_dir`", "`stubs_dir`", "`commands`", "`supplied`"):
         assert key in start, key  # what the plan gives it, so that the main session pastes nothing in
     assert "`status` shows the state of each stage, the rounds each has used" in start
-    assert "the line `round <n>: ...` under it names the records the round holds already: launch only the agents whose record is missing" in start
+    assert "the line `round <n>: ...` under it names the records the highest round directory holds: when that is the stage's `next_round`, launch only the agents whose record is missing; when `next_round` is higher, that round has no records yet, and all of its agents launch" in start
     assert "under a review stage, the records its highest round holds and how many BLOCKING findings the prosecutors filed in it" in start
 
 

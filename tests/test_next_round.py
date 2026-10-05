@@ -263,6 +263,13 @@ def test_plan_run_follows_the_run_as_its_rounds_pass(run_cli, stored):
     assert next_rounds(run_cli, stored)["spec-review"] == 3
 
 
+def test_status_names_the_highest_round_directory_while_the_plan_names_the_round_to_write(run_cli, stored):
+    passed_round_one(run_cli, stored)
+    out = run_cli("status", "--run", RUN, cwd=stored).stdout
+    assert "round 1: prosecutor-requirements; BLOCKING filed: 0" in out  # the highest directory there is: its records are the old round's
+    assert next_rounds(run_cli, stored)["spec-review"] == 2  # and the round the new records go in: the prompt says which of the two decides what to launch
+
+
 def test_the_plan_that_starts_a_run_and_the_plan_of_the_run_that_has_begun_agree(run_cli, repo, tmp_path):
     adopt_base(repo)
     request = write(tmp_path / "request.md", REQUEST)
