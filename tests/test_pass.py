@@ -313,14 +313,14 @@ def test_override_without_any_run_lists_every_stage_of_the_pipeline(run_cli, rep
     adopt(repo)
     assert do_override(run_cli, repo).returncode == 0
     skipped = json.loads(override_file(repo).read_text(encoding="utf-8"))["stages_skipped"]
-    assert skipped == ["intake", "plan", "tests", "test-review", "build", "verify", "review", "reduce"]
+    assert skipped == ["intake", "plan", "spec-review", "tests", "test-review", "build", "verify", "review", "reduce"]
 
 
 def test_override_with_an_unusable_latest_run_lists_every_stage_and_still_works(run_cli, repo):
     adopt(repo)
     put(repo, "verify", "{not json")  # a run with no intake record at all
     assert do_override(run_cli, repo).returncode == 0
-    assert len(json.loads(override_file(repo).read_text(encoding="utf-8"))["stages_skipped"]) == 8
+    assert len(json.loads(override_file(repo).read_text(encoding="utf-8"))["stages_skipped"]) == 9
 
 
 def test_override_for_a_run_that_does_not_exist_could_not_be_written(run_cli, ready):

@@ -209,7 +209,7 @@ def test_the_record_and_the_output_keep_tests_lens_findings_apart_from_the_rest(
     result = merge(run_cli, unit)
     assert result.returncode == 0, result.stdout
     record = read(unit, "review")
-    assert record["routes"] == {"builder": ["correctness-1"], "test-writer": ["correctness-2", "tests-1", "tests-2"]}
+    assert record["routes"] == {"builder": ["correctness-1"], "test-writer": ["correctness-2", "tests-1", "tests-2"], "planner": []}
     lines = result.stdout.splitlines()
     builder = lines.index("surviving findings for the builder (give the builder this text and nothing else):")
     writer = next(i for i, line in enumerate(lines) if line.startswith("surviving findings for the test-writer"))
@@ -248,7 +248,7 @@ def test_a_round_without_survivors_prints_neither_list(run_cli, unit):
 def test_only_surviving_findings_are_routed(run_cli, unit):
     parts(unit, {"correctness": [finding("correctness-1")], "tests": [finding("tests-1", "tests")]}, refuting=(1, 2, 3))
     merge(run_cli, unit)
-    assert read(unit, "review")["routes"] == {"builder": [], "test-writer": []}
+    assert read(unit, "review")["routes"] == {"builder": [], "test-writer": [], "planner": []}
 
 
 @pytest.mark.parametrize(

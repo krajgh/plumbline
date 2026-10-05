@@ -272,7 +272,7 @@ def test_a_tests_lens_blocker_goes_to_the_test_writer_and_the_run_carries_on_aft
     )
     assert result.returncode == 0, result.stdout
     assert "surviving findings for the test-writer" in result.stdout and "surviving findings for the builder" not in result.stdout
-    assert read(adopted, "review")["routes"] == {"builder": [], "test-writer": ["tests-1"]}
+    assert read(adopted, "review")["routes"] == {"builder": [], "test-writer": ["tests-1"], "planner": []}
     assert gate(run_cli, adopted, "review").returncode == 1
     # the test-writer strengthens the tests; the code exists by now, so the tests are not expected to fail on stubs
     write(adopted / "tests" / "test_app.py", (adopted / "tests" / "test_app.py").read_text() + "def test_the_edge():\n    assert False\n")

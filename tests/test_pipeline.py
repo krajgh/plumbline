@@ -61,7 +61,7 @@ BAD_FIXTURES = [
     ("on-fail-unknown", lambda d: stage(d, "verify").update(on_fail="nowhere"), "on_fail names unknown stage 'nowhere'"),
     ("on-fail-review-stage", lambda d: stage(d, "build").update(on_fail="test-review", max_rounds=1), "is a review stage"),
     ("on-fail-without-max-rounds", lambda d: stage(d, "verify").pop("max_rounds"), "on_fail needs max_rounds"),
-    ("max-rounds-zero", lambda d: stage(d, "verify").update(max_rounds=0), "$.stage[5].max_rounds"),
+    ("max-rounds-zero", lambda d: stage(d, "verify").update(max_rounds=0), f"$.stage[{[s['id'] for s in default_pipeline()['stage']].index('verify')}].max_rounds"),
     ("survive-exceeds-defenders", lambda d: stage(d, "review").update(survive_if_unrefuted_by=4), "cannot exceed defenders"),
     ("row-reorders-stages", lambda d: d["matrix"]["docs"].update(stages=["intake", "review", "verify", "reduce"]), "definition order"),
     ("row-reads-stage-it-lacks", lambda d: d["matrix"]["docs"].update(stages=["intake", "review", "reduce"]), "reads 'verify', which is neither an input nor an earlier stage of this row"),

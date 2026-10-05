@@ -6,7 +6,7 @@
   "properties": {
     "lens": {
       "description": "The one lens this prosecutor reviewed through.",
-      "enum": ["correctness", "tests", "security", "data", "boundaries", "docs"]
+      "enum": ["correctness", "tests", "security", "data", "boundaries", "docs", "requirements"]
     },
     "findings": {
       "description": "Every finding, each with its own evidence. Finding ids must be unique across the prosecutors of a round, so prefix them with the lens (for example security-1).",
@@ -21,7 +21,7 @@
             "minLength": 1
           },
           "lens": {
-            "enum": ["correctness", "tests", "security", "data", "boundaries", "docs"]
+            "enum": ["correctness", "tests", "security", "data", "boundaries", "docs", "requirements"]
           },
           "file": {
             "type": "string",

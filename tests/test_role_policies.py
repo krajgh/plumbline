@@ -154,9 +154,9 @@ def test_a_prosecutor_outside_plumbline_runs_is_denied(run_pre, adopted, tmp_pat
 
 def test_the_denial_names_where_the_agent_may_write(run_pre, adopted):
     assert "(.plumbline/runs/<run-id>/plan.json)" in writes(run_pre, adopted, "planner", "src/app.py")
-    assert "{test-review,review}/round-<n>/prosecutor-<lens>.json" in writes(run_pre, adopted, "prosecutor", "src/app.py")
-    assert "{test-review,review}/round-<n>/defender-<n>.json" in writes(run_pre, adopted, "defender", "src/app.py")
-    assert "{test-review,review}/round-<n>/detective.json" in writes(run_pre, adopted, "detective", "src/app.py")
+    assert "{spec-review,test-review,review}/round-<n>/prosecutor-<lens>.json" in writes(run_pre, adopted, "prosecutor", "src/app.py")
+    assert "{spec-review,test-review,review}/round-<n>/defender-<n>.json" in writes(run_pre, adopted, "defender", "src/app.py")
+    assert "{spec-review,test-review,review}/round-<n>/detective.json" in writes(run_pre, adopted, "detective", "src/app.py")
 
 
 @pytest.mark.parametrize("role", [*ROLES, None])

@@ -87,7 +87,7 @@
             "minLength": 1
           },
           "lens": {
-            "enum": ["correctness", "tests", "security", "data", "boundaries", "docs"]
+            "enum": ["correctness", "tests", "security", "data", "boundaries", "docs", "requirements"]
           },
           "severity": {
             "description": "A finding that survives with BLOCKING fails its gate, so a passed run holds only MAJOR and MINOR ones.",

@@ -38,6 +38,21 @@ on_fail = "plan"                # the planner runs again with the gate's problem
 max_rounds = 2
 
 [[stage]]
+id = "spec-review"
+kind = "review"                 # a review unit that checks the spec against the request: nothing else does, and everything after it is checked against the spec
+target = "plan"
+reads = ["request", "plan"]     # the request as `plan --request-file` stored it
+record = "review_record"
+lenses = ["requirements"]
+defenders = 3
+survive_if_unrefuted_by = 2
+screen_defenders = 1
+detective = false
+gate = "no_surviving_blockers"
+on_fail = "plan"                # the planner runs again with the surviving findings
+max_rounds = 2
+
+[[stage]]
 id = "tests"
 role = "test-writer"
 reads = ["plan"]
@@ -119,11 +134,12 @@ on_fail = { verify = "main", review = "main" }
 stages = ["intake", "plan", "tests", "build", "verify", "review", "reduce"]
 lenses = ["correctness", "tests"]
 
+# spec-review is in the rows of size M and L: a spec of size S has one or two criteria, and the review of a spec that short costs more than it finds.
 [matrix.code.M]
-stages = ["intake", "plan", "tests", "test-review", "build", "verify", "review", "reduce"]
+stages = ["intake", "plan", "spec-review", "tests", "test-review", "build", "verify", "review", "reduce"]
 
 [matrix.code.L]
-stages = ["intake", "plan"]
+stages = ["intake", "plan", "spec-review"]
 note = "The planner proposes a split into changes of size M or smaller; nothing is built at size L."
 
 # Role policies: what each agent may write and run. A PreToolUse hook enforces them for plumbline agents.
@@ -182,9 +198,9 @@ supplies = ["plan"]             # a one-AC spec from the bug report: "this no lo
 gates = { tests = "reproduces_on_head" }   # the new tests must fail on today's code, on an assertion
 
 [intent.refactor]               # behaviour unchanged
-skip = ["plan", "tests", "test-review"]
+skip = ["plan", "spec-review", "tests", "test-review"]   # the template spec says "behaviour unchanged": there is no request to compare it with
 supplies = ["plan"]             # the shipped template spec (pipeline/templates/refactor.json): behaviour unchanged, every existing test passes
 lenses = ["correctness", "boundaries"]
 
 [intent.review-only]            # a change that already exists: nothing is built
-skip = ["plan", "tests", "test-review", "build"]
+skip = ["plan", "spec-review", "tests", "test-review", "build"]

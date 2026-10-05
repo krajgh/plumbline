@@ -5,7 +5,7 @@ Standard library only (Python 3.11 or newer).
 
     validate-pipeline [FILE] [--project PATH]
     classify [--project PATH] [--base REF] [--intent ID] [--row ROW] [--out FILE]
-    plan [--project PATH] [--base REF] [--run-id ID] [--intent ID [--spec FILE]] [--row ROW]
+    plan [--project PATH] [--base REF] [--run-id ID] [--intent ID [--spec FILE] [--request-file FILE]] [--row ROW]
     check-record TYPE FILE
     render FILE [--type TYPE]
     init [--project PATH] [--graft]
@@ -22,7 +22,9 @@ A run is the directory .plumbline/runs/<run-id>/: one <stage-id>.json per stage,
 the per-agent records of a review unit under <stage-id>/round-<n>/, and a
 ledger.jsonl that only ever grows. `plan --intent ID` starts a run: it writes the
 intake record (which carries the intent), copies the record an intent supplies in
-place of a skipped stage, and names the run in .plumbline/runs/ACTIVE.
+place of a skipped stage, stores the request a `--request-file` holds as request.md
+(its hash goes into the ledger first, as the intake record's does), and names the
+run in .plumbline/runs/ACTIVE.
 
 Gates measure and trace. A stage's record counts only with the ledger's entry for
 the agent that wrote it (written by the SubagentStop hook, with the record's
@@ -76,13 +78,14 @@ RUNS_DIR = ".plumbline/runs"
 PASS_DIR = ".plumbline/pass"
 LEDGER_FILE = "ledger.jsonl"
 ACTIVE_FILE = "ACTIVE"  # .plumbline/runs/ACTIVE: the run id and a newline; written by `plan --intent`, read by the hooks
+REQUEST_FILE = "request.md"  # .plumbline/runs/<run-id>/request.md: the request the run began with, which `plan --intent --request-file` stores
 IGNORE_ENTRY = ".plumbline/"
 IGNORE_EQUIVALENTS = {".plumbline", ".plumbline/", "/.plumbline", "/.plumbline/"}
 
 SIZE_LABELS = ("S", "M", "L")
 KNOWN_ROLES = ("main", "planner", "test-writer", "builder", "verifier")
 KNOWN_KINDS = ("agent", "review")
-KNOWN_LENSES = ("correctness", "tests", "security", "data", "boundaries", "docs")
+KNOWN_LENSES = ("correctness", "tests", "security", "data", "boundaries", "docs", "requirements")
 KNOWN_GATES = (
     "spec_complete",
     "acs_covered",
@@ -109,6 +112,7 @@ DEFAULT_COMMAND_TIMEOUT = 900  # seconds each declared command may run; `timeout
 MIN_QUOTE = 6  # a defender's quote of fewer characters (whitespace-normalised) proves nothing
 TESTS_TYPE = "tests"  # the file type of test files
 TESTS_LENS = "tests"  # the lens that reviews tests
+REQUIREMENTS_LENS = "requirements"  # the lens that reviews the spec against the request
 SINGLE_AC_INTENTS = ("fix",)  # a fix reproduces one bug: its spec has exactly one acceptance criterion
 UNCHANGED_TESTS_INTENTS = ("refactor",)  # behaviour stays the same, so no test file changes
 OPEN_FINDING_KEYS = ("id", "lens", "severity", "file", "line", "claim", "failure_scenario")  # what the pass record keeps of a surviving finding, after its stage
@@ -1438,18 +1442,20 @@ def default_run_id(root: Path) -> str:
     return f"{short}-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
 
 
-def build_plan(pipeline: dict, record: dict, run_id: str, commands: dict | None = None, graft: bool = False) -> dict:
+def build_plan(pipeline: dict, record: dict, run_id: str, commands: dict | None = None, graft: bool = False, request: bool = False) -> dict:
     """The stages to run for a classified change, in order, with every read
     resolved to a record path and every on_fail resolved within the row. The
     intake record's intent is applied to the row: skipped stages are left out,
     the records it supplies count as present, and its gates and lenses replace
-    the stages' own."""
+    the stages' own. When the run stores its request (`request`), the request
+    input resolves to the file that holds it."""
     intent = record.get("intent", DEFAULT_INTENT)
     effective = effective_row(pipeline, record["row"], intent)
     by_id = {s["id"]: s for s in pipeline["stage"]}
     in_row = list(effective.stages)
     present = set(in_row) | set(effective.supplied)
     record_dir = f"{RUNS_DIR}/{run_id}"
+    request_path = f"{record_dir}/{REQUEST_FILE}" if request else None
 
     stages = []
     for sid in in_row:
@@ -1461,7 +1467,7 @@ def build_plan(pipeline: dict, record: dict, run_id: str, commands: dict | None 
         reads = []
         for name, optional in _read_names(stage):
             is_input = name in pipeline["inputs"]
-            path = None if is_input or name not in present else f"{record_dir}/{name}.json"
+            path = (request_path if name == "request" else None) if is_input else (f"{record_dir}/{name}.json" if name in present else None)
             reads.append({"name": name, "kind": "input" if is_input else "record", "path": path, "optional": optional})
         on_fail = stage.get("on_fail")
         if on_fail is not None and on_fail != "main" and on_fail not in in_row:
@@ -1495,6 +1501,7 @@ def build_plan(pipeline: dict, record: dict, run_id: str, commands: dict | None 
         "merge_base": record["merge_base"],
         "note": effective.note,
         "record_dir": record_dir,
+        "request": request_path,
         "stubs_dir": f"{record_dir}/{STUBS_DIR}",
         "commands": commands or {},
         "graft": graft,
@@ -1785,6 +1792,10 @@ def _render_review_record(d) -> list[str]:
     routes = _get(d, "routes", {})
     out += _section("Survivors for the builder", _get(routes, "builder"))
     out += _section("Survivors for the test-writer", _get(routes, "test-writer"))
+    if _get(routes, "planner") is not None:  # a record from before 0.5.0 has no such list
+        out += _section("Survivors for the planner", _get(routes, "planner"))
+    if _get(d, "panel_needed"):
+        out += _section("Findings that need the full panel", _get(d, "panel_needed"))
     out += _section("Gaps", d.get("gaps"), _gap_text)
     return out
 
@@ -1962,6 +1973,14 @@ def write_json_atomic(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.tmp")
     temp.write_text(json_text(data), encoding="utf-8")
+    os.replace(temp, path)
+
+
+def write_bytes_atomic(path: Path, data: bytes) -> None:
+    """Write `data` as it is, so that a reader sees the old file or the whole new one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.tmp")
+    temp.write_bytes(data)
     os.replace(temp, path)
 
 
@@ -2594,13 +2613,32 @@ def _supplied_provenance(root: Path, run_id: str, stage: dict, ledger: list[dict
     return []
 
 
+def reads_request(stage: dict) -> bool:
+    """Does this review stage compare something with the request? The spec review does: the stored request must be the one the run began with."""
+    return stage.get("kind", "agent") == "review" and any(name == "request" and not optional for name, optional in _read_names(stage))
+
+
+def request_problems(root: Path, run_id: str, ledger: list[dict]) -> list[str]:
+    """The run's request must be stored, and be the file `plan --intent --request-file` stored: the ledger holds its hash from before the file existed."""
+    path = run_dir(root, run_id) / REQUEST_FILE
+    entry = latest_entry(ledger, "request")
+    if entry is None:
+        return ["the run stored no request, so there is nothing to compare the spec with: start it with `plan --intent <intent> --request-file FILE`"]
+    if not path.is_file():
+        return [f"{rel_path(root, path)} is missing, though the ledger shows `plan --intent` storing it; start a new run with `plan --intent <intent> --request-file FILE`"]
+    if entry.get("record_sha256") != file_sha256(path):
+        return [f"{rel_path(root, path)} changed after `plan --intent` stored it (the ledger holds its hash from then); start a new run with `plan --intent <intent> --request-file FILE`"]
+    return []
+
+
 def provenance_problems(root: Path, run_id: str, stage: dict, run: Run | None, ledger: list[dict]) -> list[str]:
     """What is missing from the ledger for this stage's record to count: the agent that wrote it, the merge that built it,
-    or the intent that supplied it. The main session's own stages (intake, reduce) are traced elsewhere."""
+    or the intent that supplied it; for a review of something against the request, the request as stored. The main session's
+    own stages (intake, reduce) are traced elsewhere."""
     if run is not None and any(s["id"] == stage["id"] for s in run.supplied):
         return _supplied_provenance(root, run_id, stage, ledger)
     if stage.get("kind", "agent") == "review":
-        return _merge_provenance(root, run_id, stage, ledger)
+        return _merge_provenance(root, run_id, stage, ledger) + (request_problems(root, run_id, ledger) if reads_request(stage) else [])
     if stage.get("role") in (None, "main"):
         return []
     return _agent_provenance(root, run_id, stage, ledger)
@@ -2912,9 +2950,14 @@ class Evidence:
 
 
 def route_of(pipeline: dict, finding: dict) -> str:
-    """Who a surviving finding goes to: the test-writer for the tests lens and for a finding about a test file (the
-    builder works without the tests), the builder for the rest."""
-    return "test-writer" if finding["lens"] == TESTS_LENS or file_type(pipeline, os.path.normpath(finding["file"]).replace(os.sep, "/")) == TESTS_TYPE else "builder"
+    """Who a surviving finding goes to: the planner for the requirements lens and for a finding on the plan record (the spec is what is
+    wrong), the test-writer for the tests lens and for a finding about a test file (the builder works without the tests), the builder
+    for the rest."""
+    path = os.path.normpath(finding["file"]).replace(os.sep, "/")
+    plans = "|".join(re.escape(s["id"]) for s in pipeline["stage"] if s["record"] == "spec")
+    if finding["lens"] == REQUIREMENTS_LENS or (plans and re.search(rf"(^|/){re.escape(RUNS_DIR)}/[^/]+/(?:{plans})\.json$", path)):
+        return "planner"
+    return "test-writer" if finding["lens"] == TESTS_LENS or file_type(pipeline, path) == TESTS_TYPE else "builder"
 
 
 SEVERITIES = ("MINOR", "MAJOR", "BLOCKING")  # lowest first
@@ -3096,6 +3139,8 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
 
     # each part is what its agent left, and was made against the change as it is now
     ledger = read_ledger(root, run_id)
+    if reads_request(stage):
+        problems += request_problems(root, run_id, ledger)
     tree = worktree_tree(root)
     current = change_hash(root, run.merge_base, tree)
     parts = []
@@ -3187,7 +3232,7 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
         for f in findings
     ]
     by_id = {f["id"]: f for f in findings}
-    routes: dict[str, list[str]] = {"builder": [], "test-writer": []}
+    routes: dict[str, list[str]] = {"builder": [], "test-writer": [], "planner": []}
     for fid in survivors:
         routes[route_of(project.pipeline, by_id[fid])].append(fid)
     answers = sorted([*defenses, *screen_defenses], key=lambda d: (position[d["finding_id"]], d["defender"]))
@@ -3719,9 +3764,30 @@ def supplied_records(effective: EffectiveRow, spec_file: str | None) -> tuple[st
     return source, (None if problems else data), problems
 
 
-def start_run(project: Project, run_id: str, record: dict, effective: EffectiveRow, source: str | None, supplied: dict | None) -> list[str]:
-    """Begin a run: copy what the intent supplies, then write the intake record, which carries the intent.
-    The intake record goes last: a run has begun once it exists, and a start that failed halfway can be redone.
+def read_request(path_arg: str) -> bytes:
+    """The request a run is to store, as the bytes of the file: it must be there, be UTF-8 text, and say something."""
+    path = Path(path_arg).expanduser()
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        raise PlumblineError(f"--request-file {path_arg}: no such file") from None
+    except OSError as exc:
+        raise PlumblineError(f"--request-file {path_arg}: cannot read: {exc}") from None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise PlumblineError(f"--request-file {path_arg}: the request must be UTF-8 text") from None
+    if not text.strip():
+        raise PlumblineError(f"--request-file {path_arg}: the file is empty, so there is no request to store")
+    return data
+
+
+def start_run(
+    project: Project, run_id: str, record: dict, effective: EffectiveRow, source: str | None, supplied: dict | None, request: bytes | None = None
+) -> list[str]:
+    """Begin a run: copy what the intent supplies, store the request, then write the intake record, which carries the intent.
+    The ledger holds the hash of the request, as of the intake record, before its file exists. The intake record goes last: a run
+    has begun once it exists, and a start that failed halfway can be redone.
     Returns the reasons the run was not started (the run already began), or nothing."""
     root = project.root
     intake_stage = intake_stage_of(project.pipeline)
@@ -3740,6 +3806,10 @@ def start_run(project: Project, run_id: str, record: dict, effective: EffectiveR
         outcome = evaluate_stage(project, run_id, stage, run=run)
         if outcome.gate is not None:
             append_ledger(root, run_id, ledger_gate_entry(outcome))
+    if request is not None:
+        request_path = run_dir(root, run_id) / REQUEST_FILE
+        append_ledger(root, run_id, {"kind": "request", "record": rel_path(root, request_path), "record_sha256": hashlib.sha256(request).hexdigest()})
+        write_bytes_atomic(request_path, request)
     text = json_text(record)  # the ledger holds the intake record's hash, entered before the file exists: a start that stops between the two can be redone
     append_ledger(
         root, run_id,
@@ -3754,11 +3824,14 @@ def cmd_plan(args) -> int:
     project = _adopted_project(args.project) if starting else _ready_project(args.project)
     if args.spec and not starting:
         raise PlumblineError("--spec goes with --intent (the intent that supplies the spec)")
+    if args.request_file and not starting:
+        raise PlumblineError("--request-file goes with --intent (the run that stores the request)")
+    request = read_request(args.request_file) if args.request_file else None
     intent = args.intent or DEFAULT_INTENT
     run_id = check_run_id(args.run_id if args.run_id is not None else default_run_id(project.root))
     record = classify(project.root, project.pipeline, args.base, intent, args.row)
     effective = effective_row(project.pipeline, record["row"], intent)
-    plan = build_plan(project.pipeline, record, run_id, project.commands, project.graft_enabled)
+    plan = build_plan(project.pipeline, record, run_id, project.commands, project.graft_enabled, request is not None)
     if starting:
         source, supplied, problems = supplied_records(effective, args.spec)
         if problems:
@@ -3766,7 +3839,7 @@ def cmd_plan(args) -> int:
                 print(f"error: {problem}")
             print(f"plan: the spec for intent '{intent}' does not hold ({_plural(len(problems), 'problem')}); nothing was written")
             return 1
-        refused = start_run(project, run_id, record, effective, source, supplied)
+        refused = start_run(project, run_id, record, effective, source, supplied, request)
         if refused:
             for reason in refused:
                 print(f"plumbline: {reason}. Nothing was changed.", file=sys.stderr)
@@ -3847,8 +3920,9 @@ def route_lines(record: dict) -> list[str]:
     for who, note in (
         ("builder", "give the builder this text and nothing else"),
         ("test-writer", "the tests lens, and findings about test files: the builder never sees these"),
+        ("planner", "the requirements lens, and findings on the plan record: the spec is what is wrong"),
     ):
-        ids = record["routes"][who]
+        ids = record["routes"].get(who, [])
         if not ids:
             continue
         lines.append(f"surviving findings for the {who} ({note}):")
@@ -4260,6 +4334,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-id", metavar="ID", help="default: <short HEAD sha>-<UTC timestamp>")
     p.add_argument("--intent", metavar="ID", help="start the run with this intent: writes its intake record and copies the record the intent supplies")
     p.add_argument("--spec", metavar="FILE", help="the spec that an intent which supplies one (spec-supplied, fix) takes as the plan record")
+    p.add_argument("--request-file", metavar="FILE", help="the request, as text: stored in the run as request.md, with its hash in the ledger; the spec review compares the spec with it")
     p.add_argument("--row", metavar="ROW", help="declare the row (for example code.M) instead of measuring it: needed when nothing has changed yet")
     p.set_defaults(run=cmd_plan)
 

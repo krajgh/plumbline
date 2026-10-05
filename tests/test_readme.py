@@ -151,7 +151,7 @@ def test_the_readmes_default_rounds_and_gates_are_the_default_pipelines():
 
 def test_the_readme_gives_what_two_real_runs_cost_in_generic_terms_and_the_rounds_fit_the_pipeline():
     text = section("What a run costs")
-    assert "These are two real runs, so two data points and not an average: a feature of about 260 changed lines in a small Python CLI, size M, through all eight stages of the `code.M` row, and a fix of 43 changed lines in the same CLI, size S, through the `code.S` row under the `fix` intent" in text
+    assert "These are two real runs, so two data points and not an average: a feature of about 260 changed lines in a small Python CLI, size M, through the eight stages the `code.M` row had then (0.5.0 added a ninth, the spec review), and a fix of 43 changed lines in the same CLI, size S, through the `code.S` row under the `fix` intent" in text
     table = [[cell.strip() for cell in line.strip("| ").split("|")] for line in text.splitlines() if line.startswith("| ") and "---" not in line]
     rows = {row[0]: row[1:] for row in table if len(row) == 3}
     assert "| | Feature, size M | Fix, size S |" in text
@@ -162,7 +162,9 @@ def test_the_readme_gives_what_two_real_runs_cost_in_generic_terms_and_the_round
     assert "**The main session is the biggest spender.**" in text and "**The agents' output is a lower bound.**" in text and "`output_lower_bound`" in text
     assert "**There is no token cap.**" in text and "nothing bounds the main session" in text
     # what the numbers must agree with: the sizes are M and S, the rows have eight and seven stages, and no stage used more rounds than the pipeline allows it
-    assert pl.size_for(260, PIPELINE["sizes"]) == "M" and len(PIPELINE["matrix"]["code"]["M"]["stages"]) == 8
+    assert pl.size_for(260, PIPELINE["sizes"]) == "M" and [s for s in PIPELINE["matrix"]["code"]["M"]["stages"] if s != "spec-review"] == [
+        "intake", "plan", "tests", "test-review", "build", "verify", "review", "reduce"
+    ]  # the eight stages the run went through: the spec review came after it
     assert pl.size_for(43, PIPELINE["sizes"]) == "S" and len(PIPELINE["matrix"]["code"]["S"]["stages"]) == 7
     stages = {s["id"]: s for s in PIPELINE["stage"]}
     for column in rows["Rounds"]:
@@ -346,17 +348,18 @@ def test_the_exit_statuses_of_gate_and_of_a_pytest_run_are_the_codes_the_readme_
 
 
 @pytest.fixture
-def flow(repo, run_cli, run_stop):
+def flow(repo, run_cli, run_stop, tmp_path):
     """A refactor run through the real CLI and the real SubagentStop hook, from `plan --intent` to `pass`: every kind of ledger entry."""
     adopt_base(repo, commands={"test": CONTROLLED})
     write(repo / "src" / "retry.py", "def retry(url):\n    return url\n")
+    request = write(tmp_path / "request.md", "Restructure the retry helper without changing what it does.\n")
 
     def cli(*args):
         result = run_cli(*args, cwd=repo)
         assert result.returncode == 0, (args, result.stdout, result.stderr)
         return result
 
-    cli("plan", "--run-id", RUN, "--intent", "refactor", "--row", "code.S")
+    cli("plan", "--run-id", RUN, "--intent", "refactor", "--row", "code.S", "--request-file", str(request))
     run = repo / ".plumbline" / "runs" / RUN
     write(run / "build.json", json.dumps(build_note_record()))
     stop = run_stop(stop_payload(repo, "plumbline:builder", "built\nRECORD: .plumbline/runs/r1/build.json", agent_id="b-1"), repo)
@@ -378,7 +381,7 @@ def flow(repo, run_cli, run_stop):
 def test_the_ledger_table_names_every_kind_of_entry_a_run_writes_and_only_fields_the_entries_hold(flow):
     text = section("Runs, gates and the pass record").split("**The ledger**", 1)[1].split("**Provenance.**", 1)[0]
     table = {r[0].strip("`"): r for r in rows(text)}
-    assert set(table) == {entry["kind"] for entry in flow} == {"intake", "supplied", "agent", "merge", "run", "gate", "pass"}
+    assert set(table) == {entry["kind"] for entry in flow} == {"intake", "request", "supplied", "agent", "merge", "run", "gate", "pass"}
     nested = {key for entry in flow if entry["kind"] == "run" for command in entry["commands"] for key in command}
     assert nested == {"name", "cmd", "exit_code", "seconds"}  # `timed_out` and `junit` are written only where they apply (tested with the commands table)
     for kind, (_kind, written_by, holds) in table.items():

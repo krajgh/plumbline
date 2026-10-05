@@ -12,7 +12,7 @@ from helpers import commit_all, git, numbered, write
 from hookdata import bash_payload, denial
 from rundata import (
     FAILING, RUN, adopt, begin, build_note_record, change_of, genuine_pass, intake_record, ledger, put, put_part, read, review_record,
-    run_entry, run_path, spec_record, verify_record, write_docs_run, write_test_file, written_tests_record,
+    run_entry, run_path, spec_record, store_request, verify_record, write_docs_run, write_test_file, written_tests_record,
 )
 from samples import sample
 
@@ -339,7 +339,9 @@ def test_the_review_of_the_tests_is_not_compared_with_the_change_of_head(run_cli
     commit_all(adopted, "the tests")
     diff = change_of(adopted)
     put(adopted, "intake", intake_record("code.M", adopted))
+    store_request(adopted)
     put(adopted, "plan", spec_record())
+    put(adopted, "spec-review", review_record(target="plan", diff=hashlib.sha256(b"the change before the build").hexdigest()))
     put(adopted, "tests", written_tests_record())
     run_entry(adopted, "tests", None, exit_code=1, cmd=FAILING)
     put(adopted, "test-review", review_record(target="tests", diff=hashlib.sha256(b"the change before the build").hexdigest()))

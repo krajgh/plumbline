@@ -8,8 +8,8 @@ import pytest
 import plumbline as pl
 from helpers import REPO, commit_all, git
 from rundata import (
-    CONTROLLED, RUN, adopt, build_note_record, change_of, intake_record, put, read, review_record, run_entry, run_path, spec_record, verify_record,
-    write_test_file, written_tests_record,
+    CONTROLLED, RUN, adopt, build_note_record, change_of, intake_record, put, read, review_record, run_entry, run_path, spec_record, store_request,
+    verify_record, write_test_file, written_tests_record,
 )
 from samples import sample
 from test_manifests import between, frontmatter
@@ -130,7 +130,9 @@ def test_each_review_stage_adds_its_findings_and_gaps_with_its_own_stage_id(adop
     commit_all(adopted, "the tests")
     diff = change_of(adopted)
     put(adopted, "intake", intake_record("code.M", adopted))
+    store_request(adopted)
     put(adopted, "plan", spec_record())
+    put(adopted, "spec-review", review_leaving(diff, [finding("requirements-1", "MINOR", lens="requirements", file=".plumbline/runs/r1/request.md", line=1)], ["requirements-1"], [], target="plan"))
     put(adopted, "tests", written_tests_record())
     run_entry(adopted, "tests", None, RUN, exit_code=1)
     put(adopted, "test-review", review_leaving(diff, [finding("tests-1", "MAJOR", lens="tests", file="tests/test_app.py", line=3)], ["tests-1"], [gap("G-1")], target="tests"))
@@ -141,7 +143,7 @@ def test_each_review_stage_adds_its_findings_and_gaps_with_its_own_stage_id(adop
     result = run_cli("pass", RUN, cwd=adopted)
     assert result.returncode == 0, result.stdout
     record = read(adopted, "reduce")
-    assert [(f["stage"], f["id"]) for f in record["open_findings"]] == [("test-review", "tests-1"), ("review", "correctness-2")]
+    assert [(f["stage"], f["id"]) for f in record["open_findings"]] == [("spec-review", "requirements-1"), ("test-review", "tests-1"), ("review", "correctness-2")]
     assert [(g["stage"], g["id"]) for g in record["gaps"]] == [("test-review", "G-1"), ("review", "G-2")]
 
 
@@ -319,6 +321,7 @@ def test_the_run_skill_says_how_a_follow_up_starts_from_the_open_findings():
     assert "Its failure scenario is the bug report" in text and "`plan --intent fix`" in text
     assert "**Gaps of the kinds `missing_test` and `uncovered_ac`** become a change of the `tests` row" in text and "`--row tests`" in text
     assert "**The request names where it came from**: the run id and the ids of the findings or gaps it takes up" in text
+    assert "Write it to the request file (section 3), so that the new run's `request.md` shows its origin" in text
     assert "what the run leaves open: the surviving findings that are not BLOCKING and the detective's gaps (`PLUMBLINE open`, section 8)" in between(run_skill(), "## 7. Reduce", "## 8.")
 
 
@@ -338,7 +341,7 @@ def test_the_readme_documents_the_open_command_the_pass_records_lists_and_the_fo
     for needed in (
         "which git ignores", "`open_findings`, each surviving finding that is not BLOCKING, of every review stage", "`gaps`, the detective's gaps", "A pass record from before 0.5.0 has neither",
         "`open: 3 findings, 4 gaps; `plumbline.py open` lists them`", "a finding that describes a failure becomes a `fix` run, one finding per run, with its failure scenario as the bug report",
-        "test gaps become a change of the `tests` row", "the request names the run and the finding ids",
+        "test gaps become a change of the `tests` row", "the request names the run and the finding ids, so that the new run's `request.md` shows where it came from",
     ):
         assert needed in paragraph, needed
     assert "start a follow-up run from the open findings" in section("Skills")

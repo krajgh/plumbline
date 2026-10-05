@@ -33,8 +33,8 @@ def test_the_default_pipeline_has_the_five_intents_of_the_spec_and_validates():
     assert intents["feature"] == {"skip": []}
     assert intents["spec-supplied"] == {"skip": ["plan"], "supplies": ["plan"]}
     assert intents["fix"] == {"skip": ["plan"], "supplies": ["plan"], "gates": {"tests": "reproduces_on_head"}}
-    assert intents["refactor"] == {"skip": ["plan", "tests", "test-review"], "supplies": ["plan"], "lenses": ["correctness", "boundaries"]}
-    assert intents["review-only"] == {"skip": ["plan", "tests", "test-review", "build"]}
+    assert intents["refactor"] == {"skip": ["plan", "spec-review", "tests", "test-review"], "supplies": ["plan"], "lenses": ["correctness", "boundaries"]}  # the shipped template spec has no request to be compared with
+    assert intents["review-only"] == {"skip": ["plan", "spec-review", "tests", "test-review", "build"]}  # nothing is planned: the spec review would read a plan that is not there
     errors, notes = pl.validate_pipeline(default_pipeline())
     assert errors == []
     assert notes == []  # the intents add no notes, and the rows that have no build stage say where a failure goes
@@ -100,7 +100,7 @@ def test_a_bad_intent_is_an_error_naming_the_intent(mutate, expected):
 def test_every_row_is_checked_against_every_intent_not_only_the_first():
     errors, _ = check(lambda d: d["intent"]["fix"].pop("supplies"))
     rows = {e.split("row '")[1].split("'")[0] for e in errors if e.startswith("intent 'fix', row")}
-    assert rows == {"code.S", "code.M"}  # the rows that include the tests stage; docs, config, tests and code.L do not
+    assert rows == {"code.S", "code.M", "code.L"}  # the rows that include the tests stage or the spec review, which read the plan; docs, config and tests do not
 
 
 def test_an_intent_may_omit_skip_and_a_pipeline_may_define_none():
@@ -122,7 +122,7 @@ def test_a_stage_that_is_missing_from_a_row_is_not_an_error_when_the_intent_skip
 def test_the_effective_row_applies_skip_supplies_gates_and_lenses():
     pipeline = default_pipeline()
     fix = pl.effective_row(pipeline, "code.M", "fix")
-    assert fix.stages == ["intake", "tests", "test-review", "build", "verify", "review", "reduce"]
+    assert fix.stages == ["intake", "spec-review", "tests", "test-review", "build", "verify", "review", "reduce"]
     assert (fix.supplied, fix.gates, fix.lenses) == (["plan"], {"tests": "reproduces_on_head"}, None)
     refactor = pl.effective_row(pipeline, "code.M", "refactor")
     assert refactor.stages == ["intake", "build", "verify", "review", "reduce"]
@@ -194,14 +194,14 @@ def started(run_cli, repo, *args, run_id="r1"):
 def test_plan_without_an_intent_is_the_feature_plan_and_writes_nothing(run_cli, code_m):
     plan = started(run_cli, code_m)
     assert plan["intent"] == "feature" and plan["supplied"] == []
-    assert stage_ids(plan) == ["intake", "plan", "tests", "test-review", "build", "verify", "review", "reduce"]
+    assert stage_ids(plan) == ["intake", "plan", "spec-review", "tests", "test-review", "build", "verify", "review", "reduce"]
     assert not (code_m / ".plumbline").exists()
 
 
 def test_feature_starts_a_run_with_the_planner_and_writes_the_intake_record_carrying_the_intent(run_cli, code_m):
     plan = started(run_cli, code_m, "--intent", "feature")
     assert plan["intent"] == "feature" and plan["supplied"] == []
-    assert stage_ids(plan) == ["intake", "plan", "tests", "test-review", "build", "verify", "review", "reduce"]
+    assert stage_ids(plan) == ["intake", "plan", "spec-review", "tests", "test-review", "build", "verify", "review", "reduce"]
     intake = read(code_m, "intake")
     assert pl.check_record("change_class", intake) == []
     assert (intake["intent"], intake["row"]) == ("feature", "code.M")
@@ -212,7 +212,7 @@ def test_spec_supplied_skips_the_planner_and_copies_the_spec_as_the_plan_record(
     given = spec_record()
     plan = started(run_cli, code_m, "--intent", "spec-supplied", "--spec", spec_file(code_m, given))
     assert plan["intent"] == "spec-supplied"
-    assert stage_ids(plan) == ["intake", "tests", "test-review", "build", "verify", "review", "reduce"]
+    assert stage_ids(plan) == ["intake", "spec-review", "tests", "test-review", "build", "verify", "review", "reduce"]
     assert plan["supplied"] == [{"stage": "plan", "record": "spec", "path": ".plumbline/runs/r1/plan.json", "source": SPEC}]
     assert read(code_m, "plan") == given  # validated, then copied as it is
     assert read(code_m, "intake")["intent"] == "spec-supplied"
@@ -224,7 +224,7 @@ def test_spec_supplied_skips_the_planner_and_copies_the_spec_as_the_plan_record(
 def test_fix_skips_the_planner_supplies_a_one_criterion_spec_and_replaces_the_tests_gate(run_cli, code_m):
     given = fix_spec()
     plan = started(run_cli, code_m, "--intent", "fix", "--spec", spec_file(code_m, given))
-    assert stage_ids(plan) == ["intake", "tests", "test-review", "build", "verify", "review", "reduce"]
+    assert stage_ids(plan) == ["intake", "spec-review", "tests", "test-review", "build", "verify", "review", "reduce"]
     tests = next(s for s in plan["stages"] if s["id"] == "tests")
     assert tests["gate"] == "reproduces_on_head"
     assert next(s for s in plan["stages"] if s["id"] == "verify")["gate"] == "verify_green"  # the others keep their own
@@ -412,7 +412,7 @@ def test_a_declared_row_stands_in_for_a_change_that_does_not_exist_yet(run_cli, 
     adopt_base(repo)
     plan = started(run_cli, repo, "--intent", "feature", "--row", "code.M")
     assert (plan["row"], plan["size"], plan["lines"], plan["types"]) == ("code.M", "M", 0, ["code"])
-    assert stage_ids(plan) == ["intake", "plan", "tests", "test-review", "build", "verify", "review", "reduce"]
+    assert stage_ids(plan) == ["intake", "plan", "spec-review", "tests", "test-review", "build", "verify", "review", "reduce"]
     intake = read(repo, "intake")
     assert intake["files"] == [] and intake["notes"] == ["nothing has changed yet, so the row code.M was declared, not measured"]
     assert pl.check_record("change_class", intake) == []

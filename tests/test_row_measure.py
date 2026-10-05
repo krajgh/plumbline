@@ -63,13 +63,13 @@ def test_a_source_change_declared_as_docs_is_refused_with_the_stages_it_lacks(ru
     assert "the change measures as code.S, which selects plan, tests, build; run 'r1' (row docs) has no such stages: start a new run for this row (`plan --intent feature --row code.S`)" in result.stdout
 
 
-def test_a_change_that_measures_as_m_needs_the_test_review_a_code_s_run_lacks(run_cli, adopted):  # C-01
+def test_a_change_that_measures_as_m_needs_the_spec_review_and_the_test_review_a_code_s_run_lacks(run_cli, adopted):  # C-01
     plan(run_cli, adopted, "feature", "code.S")
     write(adopted / "src" / "new_module.py", numbered(100))
     commit_all(adopted, "100 lines")
     result = pass_of(run_cli, adopted)
     assert result.returncode == 1
-    assert "the change measures as code.M, which selects test-review; run 'r1' (row code.S) has no such stage: start a new run for this row (`plan --intent feature --row code.M`)" in result.stdout
+    assert "the change measures as code.M, which selects spec-review, test-review; run 'r1' (row code.S) has no such stages: start a new run for this row (`plan --intent feature --row code.M`)" in result.stdout
 
 
 def test_the_row_is_measured_against_the_intent_so_a_review_only_run_needs_only_its_own_stages(run_cli, adopted):
@@ -178,8 +178,8 @@ def test_check_diff_of_a_run_names_the_stages_a_larger_measured_row_selects_and_
     write(adopted / "src" / "new_module.py", numbered(100))
     result, data = check_diff(run_cli, adopted)
     assert result.returncode == 1
-    assert data["row"] == {"declared": "code.S", "measured": "code.M", "missing_stages": ["test-review"]}
-    assert any("the change measures as code.M, which selects test-review" in p for p in data["problems"])
+    assert data["row"] == {"declared": "code.S", "measured": "code.M", "missing_stages": ["spec-review", "test-review"]}
+    assert any("the change measures as code.M, which selects spec-review, test-review" in p for p in data["problems"])
     assert data["checks"] == {"symlinks": True, "abs_paths": True, "secrets": True}  # the verifier's record copies these three, and only these
 
 

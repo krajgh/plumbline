@@ -4,6 +4,7 @@ ledger, and the per-agent records of a review unit. Plain helpers, no fixtures.
 A record that an agent wrote is traced in the ledger by the SubagentStop hook (the agent's entry, with the record's
 hash), and a merged review by `merge-review`. `put` and `put_part` write those entries the way the hook and the
 command do, so that a stage's record counts; `agent=False` writes the file alone, as a hand-written record would be."""
+import hashlib
 import json
 from pathlib import Path
 
@@ -129,8 +130,18 @@ def put(repo, stage_id, data, run_id=RUN, agent=True) -> Path:
             )
         elif stage_id in STAGE_ROLES:
             agent_stopped(repo, stage_id, path, STAGE_ROLES[stage_id], STAGE_RECORDS[stage_id], valid=not pl.check_record(STAGE_RECORDS[stage_id], data), run_id=run_id)
-        elif stage_id in ("review", "test-review"):
+        elif stage_id in ("review", "test-review", "spec-review"):
             merged(repo, stage_id, path, data.get("round", 1), run_id)
+    return path
+
+
+def store_request(repo, text="Do what the builder asked.\n", run_id=RUN) -> Path:
+    """Store the run's request as `plan --intent --request-file` does: its hash in the ledger, then the file."""
+    path = run_path(repo, run_id, "request.md")
+    data = text.encode("utf-8")
+    pl.append_ledger(repo, run_id, {"kind": "request", "record": pl.rel_path(repo, path), "record_sha256": hashlib.sha256(data).hexdigest()})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
     return path
 
 

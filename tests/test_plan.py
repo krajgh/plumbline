@@ -7,7 +7,7 @@ import pytest
 import plumbline as pl
 from helpers import numbered, write
 
-CODE_M_STAGES = ["intake", "plan", "tests", "test-review", "build", "verify", "review", "reduce"]
+CODE_M_STAGES = ["intake", "plan", "spec-review", "tests", "test-review", "build", "verify", "review", "reduce"]
 
 
 def plan(run_cli, repo, *extra, run_id="demo"):
@@ -35,7 +35,7 @@ def docs_only(repo):
     return repo
 
 
-def test_code_m_lists_the_eight_stages_in_order_with_record_paths(run_cli, code_m):
+def test_code_m_lists_the_nine_stages_in_order_with_record_paths(run_cli, code_m):
     p = plan(run_cli, code_m)
     assert (p["row"], p["size"], p["lines"]) == ("code.M", "M", 100)
     assert [s["id"] for s in p["stages"]] == CODE_M_STAGES
@@ -45,6 +45,7 @@ def test_code_m_lists_the_eight_stages_in_order_with_record_paths(run_cli, code_
     assert [(s["id"], s["record"]) for s in p["stages"]] == [
         ("intake", "change_class"),
         ("plan", "spec"),
+        ("spec-review", "review_record"),
         ("tests", "tests_record"),
         ("test-review", "review_record"),
         ("build", "build_note"),
@@ -68,6 +69,20 @@ def test_every_stage_carries_role_or_kind_gate_on_fail_max_rounds_and_lenses(run
     assert review["lenses"] == ["correctness", "tests", "security", "data", "boundaries"]  # code.M sets no lenses
     assert (review["target"], review["defenders"], review["survive_if_unrefuted_by"], review["detective"]) == ("diff", 3, 2, True)
     assert (stage(p, "verify")["on_fail"], stage(p, "verify")["max_rounds"]) == ("build", 3)
+
+
+def test_the_spec_review_reads_the_request_and_the_plan_and_is_defined_as_the_brief_says(run_cli, code_m):
+    p = plan(run_cli, code_m)
+    review = stage(p, "spec-review")
+    assert (review["kind"], review["role"], review["target"], review["lenses"]) == ("review", None, "plan", ["requirements"])
+    assert (review["defenders"], review["survive_if_unrefuted_by"], review["screen_defenders"], review["detective"]) == (3, 2, 1, False)
+    assert (review["gate"], review["on_fail"], review["max_rounds"]) == ("no_surviving_blockers", "plan", 2)
+    assert review["reads"] == [
+        {"name": "request", "kind": "input", "path": None, "optional": False},  # no request file was given: nothing is stored
+        {"name": "plan", "kind": "record", "path": ".plumbline/runs/demo/plan.json", "optional": False},
+    ]
+    assert p["request"] is None
+    assert [s["id"] for s in p["stages"]].index("spec-review") == [s["id"] for s in p["stages"]].index("plan") + 1  # directly after plan
 
 
 def test_reads_are_resolved_to_record_paths(run_cli, code_m):
@@ -148,11 +163,11 @@ def test_the_test_review_stage_keeps_its_own_lenses_in_every_row(run_cli, code_m
     assert stage(plan(run_cli, code_m), "test-review")["lenses"] == ["tests"]
 
 
-def test_code_l_runs_only_intake_and_plan_and_carries_the_note(run_cli, repo):
+def test_code_l_runs_only_intake_plan_and_the_review_of_the_spec_and_carries_the_note(run_cli, repo):
     write(repo / "src" / "big.py", numbered(500))
     p = plan(run_cli, repo)
     assert p["row"] == "code.L"
-    assert [s["id"] for s in p["stages"]] == ["intake", "plan"]
+    assert [s["id"] for s in p["stages"]] == ["intake", "plan", "spec-review"]
     assert "split into changes of size M or smaller" in p["note"]
 
 
