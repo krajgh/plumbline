@@ -184,6 +184,7 @@ REVIEW_FILE_NAMES = {
     "canary": ("prosecutor-<lens>-b.json", "canary-key.json"),
 }
 CANARY_KEY_FILE = "canary-key.json"  # in the round directory of a calibration run: what tells the canary's finding from the others, which the defenders do not read
+CANARY_PROMPT = "agents/canary.md"  # the plugin's own prompt for the canary, which says how the canary names its record: the defenders do not read it either
 LEDGER_NAME = "ledger.jsonl"  # a run's ledger names the agent that wrote each record, so it tells the canary's record too: the defenders do not read it either
 # A command of the main session concerns plumbline besides git and gh only if it mentions one of these.
 CARES = re.compile(r"plumbline|override|ledger")
@@ -1615,7 +1616,7 @@ def bash_reason(data: dict) -> str | None:
 
     rules = [(override_reason, pl, steps)]
     if role is not None:
-        rules += [(role_command_reason, pl, role, steps, Path(cwd)), (canary_command_reason, pl, role, steps, Path(cwd))]
+        rules += [(role_command_reason, pl, role, steps, Path(cwd)), (canary_command_reason, pl, role, steps, Path(cwd), data)]
     rules += [(protected_command_reason, pl, steps), (gate_reason, pl, command, Path(cwd), steps)]
     for rule in rules:
         reason = _guarded(*rule)
@@ -1906,8 +1907,10 @@ def builder_reason(data: dict) -> str | None:
 #
 # A calibration run plants a false finding, the canary's, in a record that a prosecutor's cannot be told from, and the key to it (canary-key.json) lies in the
 # round directory: nothing else says which finding is the canary's, except the run's ledger, which names the agent that wrote each record. A defender that read
-# either would be answering the key and not the code, so a defender's Read, Grep, Glob and Bash do not reach them. The rules look only where a key exists: no key,
-# no calibration run, and nothing here changes what a defender does.
+# either would be answering the key and not the code, so a defender's Read, Grep, Glob and Bash do not reach them. The plugin's own prompt for the canary
+# (agents/canary.md, wherever a copy of the plugin lies: any path that ends so) and the agent transcripts (under `projects` in the directories of Claude Code, where
+# the canary's shows its brief) tell the same, and are out of reach the same way. The rules look only where a key exists: no key, no calibration run, and nothing
+# here changes what a defender does.
 
 
 def canary_files(root: Path) -> list[Path]:
@@ -1921,11 +1924,12 @@ def canary_files(root: Path) -> list[Path]:
 
 
 def shows_canary_file(hidden: list[Path], target: Path) -> Path | None:
-    """The first of the hidden files that reading or searching `target` would show: the file itself, or a directory it lies in, at any depth."""
+    """The first of the hidden files that reading or searching `target` would show: the file itself, or a directory it lies in, at any depth; for a hidden
+    directory (the transcripts'), a path below it too."""
     for candidate in dict.fromkeys((target, Path(os.path.realpath(target)))):
         for key in hidden:
             for real in dict.fromkeys((key, Path(os.path.realpath(key)))):
-                if candidate == real or candidate in real.parents:
+                if candidate == real or candidate in real.parents or real in candidate.parents:
                     return key
     return None
 
@@ -1935,9 +1939,38 @@ def names_canary_file(text: str) -> bool:
     return any(name in text.lower() for name in (CANARY_KEY_FILE, LEDGER_NAME))
 
 
+def names_canary_source(text: str) -> bool:
+    """Does this word, or this glob pattern, name the plugin's prompt for the canary (a path that ends in agents/canary.md, or its file name alone: a pattern has no
+    directory to say) or an agent transcript (a path through `.claude/projects`)?"""
+    low = text.lower().replace("\\", "/")
+    return Path(CANARY_PROMPT).name in low or ".claude/projects" in low
+
+
+def reads_canary_source(target: Path) -> bool:
+    """Is this path, or where it leads, the plugin's prompt for the canary (any path that ends in agents/canary.md) or under `.claude/projects`, where Claude Code keeps
+    the agent transcripts, wherever the home directory is?"""
+    return any(
+        posix.endswith(f"/{CANARY_PROMPT}") or posix == CANARY_PROMPT or TRANSCRIPTS.search(posix) is not None
+        for posix in (Path(path).as_posix().lower() for path in dict.fromkeys((target, Path(os.path.realpath(target)))))
+    )
+
+
+def canary_sources(pl, data: dict | None = None) -> list[Path]:
+    """What else a defender reads to tell the canary's record from the others, where a calibration run has a canary key: the plugin's own prompt for the canary, and the
+    agent transcripts, which lie under `projects` in the directories of Claude Code (~/.claude, $CLAUDE_CONFIG_DIR, and the one the session's transcript is in)."""
+    return [Path(os.path.realpath(pl.PLUGIN_ROOT / "agents" / "canary.md")), *(directory / "projects" for directory in _claude_dirs(data or {}))]
+
+
 def _key_message(what: str) -> str:
     return (
         f"plumbline: {what} would show a file that a defender answers without: the run keeps its own key to the round there, and its own ledger. "
+        "Read the findings records of the round and the code, and search a directory of source, for example src/."
+    )
+
+
+def _source_message(what: str) -> str:
+    return (
+        f"plumbline: {what} would show how the records of the round were written, which a defender answers without. "
         "Read the findings records of the round and the code, and search a directory of source, for example src/."
     )
 
@@ -1962,14 +1995,18 @@ def defender_reason(data: dict) -> str | None:
         base = _join(here, named) if isinstance(named, str) and named.strip() else here  # a search without a path starts where the agent is
         pattern = tool_input.get("pattern") if tool == "Glob" and isinstance(tool_input.get("pattern"), str) else None
         target, shown = (_join(base, _static_prefix(pattern)) if pattern else base), f"a {tool} of {named if isinstance(named, str) and named.strip() else 'the working directory'}"
-        if pattern and names_canary_file(pattern) and any(canary_files(root) for root in adopted_roots(pl, anchors_of(here, base))):
-            return _key_message(f"a Glob for {pattern}")
+        if pattern and (names_canary_file(pattern) or names_canary_source(pattern)) and any(canary_files(root) for root in adopted_roots(pl, anchors_of(here, base))):
+            return (_key_message if names_canary_file(pattern) else _source_message)(f"a Glob for {pattern}")
     else:
         return None
     for root in adopted_roots(pl, anchors_of(here, target)):
         hidden = canary_files(root)
-        if hidden and shows_canary_file(hidden, target):
+        if not hidden:
+            continue
+        if shows_canary_file(hidden, target):
             return _key_message(shown)
+        if reads_canary_source(target) or shows_canary_file(canary_sources(pl, data), target):
+            return _source_message(shown)
     return None
 
 
@@ -1977,18 +2014,22 @@ RECURSIVE_GREP = re.compile(r"-[A-Za-z]*[rR][A-Za-z]*|--recursive|--dereference-
 RG_UNFILTERED = {"-u", "-uu", "-uuu", "--no-ignore", "--no-ignore-vcs", "--no-ignore-dot", "--no-ignore-parent", "--hidden", "-."}  # ripgrep skips what git ignores, and dot directories, without these
 
 
-def canary_command_reason(pl, role: str, steps: list["Step"], cwd: Path) -> str | None:
-    """A defender's Bash does not reach a canary key or the ledger beside it: a word that names one, or a search tool whose operands (a glob counts as what it
-    matches, and a recursive search with no operand as the directory it runs in) take in the file or a directory that holds it."""
+def canary_command_reason(pl, role: str, steps: list["Step"], cwd: Path, data: dict | None = None) -> str | None:
+    """A defender's Bash does not reach a canary key or the ledger beside it, nor the plugin's prompt for the canary or the agent transcripts: a word that names
+    one, or a search tool whose operands (a glob counts as what it matches, and a recursive search with no operand as the directory it runs in) take in the file
+    or a directory that holds it."""
     if role != "defender":
         return None
     for root in adopted_roots(pl, anchors_of(cwd, *_anchor_paths(steps))):
         hidden = canary_files(root)
         if not hidden:
             continue
+        sources = canary_sources(pl, data)
         for step in steps:
             if any(names_canary_file(word) for word in step.raw):
                 return _key_message(f"`{' '.join(step.raw)[:100]}`")
+            if any(names_canary_source(word) for word in step.raw):
+                return _source_message(f"`{' '.join(step.raw)[:100]}`")
             name = os.path.basename(step.argv[0]) if step.argv else ""
             if name not in SEARCH_TOOLS:
                 continue
@@ -2007,6 +2048,8 @@ def canary_command_reason(pl, role: str, steps: list["Step"], cwd: Path) -> str 
             for target in paths or ([step.cwd] if implicit else []):
                 if shows_canary_file(hidden, target):
                     return _key_message(f"`{' '.join(step.raw)[:100]}`")
+                if reads_canary_source(target) or shows_canary_file(sources, target):
+                    return _source_message(f"`{' '.join(step.raw)[:100]}`")
     return None
 
 

@@ -322,6 +322,117 @@ def test_a_defender_cannot_read_the_ledger_either_because_it_names_the_agent_of_
         assert read_as(keyed, other, "Read", file_path=str(ledger_path(keyed))) is None, other
 
 
+# --- the plugin's own prompt for the canary and the agent transcripts say as much as the key does: a defender reads neither
+
+PROMPT = REPO / "agents" / "canary.md"
+TRANSCRIPT = Path.home() / ".claude" / "projects" / "slug" / "agent-x.jsonl"
+
+
+@pytest.fixture
+def claude_dir(keyed, home):
+    """The keyed calibration run, with a Claude Code directory in the throw-away home: a transcript under `projects`, the settings and a plugins folder beside it."""
+    write(home / ".claude" / "projects" / "slug" / "agent-x.jsonl", "{}\n")
+    write(home / ".claude" / "settings.json", "{}\n")
+    (home / ".claude" / "plugins").mkdir()
+    return keyed
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        str(PROMPT), "agents/canary.md", "/opt/plugins/cache/plumbline/0.5.0/agents/canary.md", "/x/AGENTS/CANARY.MD",  # the prompt, wherever a copy of the plugin lies, even where there is none
+        str(TRANSCRIPT), "/somewhere/else/.claude/projects/slug/sess/subagents/agent-1.jsonl", str(Path.home() / ".claude" / "projects"), "~/.claude/projects/x.jsonl",
+    ],
+)
+def test_a_defender_cannot_read_the_plugins_prompt_for_the_canary_or_an_agent_transcript(keyed, path):
+    denied = read_as(keyed, "defender", "Read", file_path=path)
+    assert denied and "would show how the records of the round were written, which a defender answers without" in denied, path
+
+
+def test_a_defender_cannot_read_them_through_a_link_or_where_the_session_keeps_its_transcripts(keyed, tmp_path, monkeypatch):
+    (keyed / "prompt.md").symlink_to(PROMPT)
+    assert read_as(keyed, "defender", "Read", file_path=str(keyed / "prompt.md"))  # where a link leads is what counts
+    elsewhere = tmp_path / "state" / "projects" / "slug"
+    write(elsewhere / "agent-9.jsonl", "{}\n")
+    (keyed / "history.jsonl").symlink_to(elsewhere / "agent-9.jsonl")
+    assert read_as(keyed, "defender", "Read", file_path=str(keyed / "history.jsonl")) is None  # a link into a directory that is called `projects` and is no Claude Code directory is no transcript
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "state"))
+    assert read_as(keyed, "defender", "Read", file_path=str(elsewhere / "agent-9.jsonl"))  # $CLAUDE_CONFIG_DIR/projects is where they lie, if it is set
+    assert read_as(keyed, "defender", "Grep", pattern="x", path=str(tmp_path / "state"))  # and the directory that holds it
+
+
+def test_a_defender_cannot_search_or_list_a_directory_that_holds_them(keyed):
+    for path in (str(PROMPT.parent), str(REPO), str(Path.home() / ".claude"), str(Path.home() / ".claude" / "projects"), str(Path.home()), "/"):
+        assert read_as(keyed, "defender", "Grep", pattern="canary", path=path), path
+        assert read_as(keyed, "defender", "Glob", pattern="*.md", path=path), path
+    for pattern in ("**/canary.md", "**/agents/canary.md", "**/AGENTS/CANARY.md", "**/.claude/projects/**/*.jsonl", ".claude/projects/**"):
+        assert read_as(keyed, "defender", "Glob", pattern=pattern, path="src"), pattern
+
+
+def test_a_defender_can_still_read_the_plugins_schemas_and_the_source_beside_them(keyed):
+    assert read_as(keyed, "defender", "Read", file_path=str(REPO / "schemas" / "defense_record.json")) is None  # its prompt tells it to read the schema of its record
+    assert read_as(keyed, "defender", "Grep", pattern="verdict", path=str(REPO / "schemas")) is None
+    assert read_as(keyed, "defender", "Read", file_path=str(REPO / "agents" / "defender.md")) is None
+    assert read_as(keyed, "defender", "Read", file_path=str(Path.home() / ".claude" / "settings.json")) is None  # a file beside the transcripts, and no transcript
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat agents/canary.md", "head -5 /opt/plugins/plumbline/agents/canary.md", "grep -n named agents/canary.md", f"cat {PROMPT}", "wc -l agents/canary.md",
+        "cat ~/.claude/projects/slug/agent-x.jsonl", "ls ~/.claude/projects", "ls ~/.claude", "ls -R ~/.claude", "grep -rn brief ~/.claude", "grep -r x ~/.claude/projects/slug",
+        "find ~/.claude -name '*.jsonl'", "cd ~/.claude && ls projects", "cd ~/.claude/projects && cat slug/agent-x.jsonl", "rg brief ~/.claude/projects", "rg -uu brief ~",
+        "tail -n 3 /ho" + "me/other/.claude/projects/s/a.jsonl", "echo $(cat agents/canary.md)", "cat agents/canary.md > /dev/null",
+    ],
+)
+def test_a_defenders_bash_does_not_reach_the_plugins_prompt_for_the_canary_or_the_transcripts(claude_dir, command):
+    denied = bash_as(claude_dir, command)
+    assert denied and "would show how the records of the round were written, which a defender answers without" in denied, command
+
+
+@pytest.mark.parametrize("command", ["cat ~/.claude/settings.json", "ls ~/.claude/plugins", "cat agents/defender.md", "grep -n verdict schemas/defense_record.json", "grep -rn retry src/", "git log --oneline"])
+def test_a_defenders_bash_still_reads_what_is_beside_them(claude_dir, command):
+    assert bash_as(claude_dir, command) is None, command
+
+
+def test_the_denial_names_only_what_the_defender_named_and_says_nothing_of_a_canary(keyed):
+    named = [
+        (str(PROMPT), read_as(keyed, "defender", "Read", file_path=str(PROMPT))),
+        (str(TRANSCRIPT), read_as(keyed, "defender", "Read", file_path=str(TRANSCRIPT))),
+        ("~/.claude/projects", bash_as(keyed, "ls ~/.claude/projects")),
+        ("**/canary.md", read_as(keyed, "defender", "Glob", pattern="**/canary.md")),
+        ("agents/canary.md", bash_as(keyed, "cat agents/canary.md")),
+    ]
+    for said, reason in named:
+        assert reason and "canary" not in reason.replace(said, "").replace("agents/canary.md", "").replace("canary.md", "").lower(), (said, reason)
+
+
+def test_the_other_roles_and_the_main_session_read_the_prompt_and_the_transcripts(keyed):
+    for role in ("prosecutor", "detective", "canary", "verifier", None):
+        assert read_as(keyed, role, "Read", file_path=str(PROMPT)) is None, role
+        assert read_as(keyed, role, "Read", file_path=str(TRANSCRIPT)) is None, role
+        assert bash_as(keyed, "cat agents/canary.md", role) is None, role
+
+
+def test_without_a_key_a_defender_reads_the_prompt_and_the_transcripts_as_before(ordinary):
+    file_findings(ordinary, [finding("correctness-1")])
+    assert read_as(ordinary, "defender", "Read", file_path=str(PROMPT)) is None and read_as(ordinary, "defender", "Read", file_path=str(TRANSCRIPT)) is None
+    assert read_as(ordinary, "defender", "Glob", pattern="**/canary.md") is None
+    for command in ("cat agents/canary.md", "ls ~/.claude/projects", "grep -r x ~/.claude"):
+        assert bash_as(ordinary, command) is None, command
+
+
+def test_a_defenders_prompt_does_not_send_it_to_either(keyed):
+    body = agent("defender")[1]
+    assert "canary.md" not in body and ".claude/projects" not in body  # what it is told to read is the findings records, the code, the spec and the schema of its record
+
+
+def test_the_hook_holds_a_defender_off_the_prompt_through_the_hook_process_too(run_pre, keyed):
+    payload = tool_payload(keyed, "Read", {"file_path": str(PROMPT)}, agent_type="plumbline:defender")
+    result = run_pre(payload, keyed)
+    assert "would show how the records of the round were written" in json.loads(result.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+
+
 def test_the_denial_says_nothing_of_a_canary(keyed):
     shown = []
     shown.append(read_as(keyed, "defender", "Read", file_path=str(key_path(keyed))))
@@ -806,7 +917,7 @@ def test_the_readme_explains_calibration_runs_the_eighth_agent_and_the_canarys_h
         "every review round that has defenders also gets a canary", "once the prosecutors have reported, `plumbline:canary` (Sonnet) reads what they filed and writes one plausible but false finding about the change, as a prosecutor would",
         "a lens of the round, an id numbered after that lens's own (`security-3`) and the severity MAJOR", "in a record named for a second prosecutor of that lens (`prosecutor-security-b.json`, beside `prosecutor-security.json`)",
         "`canary-key.json` (`{finding_id, why_false}`) in the round directory is the one file that says which finding is the canary's",
-        "defenders' brief lists the canary's record among the prosecutors' records and names neither it nor the key", "a defender's tools do not reach the key or the run's ledger",
+        "defenders' brief lists the canary's record among the prosecutors' records and names neither it nor the key", "a defender's tools do not reach the key, the run's ledger, the plugin's own prompt for the canary or the agent transcripts",
         "`merge-review` reads the key, takes out of the round the record that holds the finding it names, and never counts that finding in the survivors, the routes, the blockers or the open findings",
         "`canary` field of the review record", "`finding_id`, `refuted_by` (a refutation whose quote the change or the finding's file holds) and `conceded_by`", "canary: refuted by 2 of 3 defenders", "the pass record's notes",
         "A defender that concedes the canary is a rubber stamp",
@@ -827,10 +938,10 @@ def test_the_limits_the_readme_lists_for_the_canary_are_real_today(keyed):
     assert bash_as(keyed, f"P={key_path(keyed).parent}/canary-; cat ${{P}}key.json") is None  # the hook reads the words, and a path put together by the shell is none
     assert bash_as(keyed, f"P={ledger_path(keyed).parent}/led; cat ${{P}}ger.jsonl") is None
     assert bash_as(keyed, f"cat {key_path(keyed)}")  # while the plain spelling is held
-    assert "**What the plugin and the transcripts say.**" in limits and "`agents/canary.md` says that the canary names its record `prosecutor-<lens>-b.json`" in limits
-    assert "prosecutor-<lens>-b.json" in (REPO / "agents" / "canary.md").read_text(encoding="utf-8")
-    assert read_as(keyed, "defender", "Read", file_path=str(REPO / "agents" / "canary.md")) is None  # a defender that looks can read it
-    assert read_as(keyed, "defender", "Read", file_path=str(Path.home() / ".claude" / "projects" / "slug" / "agent-x.jsonl")) is None  # and the transcripts
+    assert "**What the plugin and the transcripts say.**" not in limits and "agents/canary.md" not in limits  # 0.5.1 closed it: the hook holds a defender off both
+    assert "prosecutor-<lens>-b.json" in (REPO / "agents" / "canary.md").read_text(encoding="utf-8")  # what a defender would learn there
+    assert read_as(keyed, "defender", "Read", file_path=str(REPO / "agents" / "canary.md"))
+    assert read_as(keyed, "defender", "Read", file_path=str(Path.home() / ".claude" / "projects" / "slug" / "agent-x.jsonl"))
     for name in ("prosecutor-correctness.json", f"{CANARY_STEM}.json"):
         record = json.loads(key_path(keyed).with_name(name).read_text(encoding="utf-8"))
         assert record["lens"] == "correctness" and "canary" not in json.dumps(record)  # what a defender reads of the findings: nothing tells the plant
