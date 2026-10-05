@@ -129,6 +129,84 @@ def test_a_glob_pattern_that_leaves_the_path_it_names_is_refused(started):
     assert glob(started, "*", inside / ".." / ".." / "..")  # the path itself leads out
 
 
+# --- the run's stubs directory and its junit files hold source and test output: inside the run's directory, and still out of the lane
+
+
+@pytest.fixture
+def with_output(started):
+    """Run r1 with what a run leaves besides records: a stub the test-writer wrote, and the junit reports of two measured test runs."""
+    write(run_dir(started) / "stubs" / "newmod.py", "def add(a, b):\n    return 0\n")
+    write(run_dir(started) / "stubs" / "pkg" / "deep.py", "x = 1\n")
+    write(run_dir(started) / "junit-tests.xml", '<testsuite tests="1"/>')
+    write(run_dir(started) / "junit-verify.xml", '<testsuite tests="1"/>')
+    return started
+
+
+@pytest.mark.parametrize("name", ["stubs", "stubs/newmod.py", "stubs/pkg/deep.py", "stubs/pkg", "stubs/not-there-yet.py", "junit-tests.xml", "junit-verify.xml", "junit-anything.xml"])
+def test_the_orchestrator_does_not_read_a_stub_or_a_junit_report_of_the_run(with_output, name):
+    reason = read(with_output, run_dir(with_output) / name)
+    assert reason and "leaves out its stubs directory and its junit-<stage>.xml files: they hold source and test output, which stay with the stage agents" in reason, name
+    assert read(with_output, f".plumbline/runs/r1/{name}")  # relative to the working directory
+
+
+def test_the_orchestrator_still_reads_the_records_the_ledger_and_the_round_directories_beside_them(with_output):
+    write(run_dir(with_output) / "review" / "round-1" / "junit-notes.xml", "<x/>")  # only the reports `gate` writes, in the run's directory, are the lane's concern
+    for name in ("intake.json", "ledger.jsonl", "review/round-1/junit-notes.xml", "stubs.json", "stubs-notes.md", "junit.xml", "junit-tests.json", "a-stubs/x.py"):
+        assert read(with_output, run_dir(with_output) / name) is None, name
+
+
+def test_the_message_names_what_was_reached(with_output):
+    assert read(with_output, run_dir(with_output) / "stubs" / "newmod.py").endswith("a Read of " + str(run_dir(with_output) / "stubs" / "newmod.py") + " reaches .plumbline/runs/r1/stubs/.")
+    assert read(with_output, run_dir(with_output) / "junit-tests.xml").endswith("reaches .plumbline/runs/r1/junit-tests.xml.")
+
+
+def test_a_link_into_the_stubs_or_to_a_report_leads_where_it_leads(with_output):
+    (run_dir(with_output) / "notes.md").symlink_to(run_dir(with_output) / "stubs" / "newmod.py")
+    (run_dir(with_output) / "result.txt").symlink_to(run_dir(with_output) / "junit-tests.xml")
+    (with_output / "alias").symlink_to(run_dir(with_output) / "stubs")
+    for path in (run_dir(with_output) / "notes.md", run_dir(with_output) / "result.txt", with_output / "alias" / "newmod.py"):
+        assert read(with_output, path), path
+
+
+def test_a_grep_or_glob_of_the_stubs_or_of_a_directory_that_holds_them_or_a_report_is_refused(with_output):
+    inside = run_dir(with_output)
+    for path in (inside / "stubs", inside / "stubs" / "pkg", inside):
+        assert grep(with_output, path, pattern="add"), path
+        assert glob(with_output, "**/*", path), path
+    assert "would search .plumbline/runs/r1/stubs/: name a record, the ledger or a round directory instead." in grep(with_output, inside)
+    assert glob(with_output, "stubs/**", inside) and glob(with_output, "junit-*.xml", inside)  # a pattern that names them leads there too
+    assert grep(with_output, inside / "junit-tests.xml")
+    for path in (inside / "review", inside / "ledger.jsonl", inside / "intake.json"):
+        assert grep(with_output, path, pattern="x") is None, path
+
+
+def test_the_run_directory_alone_is_searchable_while_it_holds_neither_stubs_nor_reports(started):
+    assert grep(started, run_dir(started), pattern='"severity"') is None and glob(started, "**/*.json", run_dir(started)) is None
+    write(run_dir(started) / "junit-verify.xml", "<testsuite/>")
+    assert grep(started, run_dir(started), pattern="x")  # a report appeared: the directory holds one now
+    (run_dir(started) / "junit-verify.xml").unlink()
+    (run_dir(started) / "stubs").mkdir()
+    assert grep(started, run_dir(started), pattern="x")  # an empty stubs directory is one too: the stubs go there
+    (run_dir(started) / "stubs").rmdir()
+    assert grep(started, run_dir(started), pattern="x") is None
+
+
+def test_only_the_orchestrators_lane_leaves_them_out_the_stage_agents_and_the_main_session_read_the_output(with_output):
+    stub = {"file_path": str(run_dir(with_output) / "stubs" / "newmod.py")}
+    for role in STAGE_ROLES:
+        reason = pre.decide(tool_payload(with_output, "Read", stub, agent_type=f"plumbline:{role}"))
+        assert (reason is not None) is (role == "builder"), role  # the builder is blind to the run's records by its own rule, and nobody else is held off
+    assert pre.decide(tool_payload(with_output, "Read", stub)) is None
+    assert pre.decide(tool_payload(with_output, "Read", {"file_path": str(run_dir(with_output) / "junit-tests.xml")})) is None  # the main session reads the report
+
+
+def test_the_stubs_and_junit_rule_works_through_the_hook_process(run_pre, with_output):
+    payload = tool_payload(with_output, "Read", {"file_path": str(run_dir(with_output) / "stubs" / "newmod.py")}, agent_type=ORCHESTRATOR)
+    assert "leaves out its stubs directory and its junit-<stage>.xml files" in denial(run_pre(payload, with_output))
+    payload = tool_payload(with_output, "Read", {"file_path": str(run_dir(with_output) / "plan.json")}, agent_type=ORCHESTRATOR)
+    assert denial(run_pre(payload, with_output)) is None
+
+
 def test_the_lane_is_the_orchestrators_alone(started):
     for role in (*STAGE_ROLES, None):
         payload = tool_payload(started, "Read", {"file_path": str(started / "src" / "app.py")}, agent_type=f"plumbline:{role}" if role else None)

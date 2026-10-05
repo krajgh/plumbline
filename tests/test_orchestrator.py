@@ -631,7 +631,8 @@ def test_the_readme_gives_the_orchestrators_measured_effect_as_a_direction_not_a
 def test_the_readme_limits_name_what_is_left_open_about_the_orchestrator():
     limits = readme_section("Limits")
     group = limits.split("**The orchestrator**", 1)[1].split("**Measured runs**", 1)[0]
-    assert "- **Its lane is a guard rail like the others.**" in group and "(`junit-<stage>.xml`) and the test-writer's stubs, and nothing hides them from it" in group
+    assert "- **Its lane is a guard rail like the others.**" in group
+    assert "junit" not in group and "stubs" not in group  # 0.5.1 closed it: the lane leaves out the run's stubs directory and its junit files
     assert "SendMessage" not in group  # the hook names it now (0.5.1): the orchestrator resumes only agents of its own run, and the hook enters the resume
     assert "whether the harness honours the frontmatter `effort` and restricts the agent to its `tools` was not tested" in group and "the run skill's fallback applies" in group
     assert "A leg that reaches it stops without a report, and the main session starts another leg" in group

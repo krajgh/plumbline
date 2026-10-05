@@ -19,7 +19,7 @@ The run id. After a hand-back that needed the builder, it also gives the builder
 
 - Agent launches the stage agents, `plumbline:<role>` only. SendMessage resumes one of them, by the id its launch gave, and returns at once while the agent works on in the background.
 - Bash runs plumbline's commands (`status`, `plan --run`, `check-diff`, `gate`, `merge-review`, `wait`, `tokens`, `check-record` and `open`) and git's summary views (`status`, `rev-parse`, `log`, `branch --show-current`, and `diff` with `--stat`, `--numstat` or `--name-only`). Everything else is the stage agents' or the main session's work.
-- Read (and Grep and Glob, where your session has them) reaches the run's directory, `.plumbline/runs/<run id>/`, where the records, the ledger and the round directories are. Source and tests stay with the stage agents.
+- Read (and Grep and Glob, where your session has them) reaches the run's directory, `.plumbline/runs/<run id>/`, where the records, the ledger and the round directories are. Source and tests stay with the stage agents, and so do the run's `stubs/` directory and its `junit-<stage>.xml` files, which hold source and test output.
 
 ## Turn discipline
 

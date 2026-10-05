@@ -68,8 +68,9 @@ the paths the call names, so an agent whose working directory drifts is held all
       tool over it (a glob counts as what it matches).
   Read, Grep and Glob, for the agent plumbline:orchestrator
     - only inside .plumbline/runs/<the active run>/ (symbolic links followed): its records, ledger and
-      round directories. A Grep or Glob needs an explicit path there, and a Glob pattern that leaves it
-      by `..` or an absolute path is refused. Source, tests and diffs stay with the stage agents.
+      round directories, and not its stubs/ directory or its junit-<stage>.xml files (source and test output),
+      nor a Grep or Glob over a directory that holds one. A Grep or Glob needs an explicit path there, and a
+      Glob pattern that leaves it by `..` or an absolute path is refused. Source, tests and diffs stay with the stage agents.
   Read, Grep and Glob, for the agent plumbline:builder only
     - a path that matches the tests type of the pipeline, or is listed in the tests record
       of any run, is denied; under .plumbline/ only the active run's intake, plan and the
@@ -2055,9 +2056,33 @@ def canary_command_reason(pl, role: str, steps: list["Step"], cwd: Path, data: d
 # code with. An allowlist, like the builder's blindness turned inside out: what is not the active run's directory is not read.
 
 
+JUNIT_FILE = re.compile(r"junit-[^/]*\.xml")  # what `gate` names the report of a measured pytest run: junit-<stage>.xml, in the run's directory
+
+
+def run_output(root: Path, run: str, target: Path, searching: bool) -> tuple[str, bool] | None:
+    """What the run's directory holds that is no record: the test-writer's stubs (`stubs/`, source) and the junit report of each measured test run
+    (`junit-<stage>.xml`, test output). Returns (the path of the one that a read or a search of `target` would show, whether `target` is it or lies below
+    it), or None. A search is of it too when `target` is a directory that holds one that exists, as the run's directory does where the test-writer has put a
+    stub or a measured run has left a report. Links are followed to where they lead."""
+    directory = root / RUNS_DIR / run
+    for base in dict.fromkeys((directory, Path(os.path.realpath(directory)))):
+        stubs = base / STUBS_DIR
+        for candidate in dict.fromkeys((target, Path(os.path.realpath(target)))):
+            if _inside(candidate, stubs):
+                return f"{RUNS_DIR}/{run}/{STUBS_DIR}/", True
+            if candidate.parent == base and JUNIT_FILE.fullmatch(candidate.name):
+                return f"{RUNS_DIR}/{run}/{candidate.name}", True
+            if searching and _isdir(candidate) and _inside(base, candidate):
+                if _exists(stubs):
+                    return f"{RUNS_DIR}/{run}/{STUBS_DIR}/", False
+                for report in sorted(base.glob("junit-*.xml")):
+                    return f"{RUNS_DIR}/{run}/{report.name}", False
+    return None
+
+
 def orchestrator_reason(data: dict) -> str | None:
-    """The orchestrator's Read, Grep and Glob reach the active run's directory (.plumbline/runs/<run>/) and nothing outside it. A Grep or Glob names its
-    path, and a Glob pattern that leaves that path by `..` or an absolute pattern is refused."""
+    """The orchestrator's Read, Grep and Glob reach the active run's directory (.plumbline/runs/<run>/) and nothing outside it, and in it not the stubs
+    directory or the junit reports (see run_output). A Grep or Glob names its path, and a Glob pattern that leaves that path by `..` or an absolute pattern is refused."""
     if data.get("agent_type") != "plumbline:orchestrator":
         return None
     tool, tool_input, cwd = data.get("tool_name"), data.get("tool_input") or {}, data.get("cwd")
@@ -2093,6 +2118,13 @@ def orchestrator_reason(data: dict) -> str | None:
         if not inside:
             where = f"the active run's directory, {RUNS_DIR}/{run}/" if run else "the active run's directory (no run is in progress, so there is none)"
             return f"plumbline: the orchestrator reads {where} and nothing else: its records, the ledger and the round directories. {shown} reaches outside it, and source and tests stay with the stage agents."
+        held = run_output(root, run, target, tool in ("Grep", "Glob"))
+        if held:
+            what, direct = held
+            return (
+                f"plumbline: the orchestrator reads the run's records, ledger and round directories, and leaves out its stubs directory and its junit-<stage>.xml files: they hold source and test output, "
+                f"which stay with the stage agents. {shown} {'reaches' if direct else 'would search'} {what}" + ("." if direct else ": name a record, the ledger or a round directory instead.")
+            )
     return None
 
 
