@@ -685,6 +685,8 @@ def test_the_run_skill_explains_the_calibration_run_and_the_canarys_round():
     assert "In a calibration run it also prints `canary: refuted by 2 of 3 defenders`" in merge_step and "tell the builder how the defenders answered it" in merge_step
     assert "A defender that concedes the canary concedes whatever it reads" in merge_step
     assert "what the canary measured" in between(body, "## 7. Reduce", "## 8.")
+    summary = between(body, "**A calibration run** answers", "## 6. When a gate fails")
+    assert "can the defenders refute a finding at all?" in summary and "The canary is no finding of the review: it is in no list of survivors, no route, no count of blockers and no open finding" in summary
 
 
 def test_the_readme_explains_calibration_runs_the_eighth_agent_and_the_canarys_hooks():

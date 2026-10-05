@@ -90,6 +90,8 @@ Start each round with `PLUMBLINE check-diff --run <run_id>`: it prints the `merg
 4. **Detective.** When the stage has `detective: true`, the merged record's `blockers_surviving` is 0 and its `panel_needed` is empty, launch `plumbline:detective` (foreground) with the merged record's path, the merge base, the `diff_sha256`, the path of the spec (the plan record) and of the tests record where the run has them, and its record path `.../detective.json`, then run `merge-review` for the same round once more. It runs only when no blocker stands.
 5. `PLUMBLINE gate <run_id> <stage id>`.
 
+**A calibration run** answers a question the normal runs leave open: can the defenders refute a finding at all? Each review round that has defenders also gets the canary, one planted false finding (steps 1 to 3 say what changes), and `merge-review` reports how the defenders answered it in the record's `canary` field. The canary is no finding of the review: it is in no list of survivors, no route, no count of blockers and no open finding, and the pass record's notes keep what it measured.
+
 ## 6. When a gate fails
 
 `gate` prints "round k of N" for the stage and exits 1 while the stage has rounds left. The stage's `on_fail` names where the run goes back to:
