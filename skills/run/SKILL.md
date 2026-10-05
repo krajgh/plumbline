@@ -103,6 +103,14 @@ When every stage has passed:
 1. Look at `git status` and `git diff`: the change is what was meant.
 2. Commit it yourself: add the files of the change and `git commit`. The commit is checked for a symlink, an absolute home path and a key-shaped secret.
 3. `PLUMBLINE pass <run_id>`. It needs a clean tree, a row that reaches reduce, and every gate passed. It measures the change again and refuses a run whose row lacks a stage the measured row selects, and it refuses when the change was edited after `verify` and `review` covered it: then run again from `verify`.
-4. Report to the builder: `PLUMBLINE status --run <run_id>`, `PLUMBLINE tokens <run_id>` (an output count whose `output_lower_bound` is above 0 is at least that), the intent, the declared and measured row, the rounds each stage took, and the detective's gaps.
+4. Report to the builder: `PLUMBLINE status --run <run_id>`, `PLUMBLINE tokens <run_id>` (an output count whose `output_lower_bound` is above 0 is at least that), the intent, the declared and measured row, the rounds each stage took, and what the run leaves open: the surviving findings that are not BLOCKING and the detective's gaps (`PLUMBLINE open`, section 8).
 
 Leave the push to the builder. With a pass recorded for HEAD, the push hook lets it through.
+
+## 8. A follow-up from the open findings
+
+`pass` writes what the run leaves open into its pass record: each surviving finding that is not BLOCKING (with its stage, id, lens, severity, file, line, claim and failure scenario) and each gap the detective named. The review files of a run stay in `.plumbline/`, which git ignores, so the pass record is where they last. `PLUMBLINE open [RUN] [--json]` lists them for the run that covers HEAD, for a named run, or for every passed run with `--all`, and `PLUMBLINE status` shows their count. When the builder asks to take some of them up, each follow-up is a run of its own, started from what the record holds:
+
+- **A finding that describes a failure** becomes a `fix` run, one finding per run. Its failure scenario is the bug report: write the one-criterion spec from it ("this no longer happens", section 3) and start the run with `plan --intent fix`.
+- **Gaps of the kinds `missing_test` and `uncovered_ac`** become a change of the `tests` row: write the tests, then start a run of that row (`plan --intent feature`, with `--row tests` while nothing has changed yet). A gap of the kind `edge_case` that describes a failure is taken up like a finding.
+- **The request names where it came from**: the run id and the ids of the findings or gaps it takes up, for example `Follow-up of run <run id>, finding review/correctness-2`. The new run's record then shows its origin.

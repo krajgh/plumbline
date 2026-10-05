@@ -166,6 +166,19 @@ _SAMPLES = {
         "tokens": {"by_model": {"sonnet": {"output": 1200, "fresh_input": 3400, "cache_read": 56000}}},
         "verdict": "pass",
         "notes": ["verify needed two rounds"],
+        "open_findings": [
+            {
+                "stage": "review",
+                "id": "correctness-2",
+                "lens": "correctness",
+                "severity": "MINOR",
+                "file": "src/app.py",
+                "line": 21,
+                "claim": "retries=0 is treated as no limit.",
+                "failure_scenario": "fetch(url, retries=0) loops forever on a dead server.",
+            }
+        ],
+        "gaps": [{"stage": "review", "id": "G-2", "kind": "edge_case", "detail": "retries=0 is not handled.", "ac": None}],
     },
     "override_record": {
         "commit": SHA_A,

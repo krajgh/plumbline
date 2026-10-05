@@ -68,6 +68,83 @@
       "items": {
         "type": "string"
       }
+    },
+    "open_findings": {
+      "description": "What the run leaves open: the surviving non-blocking findings of every review stage, each with the stage it came from. `pass` fills it from the merged review records, so that it outlasts the run's review files. Absent from a pass record written before 0.5.0.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "id", "lens", "severity", "file", "line", "claim", "failure_scenario"],
+        "additionalProperties": false,
+        "properties": {
+          "stage": {
+            "description": "The review stage the finding came from.",
+            "type": "string",
+            "minLength": 1
+          },
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "lens": {
+            "enum": ["correctness", "tests", "security", "data", "boundaries", "docs"]
+          },
+          "severity": {
+            "description": "A finding that survives with BLOCKING fails its gate, so a passed run holds only MAJOR and MINOR ones.",
+            "enum": ["MAJOR", "MINOR"]
+          },
+          "file": {
+            "type": "string",
+            "minLength": 1
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "claim": {
+            "description": "What is wrong, in one sentence.",
+            "type": "string",
+            "minLength": 1
+          },
+          "failure_scenario": {
+            "description": "A concrete input or sequence of events that goes wrong: a follow-up fix run takes it as its bug report.",
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "gaps": {
+      "description": "What the detective found missing, from every review stage that has a detective, each with the stage it came from. Absent from a pass record written before 0.5.0.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "id", "kind", "detail", "ac"],
+        "additionalProperties": false,
+        "properties": {
+          "stage": {
+            "description": "The review stage the gap came from.",
+            "type": "string",
+            "minLength": 1
+          },
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "enum": ["missing_test", "edge_case", "uncovered_ac"]
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 1
+          },
+          "ac": {
+            "description": "The acceptance criterion the gap concerns, or null.",
+            "type": ["string", "null"],
+            "pattern": "^AC-[0-9]+$"
+          }
+        }
+      }
     }
   }
 }

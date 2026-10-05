@@ -52,11 +52,24 @@ def _objects(schema, path="$"):
         yield from _objects(schema["items"], f"{path}[]")
 
 
+# The fields a record may leave out: every other field of a fixed-shape object is required. A field joins this list for a reason that
+# is written next to it: a record from an earlier version has to stay valid, because the push gate reads a run's records again.
+OPTIONAL = {
+    ("pass_record", "$"): {"open_findings", "gaps"},  # 0.5.0: a pass record from 0.4.2 has neither
+}
+
+
 @pytest.mark.parametrize("name", sorted(SPEC_TYPES))
 def test_every_field_of_a_fixed_shape_object_is_required_and_no_others_are_allowed(name):
     for path, obj in _objects(pl.load_schema(name)):
         assert obj["additionalProperties"] is False, path
-        assert set(obj["required"]) == set(obj["properties"]), path
+        assert set(obj["required"]) == set(obj["properties"]) - OPTIONAL.get((name, path), set()), path
+
+
+def test_every_optional_field_the_tests_name_is_in_its_schema_and_not_required():
+    for (name, path), fields in OPTIONAL.items():
+        obj = dict(_objects(pl.load_schema(name)))[path]
+        assert fields <= set(obj["properties"]) and not fields & set(obj["required"]), (name, path)
 
 
 @pytest.mark.parametrize("name", sorted(SPEC_TYPES))

@@ -13,6 +13,7 @@ Standard library only (Python 3.11 or newer).
     gate RUN STAGE [--project PATH]
     tokens RUN [--project PATH]
     pass RUN [--project PATH]
+    open [RUN] [--all] [--json] [--project PATH]
     override --reason TEXT [--run RUN] [--project PATH]
     status [--run RUN] [--project PATH]
     check-diff [--run RUN] [--base REF] [--project PATH]
@@ -110,6 +111,8 @@ TESTS_TYPE = "tests"  # the file type of test files
 TESTS_LENS = "tests"  # the lens that reviews tests
 SINGLE_AC_INTENTS = ("fix",)  # a fix reproduces one bug: its spec has exactly one acceptance criterion
 UNCHANGED_TESTS_INTENTS = ("refactor",)  # behaviour stays the same, so no test file changes
+OPEN_FINDING_KEYS = ("id", "lens", "severity", "file", "line", "claim", "failure_scenario")  # what the pass record keeps of a surviving finding, after its stage
+OPEN_GAP_KEYS = ("id", "kind", "detail", "ac")  # and of a gap
 
 # The plumbline agents (agent type `plumbline:<name>`) and the record each one
 # ends its work with; the SubagentStop hook validates against it.
@@ -1781,6 +1784,21 @@ def _render_gaps_record(d) -> list[str]:
     return ["# Gaps", *_change_line(d)] + _section("Gaps", d.get("gaps"), _gap_text)
 
 
+def _open_finding_text(f) -> str:
+    return (
+        f"**{_s(_get(f, 'stage'))}/{_s(_get(f, 'id'))}** [{_s(_get(f, 'severity'))}] ({_s(_get(f, 'lens'))}) "
+        f"`{_s(_get(f, 'file'))}:{_s(_get(f, 'line'))}` {_s(_get(f, 'claim'))} Failure: {_s(_get(f, 'failure_scenario'))}"
+    )
+
+
+def _open_gap_text(g) -> str:
+    return (
+        f"**{_s(_get(g, 'stage'))}/{_s(_get(g, 'id'))}** ({_s(_get(g, 'kind'))}"
+        + (f", {_s(_get(g, 'ac'))}" if _get(g, "ac") is not None else "")
+        + f") {_s(_get(g, 'detail'))}"
+    )
+
+
 def _render_pass_record(d) -> list[str]:
     out = [
         f"# Pass record: {_s(d.get('verdict'))}",
@@ -1815,6 +1833,10 @@ def _render_pass_record(d) -> list[str]:
     else:
         out.append("None recorded.")
     out += _section("Notes", d.get("notes"))
+    if "open_findings" in d:  # a pass record from before 0.5.0 has neither list
+        out += _section("Open findings", d.get("open_findings"), _open_finding_text)
+    if "gaps" in d:
+        out += _section("Gaps", d.get("gaps"), _open_gap_text)
     return out
 
 
@@ -3211,6 +3233,19 @@ def rounds_taken(stage: dict, record: dict | None, ledger: list[dict]) -> int:
     return stage_agents(ledger, stage["id"]) or 1
 
 
+def open_items(stage_id: str, review: dict) -> tuple[list[dict], list[dict]]:
+    """What a merged review record leaves open: its surviving findings that are not BLOCKING and the detective's gaps, each
+    with the stage it came from. The review's own files stay in the run, which `.plumbline/` keeps out of git, so the pass
+    record carries them on."""
+    by_id = {finding["id"]: finding for finding in review["findings"]}
+    found = [
+        {"stage": stage_id, **{key: by_id[fid][key] for key in OPEN_FINDING_KEYS}}
+        for fid in dict.fromkeys(review["survivors"])
+        if fid in by_id and by_id[fid]["severity"] != "BLOCKING"
+    ]
+    return found, [{"stage": stage_id, **{key: gap[key] for key in OPEN_GAP_KEYS}} for gap in review["gaps"]]
+
+
 def stale_change_problems(project: Project, run: Run) -> list[str]:
     """The verify record and the review of the diff must cover the change HEAD holds: the diff from the
     run's merge base to HEAD must hash to the `diff_sha256` of each. A change edited after them does not."""
@@ -3303,7 +3338,8 @@ def make_pass_record(project: Project, run_id: str) -> tuple[dict | None, list[s
     entered in the ledger. The change is measured again: its row must not select
     a stage the run lacks. Once the gates pass, the verify record and the review of
     the diff must also cover the change HEAD holds (see stale_change_problems).
-    What the run's intent supplies is evaluated like any stage, with rounds 0."""
+    What the run's intent supplies is evaluated like any stage, with rounds 0.
+    What the review stages leave open (see open_items) goes into the record."""
     root = project.root
     head = head_sha(root)
     run = load_run(project, run_id)
@@ -3321,6 +3357,8 @@ def make_pass_record(project: Project, run_id: str) -> tuple[dict | None, list[s
     ledger = read_ledger(root, run_id)
     order = {s["id"]: position for position, s in enumerate(project.pipeline["stage"])}
     entries: list[dict] = []
+    open_findings: list[dict] = []
+    gaps: list[dict] = []
     supplied_ids = {s["id"] for s in run.supplied}
     for stage in [*run.supplied, *run.stages]:
         if stage is reduce_stage:
@@ -3332,6 +3370,10 @@ def make_pass_record(project: Project, run_id: str) -> tuple[dict | None, list[s
             problems.append(f"stage '{stage['id']}'" + (f" (gate {outcome.gate})" if outcome.gate else "") + ": " + "; ".join(outcome.problems[:3]))
         rounds = 0 if stage["id"] in supplied_ids else rounds_taken(stage, outcome.data, ledger)
         entries.append({"id": stage["id"], "record": outcome.record, "gate": outcome.gate, "passed": outcome.passed, "rounds": rounds})
+        if stage.get("kind", "agent") == "review" and outcome.data is not None:
+            found, missing = open_items(stage["id"], outcome.data)
+            open_findings += found
+            gaps += missing
     reduce_id = reduce_stage["id"] if reduce_stage else "reduce"
     reduce_path = run_dir(root, run_id) / f"{reduce_id}.json"
     if reduce_stage is not None and reduce_stage.get("gate") == "all_gates_passed" and not problems:
@@ -3350,7 +3392,10 @@ def make_pass_record(project: Project, run_id: str) -> tuple[dict | None, list[s
         notes.insert(0, run.note)
     if run.supplied:
         notes.append(f"intent {run.intent}: the record of {', '.join(sorted(supplied_ids))} was supplied, not written by an agent")
-    record = {"commit": head, "run_id": run_id, "row": run.row, "stages": entries, "tokens": tokens, "verdict": "pass", "notes": notes}
+    record = {
+        "commit": head, "run_id": run_id, "row": run.row, "stages": entries, "tokens": tokens, "verdict": "pass", "notes": notes,
+        "open_findings": open_findings, "gaps": gaps,
+    }
     errors = check_record("pass_record", record)
     if errors:
         raise PlumblineError("internal error: the pass_record does not validate: " + "; ".join(errors[:3]))
@@ -3800,6 +3845,116 @@ def cmd_pass(args) -> int:
     return 0
 
 
+def open_summary(record: dict) -> str | None:
+    """`open: 3 findings, 4 gaps; ...` for a pass record, `open: none` when it leaves nothing open, and None for one that
+    predates the lists (it says nothing about what was left)."""
+    if "open_findings" not in record or "gaps" not in record:
+        return None
+    findings, gaps = len(record["open_findings"]), len(record["gaps"])
+    if not findings and not gaps:
+        return "open: none"
+    return f"open: {_plural(findings, 'finding')}, {_plural(gaps, 'gap')}; `plumbline.py open` lists them"
+
+
+def run_pass_path(project: Project, run_id: str) -> Path:
+    """Where `pass` leaves a run's own copy of its pass record: the file of the pipeline's reduce stage."""
+    stage_id = next((s["id"] for s in project.pipeline["stage"] if s["record"] == "pass_record"), "reduce")
+    return run_dir(project.root, run_id) / f"{stage_id}.json"
+
+
+def run_pass_record(project: Project, run_id: str) -> tuple[dict | None, str]:
+    """A passed run's own copy of its pass record, as (record, why not): the file must be there, validate, and say pass."""
+    path = run_pass_path(project, run_id)
+    data, problem = load_json_file(path)
+    if problem == "no such file":
+        return None, f"run '{run_id}' has no pass record ({rel_path(project.root, path)}); `pass` writes it once every gate has passed"
+    if problem:
+        return None, f"{rel_path(project.root, path)} cannot be used: {problem}"
+    errors = check_record("pass_record", data)
+    if errors:
+        return None, f"{rel_path(project.root, path)} is not a valid pass_record ({errors[0]})"
+    if data["verdict"] != "pass":
+        return None, f"run '{run_id}' did not pass ({rel_path(project.root, path)} says {data['verdict']})"
+    return data, ""
+
+
+def open_entry(record: dict) -> dict:
+    """What `open` reports of a pass record. `recorded` is false for a record from before 0.5.0, which carries no lists: an empty
+    list there means nothing was kept, not that nothing was left."""
+    return {
+        "run_id": record["run_id"], "commit": record["commit"], "row": record["row"], "recorded": "open_findings" in record and "gaps" in record,
+        "open_findings": record.get("open_findings", []), "gaps": record.get("gaps", []),
+    }
+
+
+def open_lines(entry: dict) -> list[str]:
+    head = f"run {entry['run_id']} (commit {entry['commit'][:7]}, row {entry['row']})"
+    if not entry["recorded"]:
+        return [f"{head}: not recorded (the pass record is from before 0.5.0 and keeps no open findings)"]
+    findings, gaps = entry["open_findings"], entry["gaps"]
+    if not findings and not gaps:
+        return [f"{head}: nothing open"]
+    lines = [f"{head}: {_plural(len(findings), 'open finding')}, {_plural(len(gaps), 'gap')}"]
+    if findings:
+        lines.append("  findings:")
+        for f in findings:
+            lines.append(f"    {f['stage']}/{f['id']} [{f['severity']}] {f['file']}:{f['line']}: {_one_line(f['claim'])}")
+            lines.append(f"      failure: {_one_line(f['failure_scenario'])}")
+    if gaps:
+        lines.append("  gaps:")
+        for g in gaps:
+            lines.append(f"    {g['stage']}/{g['id']} ({g['kind']}{', ' + g['ac'] if g['ac'] else ''}): {_one_line(g['detail'])}")
+    return lines
+
+
+def cmd_open(args) -> int:
+    """List what passed runs left open. The run is the one named, else the one whose pass record covers HEAD; `--all` lists every passed run."""
+    project = _ready_project(args.project)
+    root = project.root
+    if args.all and args.run_id:
+        raise PlumblineError("--all lists every passed run, so it takes no RUN")
+    entries = []
+    if args.all:
+        found = []  # (when the pass record was written, run id, record): the oldest run first
+        try:
+            candidates = [d.name for d in (root / RUNS_DIR).iterdir() if d.is_dir() and RUN_ID_PATTERN.fullmatch(d.name)]
+        except OSError:
+            candidates = []
+        for name in candidates:
+            record, _why = run_pass_record(project, name)
+            if record is not None:
+                found.append((run_pass_path(project, name).stat().st_mtime, name, record))
+        entries = [open_entry(record) for _when, _name, record in sorted(found, key=lambda item: item[:2])]
+    elif args.run_id:
+        existing_run_dir(root, args.run_id)
+        record, why = run_pass_record(project, check_run_id(args.run_id))
+        if record is None:
+            print(f"plumbline: {why}. Nothing to list.", file=sys.stderr)
+            return 1
+        entries = [open_entry(record)]
+    else:
+        head = head_sha(root)
+        how, detail = coverage(root, head, project)
+        if how != "pass":
+            print(
+                f"plumbline: HEAD {head[:7]} is not covered by a pass record ({detail}), so there is no run to list. "
+                "Name a run (`open RUN`) or list every passed run (`open --all`). Nothing to list.",
+                file=sys.stderr,
+            )
+            return 1
+        record, _problem = load_json_file(root / PASS_DIR / f"{head}.json")
+        entries = [open_entry(record)]
+    if args.json:
+        print(json.dumps({"runs": entries}, indent=2))
+    elif not entries:
+        print("no run has a pass record")
+    else:
+        for entry in entries:
+            for line in open_lines(entry):
+                print(line)
+    return 0
+
+
 def cmd_override(args) -> int:
     project = _adopted_project(args.project)
     reason = (sys.stdin.read() if args.reason == "-" else args.reason).strip()  # `-`: the reason arrives on stdin, so that no quoting can alter it
@@ -3891,6 +4046,10 @@ def cmd_status(args) -> int:
         how, detail = coverage(root, head, project)
         if how == "pass":
             print(f"HEAD {head[:7]}: covered by a pass record ({detail})")
+            record, _problem = load_json_file(root / PASS_DIR / f"{head}.json")
+            summary = open_summary(record) if isinstance(record, dict) else None
+            if summary:
+                print(summary)
         elif how == "override":
             print(f"HEAD {head[:7]}: covered by an override ({detail})")
         else:
@@ -3980,6 +4139,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("run_id", metavar="RUN")
     p.add_argument("--project", metavar="PATH")
     p.set_defaults(run=cmd_pass)
+
+    p = sub.add_parser("open", allow_abbrev=False, help="list what passed runs left open: the surviving non-blocking findings and the detective's gaps (default: the run whose pass record covers HEAD)")
+    p.add_argument("run_id", nargs="?", metavar="RUN", help="a passed run (default: the run that covers HEAD)")
+    p.add_argument("--all", action="store_true", help="every passed run, oldest first")
+    p.add_argument("--json", action="store_true", help="print the runs as JSON")
+    p.add_argument("--project", metavar="PATH")
+    p.set_defaults(run=cmd_open)
 
     p = sub.add_parser("override", allow_abbrev=False, help="record an override for HEAD, so that it can be pushed without a pass (only when the builder asks)")
     p.add_argument("--reason", required=True, metavar="TEXT", help="why the pipeline is bypassed: at least 20 characters (`-` reads it from stdin)")
