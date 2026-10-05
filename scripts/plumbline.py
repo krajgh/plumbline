@@ -133,13 +133,14 @@ AGENT_RECORDS = {
     "detective": "gaps_record",
     "canary": "findings_record",
 }
-AGENT_ROLES = tuple(AGENT_RECORDS)  # the roles a [roles.<name>] policy may describe
+ORCHESTRATOR = "orchestrator"  # the agent that runs a leg of a run for the main session: it ends with a report, writes no record, and is no stage's agent
+AGENT_ROLES = (*AGENT_RECORDS, ORCHESTRATOR)  # the roles a [roles.<name>] policy may describe
 REVIEW_PART_TYPES = ("findings_record", "defense_record", "gaps_record")
 # Role policies (see [roles.*] in pipeline/default.toml): where an agent may write, and what its Bash may run.
 KNOWN_WRITE_TARGETS = ("record", "tests", "stubs", "code")
 STUBS_DIR = "stubs"  # .plumbline/runs/<run-id>/stubs/: the stubs of brand-new modules, in the run and so outside the change
 CONFIG_COMMANDS = ("test", "lint", "typecheck", "build")  # the keys of [commands] in plumbline.toml
-KNOWN_COMMAND_CLASSES = (*CONFIG_COMMANDS, "git-read", "search", "plumbline-check", "graft")
+KNOWN_COMMAND_CLASSES = (*CONFIG_COMMANDS, "git-read", "search", "plumbline-check", "graft", "plumbline-run", "git-meta")
 DEFAULT_INTENT = "feature"
 TEMPLATE_DIR = PIPELINE_DIR / "templates"
 ID_PATTERN = r"^[a-z][a-z0-9_-]*$"
@@ -829,8 +830,12 @@ def _check_roles(roles, errors: list[str]) -> None:
                     errors.append(f"{where}: unknown {what} {item!r} (known: {', '.join(known)})")
                 elif value.count(item) > 1:
                     errors.append(f"{where}: {key} names {item!r} more than once")
-        if isinstance(policy.get("writes"), list) and "record" not in policy["writes"]:
-            errors.append(f"{where}: writes must include 'record', because every agent ends with its record")
+        if isinstance(policy.get("writes"), list):
+            if name == ORCHESTRATOR:
+                if policy["writes"]:
+                    errors.append(f"{where}: writes must be empty: the orchestrator launches the stage agents and runs plumbline's commands, and writes no file")
+            elif "record" not in policy["writes"]:
+                errors.append(f"{where}: writes must include 'record', because every agent ends with its record")
     for name in AGENT_ROLES:
         if name not in roles:
             errors.append(f"roles: there is no policy for the agent '{name}' (every agent needs one)")

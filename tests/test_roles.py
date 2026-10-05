@@ -16,6 +16,7 @@ SPEC_ROLES = {
     "defender": {"writes": ["record"], "commands": ["git-read", "search"]},
     "detective": {"writes": ["record"], "commands": ["git-read", "search", "graft"]},
     "canary": {"writes": ["record"], "commands": ["git-read", "search"]},
+    "orchestrator": {"writes": [], "commands": ["plumbline-run", "git-meta"]},  # launches the stage agents and runs plumbline's commands: no file, no source
 }
 
 
@@ -34,7 +35,7 @@ def test_the_default_pipeline_carries_the_specs_role_policies_and_validates():
 
 def test_the_known_write_targets_and_command_classes_are_the_specs():
     assert pl.KNOWN_WRITE_TARGETS == ("record", "tests", "stubs", "code")
-    assert pl.KNOWN_COMMAND_CLASSES == ("test", "lint", "typecheck", "build", "git-read", "search", "plumbline-check", "graft")
+    assert pl.KNOWN_COMMAND_CLASSES == ("test", "lint", "typecheck", "build", "git-read", "search", "plumbline-check", "graft", "plumbline-run", "git-meta")
 
 
 def test_the_test_writer_alone_has_the_stubs_write_target_and_the_policy_comment_documents_it():
@@ -45,8 +46,21 @@ def test_the_test_writer_alone_has_the_stubs_write_target_and_the_policy_comment
     assert "stubs = the active run's stubs directory, .plumbline/runs/<run-id>/stubs/" in comment and "outside the change" in comment
 
 
-def test_the_roles_are_the_agents_that_end_with_a_record():
-    assert set(default_pipeline()["roles"]) == set(pl.AGENT_RECORDS)
+def test_the_roles_are_the_agents_that_end_with_a_record_and_the_orchestrator_that_ends_with_a_report():
+    assert set(default_pipeline()["roles"]) == set(pl.AGENT_RECORDS) | {"orchestrator"} == set(pl.AGENT_ROLES)
+    assert pl.AGENT_ROLES[-1] == pl.ORCHESTRATOR == "orchestrator" and pl.ORCHESTRATOR not in pl.AGENT_RECORDS
+
+
+def test_the_orchestrator_writes_nothing_and_runs_only_plumbline_and_git_summaries_and_the_policy_comment_documents_both_classes():
+    policy = default_pipeline()["roles"]["orchestrator"]
+    assert policy == {"writes": [], "commands": ["plumbline-run", "git-meta"]}
+    assert "search" not in policy["commands"] and "git-read" not in policy["commands"]  # no cat and grep of source
+    text = DEFAULT_TOML.read_text(encoding="utf-8")
+    comment = text[text.index("# Role policies"):text.index("[roles.planner]")]
+    assert "plumbline-run is the commands of `plumbline.py` that run a run's stages: check-diff, gate, merge-review, status, tokens," in comment
+    assert "check-record, open, and `plan --run RUN --json` (the plan of a run that has begun), and not `plan --intent`, `pass`, `override` or `init`" in comment
+    assert "git-meta is git's summary views: status, rev-parse, log (no patch), branch --show-current, and diff only with --stat, --numstat or --name-only" in comment
+    assert "the orchestrator, which launches the stage agents and writes no record, lists none" in comment
 
 
 BAD_ROLES = [
@@ -64,6 +78,12 @@ BAD_ROLES = [
     ("policy-not-a-table", lambda d: d["roles"].update(defender=["search"]), "roles.defender: must be a table"),
     ("a-write-target-as-a-command", lambda d: d["roles"]["defender"]["commands"].append("tests"), "roles.defender: unknown command 'tests'"),
     ("a-command-as-a-write-target", lambda d: d["roles"]["defender"]["writes"].append("git-read"), "roles.defender: unknown write target 'git-read'"),
+    ("the-orchestrator-writes-nothing", lambda d: d["roles"]["orchestrator"].update(writes=["record"]), "roles.orchestrator: writes must be empty: the orchestrator launches the stage agents"),
+    ("the-orchestrator-writes-code", lambda d: d["roles"]["orchestrator"].update(writes=["code"]), "roles.orchestrator: writes must be empty"),
+    ("the-orchestrators-policy-is-missing", lambda d: d["roles"].pop("orchestrator"), "there is no policy for the agent 'orchestrator'"),
+    ("a-typo-in-a-new-command-class", lambda d: d["roles"]["orchestrator"]["commands"].append("plumbline-runs"), "roles.orchestrator: unknown command 'plumbline-runs'"),
+    ("a-new-class-named-twice", lambda d: d["roles"]["orchestrator"]["commands"].append("git-meta"), "roles.orchestrator: commands names 'git-meta' more than once"),
+    ("the-orchestrator-with-no-writes-key", lambda d: d["roles"]["orchestrator"].pop("writes"), "roles.orchestrator: writes must be a list of strings"),
 ]
 
 
@@ -161,3 +181,21 @@ def test_a_merged_pipeline_keeps_the_roles_of_the_shipped_one(repo):
     project = pl.load_project(repo)
     assert project.errors == [] and project.roles == SPEC_ROLES
     assert project.pipeline["roles"] == copy.deepcopy(SPEC_ROLES)
+
+
+def test_the_two_new_command_classes_are_valid_for_any_role_and_an_orchestrator_may_run_nothing_at_all():
+    errors, _ = check(lambda d: d["roles"]["verifier"]["commands"].extend(["plumbline-run", "git-meta"]))
+    assert errors == []
+    errors, _ = check(lambda d: d["roles"]["orchestrator"].update(commands=[]))
+    assert errors == []  # a role with no commands has no Bash
+    errors, _ = check(lambda d: d["roles"]["orchestrator"]["commands"].append("search"))
+    assert errors == []  # the policy is data: a repository's pipeline may widen it, and the hook follows what it says
+
+
+def test_a_repository_pipeline_that_has_roles_must_have_the_orchestrators_too(repo):
+    text = DEFAULT_TOML.read_text(encoding="utf-8")
+    old = text[: text.index("[roles.orchestrator]")] + text[text.index("# Intents"):]
+    write(repo / "old.toml", old)
+    write(repo / "plumbline.toml", 'schema = 1\npipeline = "old.toml"\n')
+    project = pl.load_project(repo)
+    assert any("there is no policy for the agent 'orchestrator' (every agent needs one)" in e for e in project.errors)

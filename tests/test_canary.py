@@ -794,8 +794,8 @@ def test_the_readme_explains_calibration_runs_the_eighth_agent_and_the_canarys_h
     assert "`--calibrate` marks the run as a calibration run in its intake record" in plan_row
     agents = {r[0].strip("`"): r for r in rows(section("Agents"))}
     assert agents["plumbline:canary"][1:] == ["Sonnet", "Read, Grep, Glob, Bash, Write", "its records", "`findings_record`"]
-    assert section("Agents").lstrip().startswith("Eight agents,")
-    assert "`[roles.<agent>]`: what each of the eight agents may do" in section("The pipeline file")
+    assert section("Agents").lstrip().startswith("Nine agents,")
+    assert "`[roles.<agent>]`: what each of the nine agents may do" in section("The pipeline file")
     paragraph = section("Runs, gates and the pass record").split("**Calibration runs.**", 1)[1].split("\n\n", 1)[0]
     for needed in (
         "Whether defenders can refute at all is untested when they concede everything", "`plan --intent ... --calibrate` marks the run as a calibration run in its intake record",

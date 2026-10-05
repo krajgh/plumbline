@@ -29,7 +29,7 @@ def agent(name):
 
 def test_there_is_one_agent_for_each_record_an_agent_ends_with_and_the_orchestrator_that_runs_them():
     assert sorted(p.stem for p in AGENTS.glob("*.md")) == sorted([*NAMES, "orchestrator"])  # the orchestrator ends with a report and writes no record
-    assert set(pl.AGENT_ROLES) == set(NAMES) == set(pl.AGENT_RECORDS)
+    assert set(pl.AGENT_ROLES) == set(NAMES) | {"orchestrator"} and set(NAMES) == set(pl.AGENT_RECORDS)
 
 
 @pytest.mark.parametrize("name", NAMES)

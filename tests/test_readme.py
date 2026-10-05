@@ -99,10 +99,11 @@ def test_the_agents_table_gives_the_model_the_tools_and_the_record_of_each_agent
     for role in pl.AGENT_ROLES:
         fields = frontmatter_of(REPO / "agents" / f"{role}.md")
         _name, model, tools, _writes, record = table[f"plumbline:{role}"]
-        assert model.lower() == fields["model"], role
+        assert model.lower().split(",")[0] == fields["model"], role  # the orchestrator's cell adds its effort
         assert [t.strip() for t in re.sub(r"\(.*\)", "", tools).split(",") if t.strip()] == [t.strip() for t in fields["tools"].split(",")], role
         assert ("no Bash" in tools) == ("Bash" not in fields["tools"]), role
-        assert record.strip("`") == pl.AGENT_RECORDS[role], role
+        assert record.strip("`") == pl.AGENT_RECORDS.get(role, "none: a report"), role  # the orchestrator ends with a report, not a record
+    assert table["plumbline:orchestrator"][1] == f"Sonnet, at {frontmatter_of(REPO / 'agents' / 'orchestrator.md')['effort']} effort"
 
 
 def schema_names(record: str) -> set[str]:
@@ -206,7 +207,7 @@ def test_the_readme_says_how_the_agents_write_and_how_the_run_skill_launches_the
     assert "Every agent writes its record with the Write tool (Bash runs commands and reads), and a review agent writes it straight to the path its brief names" in agents
     assert "the round directory is there already, or Write makes it" in agents
     assert "launch each stage's agent without `model`, because each is pinned in its definition" in section("Skills")
-    for role in pl.AGENT_ROLES:
+    for role in pl.AGENT_RECORDS:  # the orchestrator has no Write tool: it writes no file
         body = (REPO / "agents" / f"{role}.md").read_text(encoding="utf-8")
         assert "with the Write tool" in body, role
 
