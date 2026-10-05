@@ -156,8 +156,8 @@ def test_the_readme_gives_what_two_real_runs_cost_in_generic_terms_and_the_round
     rows = {row[0]: row[1:] for row in table if len(row) == 3}
     assert "| | Feature, size M | Fix, size S |" in text
     assert rows["Active machine time"] == ["about 18 minutes", "about 7 minutes"]
-    assert rows["Rounds"] == ["plan 1, tests 2, test-review 1, verify 1, review 1", "tests 2, verify 1, review 1"]
-    assert rows["The agents"] == ["15 of them: at least 42K output tokens, 415K cache writes, 2.7M cache reads", "10 of them: at least 18K output tokens, 157K cache writes, 1.1M cache reads"]
+    assert rows["Rounds"] == ["plan 1, tests 3, test-review 1, verify 2, review 1", "tests 2, verify 1, review 1"]
+    assert rows["The agents"] == ["15 of them: at least 42K output tokens, 415K cache writes, 2.7M cache reads", "9 of them: at least 18K output tokens, 157K cache writes, 1.1M cache reads"]
     assert rows["The main session, which orchestrates"] == ["26K output tokens, 114K cache writes, 5.3M cache reads", "13K output tokens, 58K cache writes, 2.3M cache reads"]
     assert "**The main session is the biggest spender.**" in text and "**The agents' output is a lower bound.**" in text and "`output_lower_bound`" in text
     assert "**There is no token cap.**" in text and "nothing bounds the main session" in text

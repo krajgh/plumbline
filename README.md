@@ -328,13 +328,13 @@ These are two real runs, so two data points and not an average: a feature of abo
 | | Feature, size M | Fix, size S |
 | --- | --- | --- |
 | Active machine time | about 18 minutes | about 7 minutes |
-| Rounds | plan 1, tests 2, test-review 1, verify 1, review 1 | tests 2, verify 1, review 1 |
-| The agents | 15 of them: at least 42K output tokens, 415K cache writes, 2.7M cache reads | 10 of them: at least 18K output tokens, 157K cache writes, 1.1M cache reads |
+| Rounds | plan 1, tests 3, test-review 1, verify 2, review 1 | tests 2, verify 1, review 1 |
+| The agents | 15 of them: at least 42K output tokens, 415K cache writes, 2.7M cache reads | 9 of them: at least 18K output tokens, 157K cache writes, 1.1M cache reads |
 | The main session, which orchestrates | 26K output tokens, 114K cache writes, 5.3M cache reads | 13K output tokens, 58K cache writes, 2.3M cache reads |
 
 - **The main session is the biggest spender.** In both runs it holds about two thirds of all the cache reads, because every agent report and every stop is a turn of its own that reads the whole of its context again.
 - **The agents' output is a lower bound.** Some messages never got their final usage entry, so they count as the snapshot taken when they began; `plumbline.py tokens` says how many (`output_lower_bound`). Input and cache counts are exact.
-- **Only the tests stage needed a second round, in both runs.** Nothing looped, so the round caps stayed as they are.
+- **No stage looped.** The rounds are the pass records' own counts. In the feature, the tests stage's third round removed scaffolding it had left in the change (stubs, which 0.4.2 keeps out of the change), and the first verifier stopped on the size that scaffolding added. In the fix, the tests stage's first round held a guard test that passed before the fix. The round caps stayed as they are.
 - **There is no token cap.** The round caps and each agent's `maxTurns` bound what the agents spend, and nothing bounds the main session.
 
 ## Developing plumbline
