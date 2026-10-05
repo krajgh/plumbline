@@ -319,15 +319,15 @@ def run_skill():
 
 
 def test_the_run_skill_says_how_a_follow_up_starts_from_the_open_findings():
-    text = run_skill().split("## 8. A follow-up from the open findings", 1)[1]
+    text = run_skill().split("## 7. A follow-up from the open findings", 1)[1].split("## If the orchestrator is not available", 1)[0]
     assert "`pass` writes what the run leaves open into its pass record" in text and "`.plumbline/`, which git ignores" in text
     assert "`PLUMBLINE open [RUN] [--json]`" in text and "every passed run with `--all`" in text and "`PLUMBLINE status` shows their count" in text
     assert "**A finding that describes a failure** becomes a `fix` run, one finding per run" in text
     assert "Its failure scenario is the bug report" in text and "`plan --intent fix`" in text
     assert "**Gaps of the kinds `missing_test` and `uncovered_ac`** become a change of the `tests` row" in text and "`--row tests`" in text
     assert "**The request names where it came from**: the run id and the ids of the findings or gaps it takes up" in text
-    assert "Write it to the request file (section 3), so that the new run's `request.md` shows its origin" in text
-    assert "what the run leaves open: the surviving findings that are not BLOCKING and the detective's gaps (`PLUMBLINE open`, section 8)" in between(run_skill(), "## 7. Reduce", "## 8.")
+    assert "Write it to the request file (section 2), so that the new run's `request.md` shows its origin" in text
+    assert "what the run leaves open: the surviving findings that are not BLOCKING and the detective's gaps (`PLUMBLINE open`, section 7)" in between(run_skill(), "## 5. When every gate has passed", "## 6. Push")
 
 
 def test_the_status_skill_names_the_count_and_the_command():

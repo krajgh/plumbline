@@ -81,18 +81,20 @@ Start each round with `PLUMBLINE check-diff --run <run id>`: it prints the `merg
 4. **Detective.** When the stage has `detective: true`, the merged record's `blockers_surviving` is 0 and its `panel_needed` is empty, launch `plumbline:detective` (foreground) with the merged record's path, the merge base, the `diff_sha256`, the path of the spec (the plan record) and of the tests record where the run has them, and its record path `.../detective.json`, then run `merge-review` for the same round once more. It runs only when no blocker stands.
 5. `PLUMBLINE gate <run id> <stage id>`.
 
+**A calibration run** answers a question the normal runs leave open: can the defenders refute a finding at all? Each review round that has defenders also gets the canary, one planted false finding (steps 1 to 3 say what changes), and `merge-review` reports how the defenders answered it in the record's `canary` field. The canary is no finding of the review: it is in no list of survivors, no route, no count of blockers and no open finding, and the pass record's notes keep what it measured.
+
 ## When a gate fails
 
 `gate` prints "round k of N" for the stage and exits 1 while the stage has rounds left. The stage's `on_fail` names where the run goes back to:
 
 - `plan` and `tests` go back to their own agent (the planner, the test-writer) with the gate's problems, for up to their `max_rounds`.
-- `spec-review` goes back to `plan`. Send the planner the text under "for the planner" (the findings of the requirements lens), and run `plan` again, then `spec-review` again as a new round, the one whose directory `gate` opened. Where the intent supplied the spec, `plan` is not in the run and the failure goes to the main session (`on_fail` is `main`).
+- `spec-review` goes back to `plan`. Send the planner the text under "for the planner" (the findings of the requirements lens), and run `plan` again, then `spec-review` again as a new round, the one whose directory `gate` opened. Where the intent supplied the spec, `plan` is not in the run and the failure goes to the main session (`on_fail` is `main`): hand back, because a corrected spec means a new run.
 - `verify` and `review` go back to `build`. Send the builder the failing criteria and error types, and the "for the builder" text of the surviving findings, and run the stages from there again, in order: `build`, then `verify`, then `review` again as a new round, the one whose directory `gate` opened.
 - A review that fails with "the screening defender claims finding X is BLOCKING" goes back to no stage: it asks for the full panel in the round it is in (step 3 of the review units), and `gate` counts no round for it and opens none.
 - The surviving findings under "for the test-writer" go to the test-writer, which revises the tests; then run `tests`, `verify` and `review` again. Once the build exists, the tests stage records its run of the test command and no longer expects the tests to fail.
 - A review of the tests goes back to `tests`.
 
-Send a stage back by resuming its agent with SendMessage, giving it the problems, or by launching a fresh agent with the problems in its brief: either is a new attempt under the rounds rule.
+Send a stage back by resuming its agent with SendMessage, giving it the problems, or by launching a fresh agent with the problems in its brief: either is a new attempt under the rounds rule. `gate` exits 3 when the stage has used its rounds. When it exits 3, or when `on_fail` is `main`, hand back (see "Hand back"): the builder decides whether to start a new run or to skip the pipeline.
 
 Each problem of the tests and verify gates starts with where it comes from: `the agent's record` (what the agent typed) or `the measured run` (what `gate` saw when it ran the repository's commands). A problem of the record goes back to the agent that wrote it. A problem of the measured run is about the change or the tests, except when it says the commands could not run (`no test command is declared`): that one is the builder's to settle in `plumbline.toml`, so hand back.
 

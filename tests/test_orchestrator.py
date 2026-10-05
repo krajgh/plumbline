@@ -141,6 +141,8 @@ def test_the_prompt_launches_every_plumbline_agent_without_a_model_because_each_
     assert sorted(n for n, m in pins.items() if m == "sonnet") == sorted(["planner", "test-writer", "builder", "prosecutor", "detective", "canary"])
     assert sorted(n for n, m in pins.items() if m == "haiku") == ["defender", "verifier"]
     assert "model:" not in body  # no launch in the prompt names a model
+    assert "(without `model`: the defender is pinned to Haiku)" in between(body, "2. **Defenders.**", "3. `PLUMBLINE merge-review")
+    assert "tests/_stubs" not in body
 
 
 def test_the_prompt_runs_the_two_measured_gates_with_the_largest_timeout():
@@ -194,6 +196,7 @@ def test_the_review_units_carry_the_calibration_canary_after_the_prosecutors_and
 def test_the_failure_routes_are_the_skills_with_hand_backs_where_the_main_session_decides():
     failing = between(orchestrator()[1], "## When a gate fails", "## A decision comes back")
     assert '"round k of N"' in failing and "exits 1 while the stage has rounds left" in failing
+    assert "`gate` exits 3 when the stage has used its rounds. When it exits 3, or when `on_fail` is `main`, hand back" in failing
     assert "`plan` and `tests` go back to their own agent" in failing and "`verify` and `review` go back to `build`" in failing
     assert "`spec-review` goes back to `plan`" in failing and "the failure goes to the main session (`on_fail` is `main`)" in failing
     assert "A review that fails with \"the screening defender claims finding X is BLOCKING\" goes back to no stage" in failing
@@ -395,3 +398,86 @@ def test_the_readme_commands_table_lists_the_plan_run_and_the_status_rounds():
     assert "[--run RUN [--json]]" in row and "rebuilt from its own files and writing nothing" in row
     status = next(line for line in readme.splitlines() if line.startswith("| `status "))
     assert "the rounds each stage that has run took (`rounds: plan 1, tests 2, review 1`)" in status
+
+
+# --- the run skill: the main session's part only
+
+
+def skill():
+    return frontmatter(REPO / "skills" / "run" / "SKILL.md")
+
+
+def test_the_run_skill_holds_the_main_sessions_part_and_is_much_shorter_than_the_whole_procedure_was():
+    fields, body = skill()
+    text = (REPO / "skills" / "run" / "SKILL.md").read_text(encoding="utf-8")
+    assert len(text) < 12000  # 0.5.0's skill before the split was about 21,000 characters
+    headings = re.findall(r"^## (.+)$", body, re.M)
+    assert headings == [
+        "0. Before you start", "1. Intake", "2. Start the run", "3. Run a leg", "4. A report that needs the builder", "5. When every gate has passed",
+        "6. Push", "7. A follow-up from the open findings", "If the orchestrator is not available",
+    ]
+    assert "orchestrator agent" in fields["description"] and "(plan, tests, build, verify, review)" in fields["description"]
+    for moved in ("plumbline:prosecutor", "plumbline:defender", "plumbline:detective", "plumbline:builder", "plumbline:planner", "PLUMBLINE gate", "PLUMBLINE merge-review", "PLUMBLINE check-diff", "round k of N", "stubs_dir"):
+        assert moved not in body, moved  # the stage procedure is the orchestrator's
+
+
+def test_every_section_the_run_skill_points_to_is_there():
+    body = skill()[1]
+    sections = set(re.findall(r"^## (\d+)\.", body, re.M))
+    pointed = set(re.findall(r"\(section (\d+)\)|, section (\d+)\)|sections (\d+) and (\d+)", body))
+    numbers = {n for group in pointed for n in group if n}
+    assert numbers and numbers <= sections, (numbers, sections)
+
+
+def test_intake_infers_and_confirms_the_intent_and_the_row_and_the_plan_command_starts_the_run():
+    body = skill()[1]
+    intake = between(body, "## 1. Intake", "## 2. Start the run")
+    assert "Settle the intent and the row before anything is planned, state both in a sentence each, and let the builder confirm or correct them in one question." in intake
+    for intent in pl.intent_ids(pl.load_toml(pl.PIPELINE_DIR / "default.toml")):
+        assert f"| `{intent}` |" in intake, intent
+    assert "`--row code.M` for a code change of size M" in intake and "A change that measures as size L ends before reduce" in intake
+    start = between(body, "## 2. Start the run", "## 3. Run a leg")
+    assert "PLUMBLINE plan --intent <intent> [--row <row>] [--spec <file>] --request-file <file> [--calibrate]" in start
+    assert "Keep the `run_id` it prints: the orchestrator reads the rest of the plan itself." in start and "If the command refuses, tell the builder why, and stop." in start
+
+
+def test_a_leg_is_started_in_the_background_with_the_run_id_and_waited_for_without_polling():
+    leg = between(skill()[1], "## 3. Run a leg", "## 4. A report that needs the builder")
+    assert "Launch the agent `plumbline:orchestrator` with the Agent tool, `run_in_background: true`, without `model` (it is pinned to Sonnet) and without `isolation`." in leg
+    assert "Its brief is the run id and, after a report that needed the builder, the builder's decision in a sentence or two." in leg
+    assert "Then wait for its report, without polling and without commands of your own: the completion arrives as one notification, which is one turn of yours." in leg
+    assert "The report is at most 15 lines" in leg and "the open findings as ids with one line each" in leg
+    assert "paste" not in leg.lower()  # the plan is read by the orchestrator, not handed to it
+
+
+def test_a_report_that_needs_the_builder_is_put_with_ask_user_question_and_a_new_leg_follows_the_answer():
+    asking = between(skill()[1], "## 4. A report that needs the builder", "## 5. When every gate has passed")
+    for case in ("a hook refused a call that the orchestrator would have had to work around", "the change measures larger than its row or at size L", "a stage reached `max_rounds`", "non-blocking findings or gaps are left once every gate passed (fix or ship)", "an error stays unresolved"):
+        assert case in asking, case
+    assert "Ask with AskUserQuestion: give the options as the report lists them, with the orchestrator's recommendation first." in asking
+    assert "start the next leg (section 3) with the builder's decision in its brief" in asking and "To ship, go on to section 5." in asking
+    assert "`/plumbline:override` is the builder's command, typed by the builder" in asking and "override --reason" not in asking
+
+
+def test_when_every_gate_has_passed_the_main_session_commits_records_the_pass_and_reports_the_cost_of_the_legs_apart():
+    reduce = between(skill()[1], "## 5. When every gate has passed", "## 6. Push")
+    assert "Commit it yourself" in reduce and "`PLUMBLINE pass <run_id>`" in reduce and "then start a leg again, which runs from `verify`" in reduce
+    assert "`PLUMBLINE status --run <run_id>` (it ends with the rounds each stage took)" in reduce
+    assert "`by_model` is what the stage agents used and `orchestration` what the orchestrator's legs used, which sat in your own session before" in reduce
+    assert "`output_lower_bound` is above 0 is at least that" in reduce and "`PLUMBLINE open`" in reduce and "what the canary measured" in reduce
+
+
+def test_the_push_is_the_builders_and_the_skill_points_to_the_procedure_when_the_agent_is_not_there():
+    body = skill()[1]
+    assert "Leave the push to the builder, until the builder asks you to push." in between(body, "## 6. Push", "## 7. A follow-up")
+    fallback = body.split("## If the orchestrator is not available", 1)[1]
+    assert "When the Agent tool has no `plumbline:orchestrator`, follow the procedure in `${CLAUDE_PLUGIN_ROOT}/agents/orchestrator.md` yourself, in this session" in fallback
+    assert "put to the builder what it would hand back" in fallback
+    assert (REPO / "agents" / "orchestrator.md").is_file()
+
+
+def test_the_skills_launch_and_the_hooks_launch_pins_agree_on_the_orchestrator():
+    import pre_tool_use as pre
+
+    assert pre.pinned_model(pl, "orchestrator") == "sonnet" == frontmatter(AGENTS / "orchestrator.md")[0]["model"]
+    assert "(it is pinned to Sonnet)" in skill()[1]

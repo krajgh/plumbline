@@ -206,7 +206,10 @@ def test_the_readme_says_how_the_agents_write_and_how_the_run_skill_launches_the
     agents = section("Agents")
     assert "Every agent writes its record with the Write tool (Bash runs commands and reads), and a review agent writes it straight to the path its brief names" in agents
     assert "the round directory is there already, or Write makes it" in agents
-    assert "launch each stage's agent without `model`, because each is pinned in its definition" in section("Skills")
+    skills = section("Skills")
+    assert "launch `plumbline:orchestrator` in the background with the run id, and wait for its report without polling" in skills
+    assert "the legs' own tokens apart, as `orchestration`" in skills and "points the main session to the procedure in `agents/orchestrator.md`, to follow itself" in skills
+    assert "launch the agents of one step together: all in ONE message".lower() not in skills.lower()  # the procedure is the orchestrator's, in its prompt
     for role in pl.AGENT_RECORDS:  # the orchestrator has no Write tool: it writes no file
         body = (REPO / "agents" / f"{role}.md").read_text(encoding="utf-8")
         assert "with the Write tool" in body, role

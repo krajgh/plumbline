@@ -253,46 +253,25 @@ def run_skill():
     return frontmatter(REPO / "skills" / "run" / "SKILL.md")[1]
 
 
+def orchestrator_body():
+    """The stage procedure the run skill used to hold: the orchestrator's prompt."""
+    return frontmatter(REPO / "agents" / "orchestrator.md")[1]
+
+
 def between(text, start, end):
     return text[text.index(start) : text.index(end)]
 
 
-def test_the_run_skill_briefs_the_defender_with_the_merge_base_and_the_hash():  # C-24
-    body = run_skill()
+def test_the_orchestrator_briefs_the_defender_with_the_merge_base_and_the_hash():  # C-24
+    body = orchestrator_body()
     defenders = between(body, "2. **Defenders.**", "3. `PLUMBLINE merge-review")
     assert "the merge base" in defenders and "diff_sha256" in defenders and "the paths of the findings records" in defenders
     prompt = (REPO / "agents" / "defender.md").read_text(encoding="utf-8")
     assert "the merge base" in prompt and "`diff_sha256`" in prompt  # what the prompt expects, the brief gives
 
 
-def test_the_run_skill_launches_every_plumbline_agent_without_a_model_because_each_is_pinned():
-    body = run_skill()
-    paragraph = between(body, "**Launch every plumbline agent", "**Every brief**")
-    assert "without `model`" in paragraph and "each is pinned in its definition" in paragraph and "Leave `isolation` out as well" in paragraph
-    assert "Sonnet for the planner, test-writer, builder, prosecutor, detective and canary; Haiku for the verifier and defender" in paragraph
-    pins = {name: frontmatter(REPO / "agents" / f"{name}.md")[0]["model"] for name in pl.AGENT_ROLES}  # what the agent files say, which is what the paragraph repeats
-    assert sorted(n for n, model in pins.items() if model == "sonnet") == sorted(["planner", "test-writer", "builder", "prosecutor", "detective", "canary", "orchestrator"])
-    assert sorted(n for n, model in pins.items() if model == "haiku") == ["defender", "verifier"]
-    assert "(without `model`: the defender is pinned to Haiku)" in between(body, "2. **Defenders.**", "3. `PLUMBLINE merge-review")
-    assert "model:" not in body  # no launch in the skill names a model
-
-
-def test_the_run_skill_briefs_the_test_writer_on_how_the_tests_run_and_where_the_stubs_go():
-    body = run_skill()
-    brief = between(body, "- test-writer:", "- builder: the plan record.")
-    for needed in (
-        "the plan's `stubs_dir`", "the tests run against today's code, with the new names imported inside the test functions",
-        "so that each test fails when it runs (on the import of a name the change has yet to add, or on an assertion) and not at collection",
-        "Stubs are for brand-new modules only: they go in `stubs_dir`, outside the change and hidden from the builder",
-        '(for pytest, the test command followed by `-o pythonpath="<stubs_dir> ."`)', "Its `files_written` lists the stubs too",
-    ):
-        assert needed in brief, needed
-    assert "the `stubs_dir` of the run" in between(body, "## 3. Start the run", "## 4. The stages")
-    assert "tests/_stubs" not in body
-
-
-def test_the_run_skill_briefs_the_detective_with_the_merge_base_the_spec_and_the_tests_record():  # C-24
-    body = run_skill()
+def test_the_orchestrator_briefs_the_detective_with_the_merge_base_the_spec_and_the_tests_record():  # C-24
+    body = orchestrator_body()
     detective = between(body, "4. **Detective.**", "5. `PLUMBLINE gate")
     for needed in ("the merge base", "the path of the spec", "of the tests record", "diff_sha256", "the merged record's path", "its record path"):
         assert needed in detective, needed
@@ -300,9 +279,9 @@ def test_the_run_skill_briefs_the_detective_with_the_merge_base_the_spec_and_the
     assert "the merge base" in prompt and "the paths of the spec and of the tests record" in prompt
 
 
-def test_the_run_skill_gives_every_review_agent_the_hash_of_the_change_from_check_diff():  # C-09
-    body = run_skill()
-    assert "PLUMBLINE check-diff --run <run_id>" in body and "`merge_base` and the `diff_sha256`" in body
+def test_the_orchestrator_gives_every_review_agent_the_hash_of_the_change_from_check_diff():  # C-09
+    body = orchestrator_body()
+    assert "PLUMBLINE check-diff --run <run id>" in body and "`merge_base` and the `diff_sha256`" in body
     for start, end in (("1. **Prosecutors.**", "2. **Defenders.**"), ("2. **Defenders.**", "3. `PLUMBLINE merge-review"), ("4. **Detective.**", "5. `PLUMBLINE gate")):
         assert "`diff_sha256`" in between(body, start, end), start
     for agent in ("prosecutor", "defender", "detective"):
@@ -310,9 +289,9 @@ def test_the_run_skill_gives_every_review_agent_the_hash_of_the_change_from_chec
         assert prompt.count("diff_sha256") >= 2, agent  # in what the brief gives, and in the record
 
 
-def test_the_run_skill_routes_tests_lens_findings_to_the_test_writer_and_gives_the_builder_text_only():  # C-06, C-07
-    body = run_skill()
-    failing = between(body, "## 6. When a gate fails", "## 7. Reduce")
+def test_the_orchestrator_routes_tests_lens_findings_to_the_test_writer_and_gives_the_builder_text_only():  # C-06, C-07
+    body = orchestrator_body()
+    failing = between(body, "## When a gate fails", "## A decision comes back")
     assert "The surviving findings under \"for the test-writer\" go to the test-writer" in failing
     assert "\"for the builder\" text of the surviving findings" in failing
     brief = between(body, "- builder: the plan record.", "- verifier:")
@@ -322,33 +301,20 @@ def test_the_run_skill_routes_tests_lens_findings_to_the_test_writer_and_gives_t
 
 def test_the_run_skill_says_how_a_run_in_progress_is_resumed():  # C-30
     body = run_skill()
-    resume = between(body, "**A run may be in progress already**", "## 1. The intent")
+    resume = between(body, "**A run may be in progress already**", "## 1. Intake")
     assert ".plumbline/runs/ACTIVE" in resume and "PLUMBLINE status" in resume
-    assert "continue that run" in resume and "from the first one that is not `pass`, `supplied` or `recorded`" in resume
+    assert "start a leg for that run (section 3)" in resume and "from the first that is not `pass`, `supplied` or `recorded`" in resume
     status = frontmatter(REPO / "skills" / "status" / "SKILL.md")[1]
     assert "`/plumbline:run` continues it" in status
 
 
-def test_the_run_skill_says_what_the_rounds_and_exit_3_mean_and_where_plan_and_tests_go_back_to():  # C-08
-    failing = between(run_skill(), "## 6. When a gate fails", "## 7. Reduce")
-    assert '"round k of N"' in failing and "exits 3 when the stage has used its rounds" in failing
-    assert "`plan` and `tests` go back to their own agent" in failing
-
-
-def test_the_run_skill_says_where_a_problem_of_the_tests_and_verify_gates_comes_from():
-    failing = between(run_skill(), "## 6. When a gate fails", "## 7. Reduce")
-    assert "starts with where it comes from: `the agent's record` (what the agent typed) or `the measured run` (what `gate` saw when it ran the repository's commands)" in failing
-    assert "A problem of the record goes back to the agent that wrote it" in failing and "`no test command is declared`" in failing
-    assert pl._typed(["x"]) == ["the agent's record: x"] and pl._measured(["x"]) == ["the measured run: x"]  # the words the skill quotes
-
-
-def test_the_run_skill_says_gate_opens_each_later_rounds_directory_and_asks_for_no_step_of_the_main_session():  # the hook's round and the CLI's meet here
-    body = run_skill()
-    units = between(body, "## 5. Review units", "Start each round with")
+def test_the_orchestrator_says_gate_opens_each_later_rounds_directory_and_asks_for_no_step_of_its_own():  # the hook's round and the CLI's meet here
+    body = orchestrator_body()
+    units = between(body, "## Review units", "Start each round with")
     assert "the hook holds them to the highest round directory their stage has" in units and "Round 1's directory appears when its first agent writes" in units
     assert "`gate` creates `round-<n+1>/` itself" in units and "blockers standing" in units and "rounds left" in units
     assert "`merge-review` with no `--round` merges the highest round" in units
-    assert "the one whose directory `gate` opened" in between(body, "## 6. When a gate fails", "## 7. Reduce")
+    assert "the one whose directory `gate` opened" in between(body, "## When a gate fails", "## A decision comes back")
     assert "mkdir" not in body and "create the directory" not in body.lower() and "create the round" not in body.lower()
 
 

@@ -311,8 +311,8 @@ def test_the_defender_compares_a_concession_with_the_severity_rubric_and_claims_
     assert "severity_claim" in pl.load_schema("defense_record")["properties"]["defenses"]["items"]["properties"] and "severity_claim" in body
 
 
-def test_the_run_skill_says_what_merge_review_does_with_a_claim():
-    body = frontmatter(REPO / "skills" / "run" / "SKILL.md")[1]
+def test_the_orchestrator_says_what_merge_review_does_with_a_claim():
+    body = frontmatter(REPO / "agents" / "orchestrator.md")[1]
     step = between(body, "3. `PLUMBLINE merge-review", "4. **Detective.**")
     assert "when enough defenders claim a higher one (`severity_claim` on a conceded verdict), the finding stands at that level" in step
     assert "a finding raised to BLOCKING is a blocker like any other" in step

@@ -768,24 +768,28 @@ def test_the_pass_record_of_a_calibration_run_carries_what_the_canary_measured_a
 # --- the run skill and the README
 
 
-def test_the_run_skill_explains_the_calibration_run_and_the_canarys_round():
+def test_the_run_skill_asks_for_a_calibration_run_only_when_the_builder_wants_one_and_reports_what_the_canary_measured():
     body = frontmatter(REPO / "skills" / "run" / "SKILL.md")[1]
-    start_section = between(body, "## 3. Start the run", "## 4. The stages")
+    start_section = between(body, "## 2. Start the run", "## 3. Run a leg")
     assert "PLUMBLINE plan --intent <intent> [--row <row>] [--spec <file>] --request-file <file> [--calibrate]" in start_section
     assert "`--calibrate` marks a calibration run" in start_section and "ask for it only when the builder wants to measure whether the defenders can refute a finding at all" in start_section
+    assert "what the canary measured" in between(body, "## 5. When every gate has passed", "## 6. Push")
+
+
+def test_the_orchestrator_runs_the_canarys_round_and_reports_how_the_defenders_answered_it():
+    body = frontmatter(REPO / "agents" / "orchestrator.md")[1]
     prosecutors = between(body, "1. **Prosecutors.**", "2. **Defenders.**")
-    assert "Wait until every prosecutor has reported. In a calibration run, in a round whose stage has defenders, launch `plumbline:canary` then, in the foreground" in prosecutors
+    assert "In a calibration run (`calibrate` is true in the plan), a round whose stage has `defenders` also gets the canary, once the prosecutors have reported. Launch `plumbline:canary` then, in the foreground" in prosecutors
     assert "the lenses of the round, the paths of the prosecutors' records and the round directory" in prosecutors
-    assert "writes its record `prosecutor-<lens>-b.json` and its key `canary-key.json` there" in prosecutors and "on the `RECORD:` line of its report" in prosecutors
+    assert "writes its record `prosecutor-<lens>-b.json` and its key `canary-key.json` in the round directory" in prosecutors and "on the `RECORD:` line of its report" in prosecutors
     defenders = between(body, "2. **Defenders.**", "3. `PLUMBLINE merge-review")
     assert "In a calibration run the canary's record is one of the findings records: list its path with the others, written the same way, and say nothing of a canary" in defenders
     assert "The canary is a finding to answer, so launch the defenders the round's rule names even when no prosecutor filed a finding" in defenders
     merge_step = between(body, "3. `PLUMBLINE merge-review", "4. **Detective.**")
-    assert "In a calibration run it also prints `canary: refuted by 2 of 3 defenders`" in merge_step and "tell the builder how the defenders answered it" in merge_step
-    assert "A defender that concedes the canary concedes whatever it reads" in merge_step
-    assert "what the canary measured" in between(body, "## 7. Reduce", "## 8.")
-    summary = between(body, "**A calibration run** answers", "## 6. When a gate fails")
+    assert "In a calibration run it also prints `canary: refuted by 2 of 3 defenders`" in merge_step and "keep that line for your report" in merge_step
+    summary = between(body, "**A calibration run** answers", "## When a gate fails")
     assert "can the defenders refute a finding at all?" in summary and "The canary is no finding of the review: it is in no list of survivors, no route, no count of blockers and no open finding" in summary
+    assert "In a calibration run the report carries the `canary:` line `merge-review` printed" in body
 
 
 def test_the_readme_explains_calibration_runs_the_eighth_agent_and_the_canarys_hooks():

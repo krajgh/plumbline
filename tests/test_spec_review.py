@@ -420,17 +420,22 @@ def test_the_denial_names_the_spec_review_among_the_stages_a_review_agent_writes
 # --- the skill and the README
 
 
-def test_the_run_skill_says_how_the_request_is_stored_and_what_a_failed_spec_review_does():
+def test_the_run_skill_says_how_the_request_is_stored():
     body = frontmatter(REPO / "skills" / "run" / "SKILL.md")[1]
-    start_section = between(body, "## 3. Start the run", "## 4. The stages")
+    start_section = between(body, "## 2. Start the run", "## 3. Run a leg")
     assert "Write the request, as the builder gave it, to a file too (`.plumbline/request.md` is a good place: git ignores it)" in start_section
     assert "PLUMBLINE plan --intent <intent> [--row <row>] [--spec <file>] --request-file <file>" in start_section
-    assert "stores the request as the run's `request.md` (its hash goes into the ledger first, as the intake record's does)" in start_section and "the `request` file" in start_section
-    assert "From the second round of the spec review, the text of the surviving findings that `merge-review` printed under \"for the planner\", verbatim." in between(body, "## 4. The stages", "## 5. Review units")
+    assert "stores the request as the run's `request.md` (its hash goes into the ledger first, as the intake record's does)" in start_section
+
+
+def test_the_orchestrator_briefs_the_spec_review_and_says_what_a_failed_one_does():
+    body = frontmatter(REPO / "agents" / "orchestrator.md")[1]
+    assert "the `request` file" in between(body, "## Where the run stands", "Take the stages in order")
+    assert "From the second round of the spec review, the text of the surviving findings that `merge-review` printed under \"for the planner\", verbatim." in between(body, "## An agent stage", "## Review units")
     assert "for the review of the spec, the plan record against the run's `request.md`" in between(body, "1. **Prosecutors.**", "2. **Defenders.**")
-    failing = between(body, "## 6. When a gate fails", "## 7. Reduce")
+    failing = between(body, "## When a gate fails", "## A decision comes back")
     assert "`spec-review` goes back to `plan`. Send the planner the text under \"for the planner\"" in failing
-    assert "Where the intent supplied the spec, `plan` is not in the run, the failure goes to the builder (`on_fail` is `main`), and a corrected spec means a new run." in failing
+    assert "Where the intent supplied the spec, `plan` is not in the run and the failure goes to the main session (`on_fail` is `main`): hand back, because a corrected spec means a new run." in failing
 
 
 def test_the_readme_documents_the_spec_review_the_request_file_and_the_planner_route():

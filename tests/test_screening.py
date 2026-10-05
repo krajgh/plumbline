@@ -463,8 +463,8 @@ def test_the_defender_prompt_names_the_screening_defender_and_the_findings_a_bri
     assert "A screening defender (`screen-<k>`) works the same way and answers alone" in body and "a `severity_claim` of `BLOCKING` sends the finding to the full panel" in body
 
 
-def test_the_run_skill_says_who_defends_and_what_a_claim_of_blocking_asks_for():
-    body = frontmatter(REPO / "skills" / "run" / "SKILL.md")[1]
+def test_the_orchestrator_says_who_defends_and_what_a_claim_of_blocking_asks_for():
+    body = frontmatter(REPO / "agents" / "orchestrator.md")[1]
     defenders = between(body, "2. **Defenders.**", "3. `PLUMBLINE merge-review")
     for needed in (
         "**A BLOCKING finding was filed:** the full panel defends all the findings", "named `defender-1`, `defender-2`", "`.../defender-<k>.json`",
@@ -480,7 +480,7 @@ def test_the_run_skill_says_who_defends_and_what_a_claim_of_blocking_asks_for():
     ):
         assert needed in merge_step, needed
     assert "its `panel_needed` is empty, launch `plumbline:detective`" in between(body, "4. **Detective.**", "5. `PLUMBLINE gate")
-    assert "goes back to no stage" in between(body, "## 6. When a gate fails", "## 7. Reduce") and "`gate` counts no round for it and opens none" in body
+    assert "goes back to no stage" in between(body, "## When a gate fails", "## A decision comes back") and "`gate` counts no round for it and opens none" in body
 
 
 def test_the_readme_describes_the_screening_defenders_and_the_files_they_write():
