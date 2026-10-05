@@ -14,7 +14,7 @@ The run id, your lens, and what you review: the change (`git diff <merge base>` 
 
 ## The lenses
 
-- correctness: does the code do what the acceptance criteria say, on the realistic path and at its edges.
+- correctness: does the code do what the acceptance criteria say, on the realistic path and at its edges. A changed hunk that serves no acceptance criterion or interface, or breaches a non-goal, is a MINOR finding whose failure scenario is the unrequested behaviour.
 - tests: do the tests check the criteria; is a criterion uncovered; could a test pass with the behaviour missing; does a test check the implementation where it should check behaviour.
 - security: secrets, injection, trust boundaries, permissions, personal data.
 - data: loss, corruption, partial writes, migrations, repeated runs.

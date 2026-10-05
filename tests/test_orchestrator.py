@@ -542,6 +542,15 @@ def test_intake_infers_and_confirms_the_intent_and_the_row_and_the_plan_command_
     assert "Keep the `run_id` it prints: the orchestrator reads the rest of the plan itself." in start and "If the command refuses, tell the builder why, and stop." in start
 
 
+def test_intake_lists_the_other_readings_of_the_request_and_the_final_report_shows_the_risks_and_the_assumptions():
+    body = skill()[1]
+    intake = between(body, "## 1. Intake", "## 2. Start the run")
+    assert "let the builder confirm or correct them in one question. The question also lists any other plausible reading of the request." in intake
+    reduce = between(body, "## 5. When every gate has passed", "## 6. Push")
+    assert "the declared and measured row, the spec's `risks` and the build note's `assumptions`, what the run leaves open" in reduce
+    assert "risks" in pl.load_schema("spec")["properties"] and "assumptions" in pl.load_schema("build_note")["properties"]  # both are in the records the report reads
+
+
 def test_a_leg_is_started_in_the_background_with_the_run_id_and_waited_for_without_polling():
     leg = between(skill()[1], "## 3. Run a leg", "## 4. A report that needs the builder")
     assert "Launch the agent `plumbline:orchestrator` with the Agent tool, `run_in_background: true`, without `model` (it is pinned to Sonnet) and without `isolation`." in leg

@@ -15,7 +15,7 @@ The run id, the path of the spec (the plan record), the path where you write you
 ## How you work
 
 1. Read the spec, then read the source it touches with Read, Grep and Glob, and trace the real flow before you write. Give Grep and Glob an explicit path such as `src/`. Tests belong to the test-writer and stay out of your view.
-2. Choose the smallest change that meets the criteria, with ponytail's ladder. Stop at the first rung that holds: does it need to exist at all; is it already in this codebase (reuse it); does the standard library do it; does the platform do it natively; does an installed dependency do it; is it one line; only then, the minimum that works. Validation at trust boundaries, data-loss handling and security stay in.
+2. Choose the smallest change that meets the criteria, with ponytail's ladder. Stop at the first rung that holds: does it need to exist at all; is it already in this codebase (reuse it); does the standard library do it; does the platform do it natively; does an installed dependency do it; is it one line; only then, the minimum that works. Validation at trust boundaries, data-loss handling and security stay in. Change only what the criteria and interfaces call for; the spec's `non_goals` are off-limits. Leave neighbouring code, comments and formatting as you found them, in the file's style. Remove only what your change leaves unused, and list unrelated dead code in `summary` instead of deleting it.
 3. Write the change with Edit and Write in the repository's source files. The interfaces of the spec are the names and signatures to use.
 4. Where the spec is silent, choose, and write the choice under `assumptions`.
 5. You have no Bash: nothing here runs the code. The verifier runs it after you.

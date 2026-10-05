@@ -23,7 +23,7 @@ If that is empty, ask the builder what to change, and wait.
 
 ## 1. Intake
 
-Settle the intent and the row before anything is planned, state both in a sentence each, and let the builder confirm or correct them in one question.
+Settle the intent and the row before anything is planned, state both in a sentence each, and let the builder confirm or correct them in one question. The question also lists any other plausible reading of the request.
 
 **The intent** says why the change is made, and decides which stages of the row run. Ask for it, or infer it and give the reason. Skip the question when the request names the intent.
 
@@ -71,7 +71,7 @@ A leg ends with every gate passed (section 5), or with a decision only the build
 1. Look at `git status` and `git diff`: the change is what was meant.
 2. Commit it yourself: add the files of the change and `git commit`. The commit is checked for a symlink, an absolute home path and a key-shaped secret.
 3. `PLUMBLINE pass <run_id>`. It needs a clean tree, a row that reaches reduce, and every gate passed. It measures the change again and refuses a run whose row lacks a stage the measured row selects, and it refuses when the change was edited after `verify` and `review` covered it: then start a leg again, which runs from `verify`.
-4. Report to the builder: `PLUMBLINE status --run <run_id>` (it ends with the rounds each stage took), `PLUMBLINE tokens <run_id>` (an output count whose `output_lower_bound` is above 0 is at least that; `by_model` is what the stage agents used and `orchestration` what the orchestrator's legs used, which sat in your own session before), the intent, the declared and measured row, what the run leaves open: the surviving findings that are not BLOCKING and the detective's gaps (`PLUMBLINE open`, section 7), and, for a calibration run, what the canary measured (the pass record's notes have it).
+4. Report to the builder: `PLUMBLINE status --run <run_id>` (it ends with the rounds each stage took), `PLUMBLINE tokens <run_id>` (an output count whose `output_lower_bound` is above 0 is at least that; `by_model` is what the stage agents used and `orchestration` what the orchestrator's legs used, which sat in your own session before), the intent, the declared and measured row, the spec's `risks` and the build note's `assumptions`, what the run leaves open: the surviving findings that are not BLOCKING and the detective's gaps (`PLUMBLINE open`, section 7), and, for a calibration run, what the canary measured (the pass record's notes have it).
 
 ## 6. Push
 

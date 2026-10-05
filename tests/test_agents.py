@@ -152,6 +152,16 @@ def test_the_prosecutor_asks_for_every_field_of_a_finding_and_one_lens_per_run()
     assert "through one lens" in body and "unique across the round" in body and "a quote from the code" in body
 
 
+def test_the_correctness_lens_files_a_hunk_nothing_asked_for_as_a_minor_finding_whose_failure_is_the_unrequested_behaviour():
+    body = agent("prosecutor")[1]
+    lens = next(line for line in body.splitlines() if line.startswith("- correctness:"))
+    assert "A changed hunk that serves no acceptance criterion or interface, or breaches a non-goal, is a MINOR finding whose failure scenario is the unrequested behaviour." in lens
+    assert lens.index("on the realistic path and at its edges.") < lens.index("A changed hunk")  # after what the lens asked for, which is the missing and the wrong
+    assert "serves no acceptance criterion" not in "\n".join(line for line in body.splitlines() if not line.startswith("- correctness:"))  # the clause belongs to this lens alone
+    assert "non_goals" in pl.load_schema("spec")["properties"] and "MINOR" in pl.load_schema("review_record")["properties"]["findings"]["items"]["properties"]["severity"]["description"]
+    assert len(" ".join(lens.split()).split("edges.")[1].split()) <= 30  # about 25 words: a clause, and no new section
+
+
 def test_the_prosecutor_names_all_six_lenses():
     body = agent("prosecutor")[1]
     for lens in pl.KNOWN_LENSES:
@@ -233,6 +243,30 @@ def test_the_test_writer_says_what_a_true_stub_check_means_in_each_kind_of_run()
     description = pl.load_schema("tests_record")["properties"]["stub_check"]["description"]
     assert "all_failed_on_assertions is true when that holds" in description and "In a fix every test must fail on an assertion" in description
     assert "the stubs under the run's stubs directory included" in pl.load_schema("tests_record")["properties"]["files_written"]["description"]
+
+
+def test_the_builder_changes_only_what_the_criteria_call_for_and_leaves_the_rest_as_it_found_it():
+    body = agent("builder")[1]
+    step = next(line for line in body.splitlines() if line.startswith("2. "))
+    for needed in (
+        "Change only what the criteria and interfaces call for; the spec's `non_goals` are off-limits.",
+        "Leave neighbouring code, comments and formatting as you found them, in the file's style.",
+        "Remove only what your change leaves unused, and list unrelated dead code in `summary` instead of deleting it.",
+    ):
+        assert needed in step, needed
+    assert step.index("Validation at trust boundaries, data-loss handling and security stay in.") < step.index("Change only what the criteria")  # after the ladder, which it does not replace
+    assert "non_goals" in pl.load_schema("spec")["properties"] and "summary" in pl.load_schema("build_note")["properties"]  # the two fields it names are in the records
+    assert len(step.split("stay in.")[1].split()) <= 50  # about 46 words
+
+
+def test_the_readme_says_in_a_line_or_two_what_the_prose_additions_ask_of_the_prosecutor_the_builder_and_the_run_skill():
+    from test_readme import section
+
+    agents, skills = section("Agents"), section("Skills")
+    assert "through the `correctness` lens it files a changed hunk that serves no acceptance criterion or interface, or breaches a non-goal, as a MINOR finding" in agents
+    assert "every other stage looks for missing work, and this one for surplus" in agents
+    assert "The builder changes only what the criteria and interfaces call for, leaves neighbouring code, comments and formatting as it found them, and lists unrelated dead code in its `summary` instead of deleting it." in agents
+    assert "the one question also lists other plausible readings of the request" in skills and "report the spec's `risks` and the build note's `assumptions`" in skills
 
 
 def test_the_planner_writes_at_size_l_a_split_proposal():
