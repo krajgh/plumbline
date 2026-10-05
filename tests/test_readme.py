@@ -258,7 +258,7 @@ def test_a_named_group_is_valid_in_the_node_that_runs_ponytails_hook_and_is_not_
 def test_the_status_line_gives_the_manifests_version_and_the_phase():
     status = section("Status").strip()
     version = json.loads((REPO / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))["version"]
-    assert version == "0.5.0" and status.startswith(f"Version {version}.")
+    assert version == "0.5.1" and status.startswith(f"Version {version}.")
     assert "Phase 2, agents and enforcement, is done: the eight agents" in status
     assert "Version 0.4.1 carried what the first real session found" in status and "Version 0.4.2 carried what the first real run found" in status
     for fix in (
@@ -268,7 +268,7 @@ def test_the_status_line_gives_the_manifests_version_and_the_phase():
         assert fix in status, fix
     assert "Phase 3, light testing in a real session, is done" in status and "has begun" not in status and "The next phase is phase 3" not in status
     assert "Version 0.4.2 was the first public release." in status and "Not yet published" not in status
-    assert "Version 0.5.0 carries what those two runs showed. About the review:" in status and "so far" not in status
+    assert "Version 0.5.0 carried what those two runs showed. About the review:" in status and "so far" not in status
     for item in (
         "open findings last beyond the run (the pass record keeps them, `plumbline.py open` lists them and `status` counts them)", "a defender can claim a higher severity (`severity_claim` on a conceded verdict)",
         "a full defender panel only when a prosecutor filed a BLOCKING finding (a screening defender answers otherwise, and `panel_needed` keeps the step)",

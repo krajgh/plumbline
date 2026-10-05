@@ -245,3 +245,16 @@ def test_the_readme_the_prompt_and_the_gate_agree_on_what_a_stale_review_is():
     assert "A review that fails with \"the tests changed after test-review read them\" (or the plan, after spec-review) goes back to no agent stage" in failing
     assert "run its review again as the round `gate` opened (`next_round`)" in failing
     assert "merged before 0.5.1" in README
+
+
+# --- the limit the README lists for it is real today
+
+
+def test_a_test_file_edited_under_an_unchanged_tests_record_does_not_make_the_test_review_stale(run_cli, stored):
+    review_the_tests(run_cli, stored)
+    assert gate(run_cli, stored, "test-review").returncode == 0
+    write(stored / "tests" / "test_app.py", "def test_ac_1():\n    assert False  # edited after the review, and the record says nothing of it\n\ndef test_ac_2():\n    assert False\n")
+    assert gate(run_cli, stored, "test-review").returncode == 0  # the record is as it was read: the hash is of the record, not of the files it names
+    limits = section("Limits")
+    assert "**Reviews**" in limits and "- **A test file edited under an unchanged tests record.**" in limits
+    assert "a test file the test-writer edits without its record changing is not seen by it. The review of the diff, `verify` and `pass` cover the change as a whole." in limits

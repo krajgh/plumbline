@@ -655,10 +655,10 @@ def test_the_readme_limits_name_what_is_left_open_about_the_orchestrator():
     assert "SendMessage" in load(HOOKS)["hooks"]["PreToolUse"][0]["matcher"].split("|")  # and the limit is closed: the matcher names it
 
 
-def test_the_readme_status_says_what_0_5_0_carries():
+def test_the_readme_status_says_what_0_5_0_and_0_5_1_carry():
     status = readme_section("Status")
-    assert status.strip().startswith("Version 0.5.0.") and "About the cost: the orchestrator agent" in status
-    assert json.loads((REPO / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))["version"] == "0.5.0"
+    assert status.strip().startswith("Version 0.5.1.") and "About the cost: the orchestrator agent" in status and "Version 0.5.0 carried what those two runs showed." in status
+    assert json.loads((REPO / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))["version"] == "0.5.1"
 
 
 def test_the_status_skill_says_where_the_orchestrators_cost_is():

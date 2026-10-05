@@ -1,6 +1,6 @@
 {
   "name": "plumbline",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "A typed, adversarial change pipeline for Claude Code, defined as data, with the subagent discipline that keeps the main session the reduce.",
   "author": {
     "name": "krajgh",

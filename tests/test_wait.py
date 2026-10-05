@@ -428,3 +428,12 @@ def test_the_readme_documents_wait_the_resume_entry_and_the_send_message_rule():
     flow = text.split("**The run flow: the main session, the orchestrator's legs, the stage agents.**", 1)[1].split("\n\n", 1)[0]
     assert "after a SendMessage it runs `wait` for that agent before any gate" in flow and "no shell variable, function or `sleep`, which the hook refuses" in flow
     assert "states item by item whether that decision is fully met, and recommends shipping only when every item is" in flow
+
+
+def test_the_limit_the_readme_lists_for_wait_is_real_today(started, monkeypatch):
+    from test_readme import section
+
+    limits = section("Limits")
+    assert "- **`wait` depends on the hook's `resume` entry.**" in limits and "so `wait` counts only the stops after it began: an agent that stopped before `wait` started is not seen, and `wait` times out." in limits
+    write_ledger(started, [agent_row("a1")])  # it stopped, and the message that woke it left no resume entry
+    assert pl.main(["wait", RUN, "a1", "--timeout", "0", "--project", str(started)]) == 1
