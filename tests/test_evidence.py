@@ -6,7 +6,7 @@ import pytest
 
 import plumbline as pl
 from helpers import commit_all, git, write
-from rundata import RUN, adopt, begin, ledger, now_hash, put, put_part, read, run_path
+from rundata import RUN, adopt, begin, ledger, now_hash, put, put_part, read, run_path, spec_record
 
 APP = "def fetch(url):\n    for attempt in range(3):\n        try:\n            return get(url)\n        except OSError:\n            continue\n    return None\n"
 
@@ -356,3 +356,99 @@ def test_the_ledger_entry_of_a_merge_lists_what_was_merged_and_the_round(run_cli
     [entry] = [e for e in ledger(unit) if e["kind"] == "merge"]
     assert entry["round"] == 2 and len(entry["parts"]) == 5 and all(set(p) == {"path", "sha256"} for p in entry["parts"])
     assert all("/round-2/" in p["path"] for p in entry["parts"])
+
+
+# --- a quote from a JSON record is read decoded: the raw file stores a double quote, a backslash and a line break as escapes
+
+PLAN = ".plumbline/runs/r1/plan.json"
+SCENARIO = 'Set the priority to "urgent" and read it back as "HIGH"; the file C:\\temp\\tasks.json keeps the order\nand a second line follows'
+
+
+@pytest.fixture
+def planned(unit):
+    """The code.S run of `unit`, with a plan record whose first test scenario holds double quotes, a backslash and a line break."""
+    record = spec_record()
+    record["test_plan"][0]["scenario"] = SCENARIO
+    put(unit, "plan", record, agent=False)
+    assert '\\"urgent\\"' in (unit / PLAN).read_text(encoding="utf-8") and "C:\\\\temp" in (unit / PLAN).read_text(encoding="utf-8")  # the file holds the escapes
+    return unit
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        'priority to "urgent" and read it back as "HIGH"',  # double quotes
+        "the file C:\\temp\\tasks.json keeps the order",  # a backslash
+        "keeps the order and a second line follows",  # the line break, as the whitespace it is
+        "keeps the order\nand a second line follows",
+        'Set the priority to "urgent" and read it back as "HIGH"; the file C:\\temp\\tasks.json keeps the order\nand a second line follows',  # the whole value
+        'priority to \\"urgent\\" and read',  # the raw spelling still counts
+        "the file C:\\\\temp\\\\tasks.json",
+    ],
+)
+def test_a_quote_taken_from_a_decoded_value_of_a_plan_record_is_found(planned, quote):
+    assert pl.Evidence(planned, []).holds(quote, PLAN, pl.MIN_QUOTE)
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        'priority to "urgent" and read it back as "LOW"',  # not in the record
+        "the file C:\\temp\\other.json keeps the order",
+        "keeps the order and a third line follows",
+        'priority to "urgent" and read it back as "HIGH" and more',
+        "",
+        "     ",
+    ],
+)
+def test_a_quote_the_record_does_not_hold_is_still_refused(planned, quote):
+    assert not pl.Evidence(planned, []).holds(quote, PLAN, pl.MIN_QUOTE)
+
+
+def test_a_quote_that_spans_two_values_of_the_record_is_not_one_the_record_holds(planned):
+    record = json.loads((planned / PLAN).read_text(encoding="utf-8"))
+    first, second = record["goal"], record["test_plan"][1]["scenario"]
+    assert not pl.Evidence(planned, []).holds(f"{first} {second}", PLAN, pl.MIN_QUOTE)  # each value stands alone: two of them are no quote of the record's words
+    assert pl.Evidence(planned, []).holds(first, PLAN, pl.MIN_QUOTE) and pl.Evidence(planned, []).holds(second, PLAN, pl.MIN_QUOTE)
+
+
+def test_only_a_json_file_is_decoded_and_only_its_values_are_searched(planned):
+    write(planned / "docs" / "notes.txt", 'say \\"hello world\\" to the user\n')
+    write(planned / "docs" / "broken.json", '{"scenario": "say \\"hello world\\" to the user"')  # not valid JSON: the raw text only
+    write(planned / "docs" / "keys.json", json.dumps({'a "quoted" key': "its value"}))
+    evidence = pl.Evidence(planned, [])
+    assert not evidence.holds('say "hello world" to the user', "docs/notes.txt", pl.MIN_QUOTE)  # a text file is read as it is
+    assert not evidence.holds('say "hello world" to the user', "docs/broken.json", pl.MIN_QUOTE)
+    assert evidence.holds('say \\"hello world\\" to the user', "docs/broken.json", pl.MIN_QUOTE)
+    assert not evidence.holds('a "quoted" key', "docs/keys.json", pl.MIN_QUOTE) and evidence.holds("its value", "docs/keys.json", pl.MIN_QUOTE)
+    assert sorted(pl.json_strings({"a": ["x", {"b": "y", "c": 3, "d": None, "e": True}], "f": "z"})) == ["x", "y", "z"]  # strings at any depth, and no number, null or boolean
+
+
+def test_a_json_file_outside_the_repository_is_not_read_decoded_either(planned, tmp_path):
+    write(tmp_path / "outside.json", json.dumps({"k": 'a "quoted" value of a file outside'}))
+    for name in ("../outside.json", str(tmp_path / "outside.json")):
+        assert not pl.Evidence(planned, []).holds('a "quoted" value of a file outside', name, pl.MIN_QUOTE), name
+
+
+def test_a_defenders_refutation_with_a_quote_from_the_plan_that_holds_double_quotes_counts(run_cli, planned):
+    parts(planned, {"correctness": [finding("correctness-1", severity="MAJOR", file=PLAN, evidence='Set the priority to "urgent"')]}, refuting=(1, 2, 3), quote='read it back as "HIGH"; the file C:\\temp\\tasks.json')
+    result = merge(run_cli, planned)
+    assert result.returncode == 0 and "which does not count" not in result.stderr, result.stderr
+    assert survivors(planned) == [] and read(planned, "review")["findings"][0]["evidence_unverified"] is False  # the evidence is found too, decoded
+
+
+def test_a_refutation_with_a_quote_the_plan_does_not_hold_is_still_discarded(run_cli, planned):
+    parts(planned, {"correctness": [finding("correctness-1", severity="MAJOR", file=PLAN, evidence="a quote the plan never held")]}, refuting=(1, 2, 3), quote='read it back as "LOW"; the file C:\\temp\\tasks.json')
+    result = merge(run_cli, planned)
+    assert survivors(planned) == ["correctness-1"]
+    assert f"with a quote that is in neither the change nor {PLAN}, which does not count" in result.stderr
+    assert read(planned, "review")["findings"][0]["evidence_unverified"] is True
+
+
+def test_the_readme_says_a_quote_of_a_json_record_may_be_decoded_and_the_code_does_that(planned):
+    from test_readme import section
+
+    text = section("Runs, gates and the pass record")
+    assert "or in the current content of the file the finding names, or, where that file is a JSON record (the plan, the tests record), in one of the record's decoded string values" in text
+    assert "stores a double quote, a backslash and a line break as escapes" in text and "a prosecutor's evidence is checked the same way, decoded values included" in text
+    assert pl.Evidence(planned, []).file_values(PLAN) and not pl.Evidence(planned, []).file_values("README.md")

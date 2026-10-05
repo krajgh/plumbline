@@ -2990,32 +2990,68 @@ def normalise_quote(text: str) -> str:
     return " ".join(text.split())
 
 
+def json_strings(data) -> list[str]:
+    """Every string value of decoded JSON, at any depth: the values, and not the keys."""
+    found, pending = [], [data]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            found.append(item)
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, dict):
+            pending.extend(item.values())
+    return found
+
+
 class Evidence:
     """Checks a quote against the change: it counts when, whitespace-normalised, it occurs in the change's diff (from the
-    merge base to the files as they are) or in the current content of the file the finding names."""
+    merge base to the files as they are) or in the current content of the file the finding names. Where that file is a JSON
+    record (the plan, say), the quote may also lie in one of the record's decoded string values: the raw text stores a double
+    quote, a backslash and a line break as escapes (`\\"urgent\\"`), and a quote copied from what the record says has none."""
 
     def __init__(self, root: Path, diff_lines: list[str]) -> None:
         self.root = root
         self.diff = normalise_quote("\n".join(diff_lines))
+        self._raw: dict[str, str] = {}
         self._files: dict[str, str] = {}
+        self._values: dict[str, list[str]] = {}
 
-    def file_text(self, name: str) -> str:
-        if name not in self._files:
+    def raw_text(self, name: str) -> str:
+        """The file the finding names as it is, or "" when it lies outside the repository, is missing, unreadable or over 8 MiB."""
+        if name not in self._raw:
             text = ""
             relative = os.path.normpath(name)
             path = self.root / relative
             try:
                 inside = not os.path.isabs(name) and path.resolve().is_relative_to(self.root.resolve())
                 if inside and path.is_file() and path.stat().st_size <= 8 << 20:
-                    text = normalise_quote(path.read_text(encoding="utf-8", errors="replace"))
+                    text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 pass
-            self._files[name] = text
+            self._raw[name] = text
+        return self._raw[name]
+
+    def file_text(self, name: str) -> str:
+        if name not in self._files:
+            self._files[name] = normalise_quote(self.raw_text(name))
         return self._files[name]
+
+    def file_values(self, name: str) -> list[str]:
+        """The decoded string values of a JSON record, each whitespace-normalised and apart from the others; none for a file that is no JSON."""
+        if name not in self._values:
+            values: list[str] = []
+            if name.lower().endswith(".json"):
+                try:
+                    values = [normalise_quote(text) for text in json_strings(json.loads(self.raw_text(name)))]
+                except (ValueError, RecursionError):
+                    pass
+            self._values[name] = values
+        return self._values[name]
 
     def holds(self, quote: str, name: str, at_least: int = 1) -> bool:
         wanted = normalise_quote(quote)
-        return len(wanted) >= at_least and (wanted in self.diff or wanted in self.file_text(name))
+        return len(wanted) >= at_least and (wanted in self.diff or wanted in self.file_text(name) or any(wanted in value for value in self.file_values(name)))
 
 
 def route_of(pipeline: dict, finding: dict) -> str:
