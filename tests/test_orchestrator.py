@@ -552,6 +552,19 @@ def test_intake_lists_the_other_readings_of_the_request_and_the_final_report_sho
     assert "risks" in pl.load_schema("spec")["properties"] and "assumptions" in pl.load_schema("build_note")["properties"]  # both are in the records the report reads
 
 
+def test_a_part_of_a_split_that_passed_offers_a_fresh_session_for_the_next_part_and_the_line_to_start_it_with():
+    text = (REPO / "skills" / "run" / "SKILL.md").read_text(encoding="utf-8")
+    body = skill()[1]
+    intake = between(body, "## 1. Intake", "## 2. Start the run")
+    assert "Start each part with a request that names the split, `Part <n> of the split proposed in run <the planning run's id>: <that part, as its `split_proposal` entry words it>`, so that its `request.md` shows where it came from." in intake
+    reduce = between(body, "## 5. When every gate has passed", "## 6. Push")
+    assert "When this run is a part of a split and another part remains, say that the next part can start in a fresh session (`/clear`), because the split proposal and every record are on disk" in reduce
+    assert "give the exact line to start it with, filled in from the planning run's `plan.json`: `/plumbline:run Part <n+1> of the split proposed in run <the planning run's id>: <that part>`" in reduce
+    assert "split_proposal" in pl.load_schema("spec")["properties"]  # the field the line is filled in from
+    assert len(text) < 12000  # the skill stays the main session's short part
+    assert text.count("/clear") == 1
+
+
 def test_a_leg_is_started_in_the_background_with_the_run_id_and_waited_for_without_polling():
     leg = between(skill()[1], "## 3. Run a leg", "## 4. A report that needs the builder")
     assert "Launch the agent `plumbline:orchestrator` with the Agent tool, `run_in_background: true`, without `model` (it is pinned to Sonnet) and without `isolation`." in leg

@@ -267,6 +267,7 @@ def test_the_readme_says_in_a_line_or_two_what_the_prose_additions_ask_of_the_pr
     assert "every other stage looks for missing work, and this one for surplus" in agents
     assert "The builder changes only what the criteria and interfaces call for, leaves neighbouring code, comments and formatting as it found them, and lists unrelated dead code in its `summary` instead of deleting it." in agents
     assert "the one question also lists other plausible readings of the request" in skills and "report the spec's `risks` and the build note's `assumptions`" in skills
+    assert "when the run is a part of a split and another part remains, say that the next part can start in a fresh session (`/clear`) and give the exact line to start it with" in skills
 
 
 def test_the_planner_writes_at_size_l_a_split_proposal():
