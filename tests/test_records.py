@@ -60,7 +60,7 @@ OPTIONAL = {
     ("defense_record", "$.defenses[]"): {"severity_claim"},  # 0.5.0: only a defender that concedes a finding worse than filed writes one
     ("review_record", "$.defenses[]"): {"severity_claim"},
     ("review_record", "$.findings[]"): {"severity_raised_from"},  # only on a finding that merge-review raised
-    ("review_record", "$"): {"panel_needed", "canary"},  # 0.5.0: a review record from 0.4.2 has no panel_needed, and only a calibration round has a canary
+    ("review_record", "$"): {"panel_needed", "canary", "target_sha256"},  # 0.5.0: a review record from 0.4.2 has no panel_needed, and only a calibration round has a canary; 0.5.1: a review of the diff has no target_sha256, and a record merged before has none
     ("change_class", "$"): {"calibrate", "weights"},  # only the intake record of a calibration run has the first; 0.5.1: the second is there only where a file type counts for less than a full line
     ("review_record", "$.routes"): {"planner"},  # a record from 0.4.2 routes to two roles
 }

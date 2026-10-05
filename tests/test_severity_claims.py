@@ -2,7 +2,6 @@
 when enough defenders claim the same, or more."""
 import json
 import re
-from types import SimpleNamespace
 
 import pytest
 
@@ -269,7 +268,9 @@ def test_the_gate_counts_a_raised_finding_from_the_record_and_not_from_what_the_
     record = read(unit, "review")
     assert pl.standing_blockers(record) == ["correctness-1"]
     record["blockers_surviving"] = 0  # a count that does not agree with the findings
-    assert any("blockers_surviving says 0, but the findings and survivors give 1" in p for p in pl._gate_no_surviving_blockers(record, SimpleNamespace(measuring=False)))
+    project = pl.load_project(unit)
+    ctx = pl.GateContext(project, RUN, next(s for s in project.pipeline["stage"] if s["id"] == "review"), None, [], False)
+    assert any("blockers_surviving says 0, but the findings and survivors give 1" in p for p in pl._gate_no_surviving_blockers(record, ctx))
 
 
 def test_a_review_without_claims_writes_the_findings_as_it_always_did(run_cli, unit):

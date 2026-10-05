@@ -2684,6 +2684,7 @@ def _gate_no_surviving_blockers(review: dict, ctx: GateContext) -> list[str]:
             problems.append(f"finding {fid} was filed BLOCKING and only a screening defender answered it; {PANEL_FIX}")
         else:
             problems.append(f"the screening defender claims finding {fid} is BLOCKING; {PANEL_FIX}")
+    problems += stale_target_problems(ctx.project.pipeline, ctx.root, ctx.run_id, ctx.stage, review)
     if ctx.measuring and ctx.run is not None and _is_diff_review(ctx.stage):
         current = change_hash(ctx.root, ctx.run.merge_base)
         if review["diff_sha256"] != current:
@@ -2975,13 +2976,17 @@ def check_all_gates_passed(project: Project, run_id: str, own_stage: dict) -> li
     for stage in [*run.supplied, *run.stages]:  # what an intent supplies is part of the run: it must still hold
         if stage["id"] == own_stage["id"]:
             continue
-        _data, record_problems = read_stage_record(root, run_id, stage)
+        data, record_problems = read_stage_record(root, run_id, stage)
         if record_problems:
             problems.append(f"stage '{stage['id']}': {record_problems[0]}")
             continue
         untraced = provenance_problems(root, run_id, stage, run, ledger)
         if untraced:
             problems += [f"stage '{stage['id']}': {p}" for p in untraced]
+            continue
+        stale = stale_target_problems(project.pipeline, root, run_id, stage, data) if stage.get("kind", "agent") == "review" else []
+        if stale:  # a review of the plan or the tests that read them as they were: its gate passed on another thing
+            problems += [f"stage '{stage['id']}': {p}" for p in stale]
             continue
         gate = stage.get("gate")
         if gate is None:
@@ -3064,12 +3069,44 @@ def _round_number(path: Path) -> int | None:
 TARGET_NAMES = {"tests": ("the tests", "them"), "plan": ("the plan", "it")}  # how a problem names what a review stage reviewed, and the pronoun that goes with it
 
 
+def review_target(pipeline: dict, stage: dict) -> str | None:
+    """The id of the stage a review stage reviews (the plan for the spec review, the tests for the test review), or None when it reviews the diff, which
+    its record's `diff_sha256` covers."""
+    target = stage.get("target")
+    return target if any(s["id"] == target for s in pipeline["stage"]) else None
+
+
+def target_changed(root: Path, run_id: str, stage: dict, review: dict) -> bool:
+    """Is the record that a review stage reviewed other than the one its merged record says it read (`target_sha256`)?"""
+    target, seen = stage.get("target"), review.get("target_sha256")
+    return isinstance(target, str) and isinstance(seen, str) and seen != file_sha256(run_dir(root, run_id) / f"{target}.json")
+
+
+def stale_target_problems(pipeline: dict, root: Path, run_id: str, stage: dict, review: dict) -> list[str]:
+    """A review of the plan or of the tests must say which version of it its agents read (`target_sha256`, set by `merge-review`), and that must still be
+    the record as it is: a review of something that has changed since reviewed another thing, and its gate, and `pass`, fail until it runs again as
+    the next round. The review of the diff is covered by `diff_sha256`."""
+    target = review_target(pipeline, stage)
+    if target is None:
+        return []
+    noun, them = TARGET_NAMES.get(target, (f"the {target} record", "it"))
+    if "target_sha256" not in review:
+        return [
+            f"the record does not say which version of {noun} {stage['id']} read (it was merged before plumbline 0.5.1): "
+            f"run `plumbline.py merge-review {run_id} {stage['id']} --round {review['round']}` again"
+        ]
+    if target_changed(root, run_id, stage, review):
+        return [f"{noun} changed after {stage['id']} read {them}; run it again as round {review['round'] + 1}"]
+    return []
+
+
 def review_round(root: Path, run_id: str, stage: dict, ledger: list[dict] | None = None) -> int:
     """The round the agents of a review stage write in now: the highest round-<n> directory the stage has (round 1 while it has none), or the one after it
-    when that round is over. A round is over when its gate has passed on the record `merge-review` built from it, or when its records were made before what
-    the stage reviews (its `target`: the plan, the tests) last changed. A review that runs again then, after a replan, a rebuild or a revision of the tests, or
-    to look at what was fixed once a gate had passed, is the next round, so it never writes over the history of a round that is over. A round whose gate failed
-    with blockers has its next directory already (`gate` opens it); a round still being written, or one whose gate has not run, goes on in its directory."""
+    when that round is over. A round is over when its gate has passed on the record `merge-review` built from it, or when what the stage reviews (its
+    `target`: the plan, the tests) has changed since: its merged record holds the hash it read (`target_sha256`), and records not yet merged were made
+    before it changed. A review that runs again then, after a replan, a rebuild or a revision of the tests, or to look at what was fixed once a gate had
+    passed, is the next round, so it never writes over the history of a round that is over. A round whose gate failed with blockers has its next
+    directory already (`gate` opens it); a round still being written, or one whose gate has not run, goes on in its directory."""
     unit = run_dir(root, run_id) / stage["id"]
     rounds = sorted(n for n in (_round_number(p) for p in unit.glob("round-*")) if n is not None)
     if not rounds:
@@ -3082,6 +3119,8 @@ def review_round(root: Path, run_id: str, stage: dict, ledger: list[dict] | None
         gate = latest_entry(ledger, "gate", stage=stage["id"])
         if gate is not None and gate.get("passed") is True and gate.get("record_sha256") == file_sha256(record_path):
             return highest + 1
+        if target_changed(root, run_id, stage, data):
+            return highest + 1  # merged, and what it reviewed has changed since
     target = stage.get("target")
     changed = changed_at(ledger, target) if isinstance(target, str) else None
     if changed is not None:
@@ -3551,6 +3590,8 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
             "finding_id": canary_id, "refuted_by": sorted(refuted.get(canary_id, ())),
             "conceded_by": sorted({d["defender"] for d in canary_answers if d["verdict"] == "conceded"}),
         }
+    reviewed_id = review_target(project.pipeline, stage)
+    reviewed = file_sha256(run_dir(root, run_id) / f"{reviewed_id}.json") if reviewed_id else None  # the plan or the tests record these parts read
     record = {
         "target": stage["target"],
         "round": round_no,
@@ -3564,6 +3605,7 @@ def merge_round(project: Project, run_id: str, stage_id: str, round_no: int | No
         "panel_needed": [f["id"] for f in findings if f["id"] in needed],
         **({"canary": canary} if canary is not None else {}),
         "diff_sha256": current,
+        **({"target_sha256": reviewed} if reviewed else {}),
     }
     errors = check_record("review_record", record)
     if errors:
@@ -4376,14 +4418,15 @@ def cmd_merge_review(args) -> int:
 
 
 def open_next_round(root: Path, run_id: str, stage: dict, outcome: GateOutcome, round_no: int, limit: int | None) -> Path | None:
-    """A review whose round ended with blockers standing, in a stage that has rounds left, goes back for another round. Its agents write
-    only in the highest round-<n> directory of their stage (the PreToolUse hook holds them to it) and `merge-review` merges the highest
-    round by default, so the directory of round N+1 is made here, and the main session has no step of its own to take. Returns it, or
-    None when the stage is no review, its rounds are used, the failure is the ledger's (a record that is missing, changed, or not traced
-    to its agents: that round is merged again, not left behind), no blocker stands, or a finding still needs the full panel."""
+    """A review whose round ended with blockers standing, or with what it reviewed changed since it read it (the plan, the tests), in a stage that has
+    rounds left, goes back for another round. Its agents write only in their stage's current round (the PreToolUse hook holds them to it, see
+    review_round) and `merge-review` merges the highest round by default, so the directory of round N+1 is made here, and the main session has no step
+    of its own to take. Returns it, or None when the stage is no review, its rounds are used, the failure is the ledger's (a record that is missing,
+    changed, or not traced to its agents: that round is merged again, not left behind), no blocker stands and its target is as it was read, or a
+    finding still needs the full panel."""
     if stage.get("kind", "agent") != "review" or limit is None or round_no >= limit or not outcome.checked or outcome.data is None:
         return None
-    if not standing_blockers(outcome.data) or outcome.data.get("panel_needed"):
+    if not (standing_blockers(outcome.data) or target_changed(root, run_id, stage, outcome.data)) or outcome.data.get("panel_needed"):
         return None  # a finding that needs the full panel is defended in this round: the next round opens once the panel has spoken
     directory = run_dir(root, run_id) / stage["id"] / f"round-{round_no + 1}"
     directory.mkdir(parents=True, exist_ok=True)

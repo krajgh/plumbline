@@ -286,8 +286,9 @@ def test_the_readme_describes_the_current_round_the_next_round_and_the_merge_ref
     paragraph = text.split("**Review rounds beyond the first.**", 1)[1].split("\n\n", 1)[0]
     for needed in (
         "The review agents write only in their stage's current round", "so the hook, `merge-review` and `gate` count one round",
-        "or the one after it when that round is over, and a round is over when its gate has passed on the record `merge-review` built from it, or when its records were made before what the stage reviews",
-        "a stop of the planner or the test-writer that leaves its record as it was changes nothing",
+        "or the one after it when that round is over, and a round is over when its gate has passed on the record `merge-review` built from it, or when what the stage reviews",
+        "has changed since: its merged record holds the hash it read (`target_sha256`), and records not yet merged were made before the change",
+        "A stop of the planner or the test-writer that leaves its record as it was changes nothing",
         "it never writes over the history of a round that is over", "`plan --run RUN` gives the number as each review stage's `next_round`",
         "`merge-review` refuses a round whose records predate the stage's upstream record", "A prosecutors' round that filed no findings needs no defender",
     ):

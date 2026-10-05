@@ -224,6 +224,11 @@
       "description": "The sha256 of the change this round covered: the diff from the run's merge base to the files as they were when `merge-review` built this record, untracked files included. For a review of the diff, `pass` refuses when the diff of HEAD hashes differently, so a change edited after its review fails.",
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "target_sha256": {
+      "description": "The sha256 of the record of the stage that was reviewed (the plan for the spec review, the tests record for the test review), as `merge-review` read it when it built this record. The gate, and `pass`, fail when that record has changed since, because the review read another version. Absent for a review of the diff, which `diff_sha256` covers, and in a record merged before 0.5.1.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     }
   }
 }

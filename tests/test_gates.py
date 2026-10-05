@@ -287,6 +287,7 @@ def test_no_surviving_blockers_passes_at_zero(run_cli, adopted):
     begin(adopted, "code.M")
     put(adopted, "review", review_record(blockers=0, diff=now_hash(adopted)))
     assert gate(run_cli, adopted, "review").returncode == 0
+    put(adopted, "tests", written_tests_record())  # what the test review read: its record says which version of it (`target_sha256`)
     put(adopted, "test-review", review_record(blockers=0, target="tests"))
     assert gate(run_cli, adopted, "test-review").returncode == 0
 
@@ -332,6 +333,7 @@ def test_the_gate_of_a_review_compares_the_records_hash_with_the_change_now(run_
 
 def test_the_gate_of_the_test_review_does_not_compare_hashes(run_cli, adopted):
     begin(adopted, "code.M")
+    put(adopted, "tests", written_tests_record())
     put(adopted, "test-review", review_record(blockers=0, target="tests", diff="f" * 64))  # made before the build: the change differs by design
     assert gate(run_cli, adopted, "test-review").returncode == 0
 

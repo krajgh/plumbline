@@ -121,6 +121,9 @@ def put(repo, stage_id, data, run_id=RUN, agent=True) -> Path:
     `agent=False` writes the file alone, as a person or a stray process would."""
     path = run_path(repo, run_id, f"{stage_id}.json")
     path.parent.mkdir(parents=True, exist_ok=True)
+    if agent and isinstance(data, dict) and stage_id in ("review", "test-review", "spec-review") and "target_sha256" not in data:
+        reviewed = pl.file_sha256(run_path(repo, run_id, f"{data.get('target')}.json"))  # what `merge-review` stamps: the hash of the plan or the tests record the review read
+        data = {**data, **({"target_sha256": reviewed} if reviewed else {})}
     path.write_text(data if isinstance(data, str) else json.dumps(data, indent=2), encoding="utf-8")
     if agent and isinstance(data, dict):
         if stage_id == "intake":
