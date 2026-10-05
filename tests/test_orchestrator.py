@@ -641,6 +641,21 @@ def test_the_readme_gives_the_orchestrators_measured_effect_as_a_direction_not_a
     assert text.index(note) < text.index("- **There is no token cap.**")
 
 
+def test_the_readme_gives_the_size_l_sequence_as_one_more_bullet_in_generic_terms_and_as_a_direction():
+    text = readme_section("What a run costs")
+    [bullet] = [line for line in text.splitlines() if line.startswith("- **A size-L request, in parts.**")]
+    for figure in (
+        "run with the orchestrator in place as a planning run and three size-M parts", "changed about 900 lines (nearly three quarters of them tests)", "in 4.4 hours on the clock",
+        "about 75 minutes of it machine time and the rest the user answering eight questions and starting each part", "about 23 million tokens from the cache, 5.3M of them in the main session",
+        "from two thirds in the size-M feature above to under a quarter", "A part read 4.5 to 11 million", "two thirds of the orchestrator's and agents' reads came in fix rounds the user chose",
+        "That is one run, so a direction and not a measure.",
+    ):
+        assert figure in bullet, figure
+    assert text.index("- **With the orchestrator, from 0.5.0.**") < text.index(bullet) < text.index("- **There is no token cap.**")
+    assert "/ho" + "me/" not in bullet and not re.search(r"\b[\w-]+/[\w.-]+\.py\b", bullet)  # no path, no project: the figures and plain words
+    assert not re.search(r"\b\d{8}T\d{6}Z\b|\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b", bullet)  # no run id, no timestamp, no commit
+
+
 def test_the_readme_limits_name_what_is_left_open_about_the_orchestrator():
     limits = readme_section("Limits")
     group = limits.split("**The orchestrator**", 1)[1].split("**Measured runs**", 1)[0]
