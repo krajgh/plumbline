@@ -208,6 +208,12 @@ def test_a_row_or_an_intent_may_name_the_requirements_lens():
     assert check(lambda d: d["intent"]["refactor"].update(lenses=["correctness", "requirements"])) == ([], [])
 
 
+def test_the_planner_is_told_what_sent_it_back_when_the_spec_review_fails():
+    body = agent("planner")[1]
+    assert "When you run again, the brief also gives what sent you back: the problems of the gate, or the text of the findings that the review of the spec made against your spec" in body
+    assert "write the spec again so that each is met" in body.split("## How you work")[0]
+
+
 def test_the_prosecutor_carries_the_requirements_lens_and_its_rubric():
     body = agent("prosecutor")[1]
     lens = next(line for line in body.splitlines() if line.startswith("- requirements:"))

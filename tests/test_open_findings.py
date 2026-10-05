@@ -13,7 +13,7 @@ from rundata import (
 )
 from samples import sample
 from test_manifests import between, frontmatter
-from test_readme import README, section
+from test_readme import section
 
 
 def finding(fid, severity="MINOR", lens="correctness", file="src/app.py", line=21):

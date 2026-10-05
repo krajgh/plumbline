@@ -16,7 +16,7 @@ from rundata import (
 from samples import sample
 from test_agents import agent
 from test_manifests import between, frontmatter
-from test_readme import README, rows, section
+from test_readme import rows, section
 
 ROUND = ("review", "round-1")
 

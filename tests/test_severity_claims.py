@@ -13,7 +13,7 @@ from rundata import RUN, adopt, intake_record, put, put_part, read, run_path
 from samples import sample
 from test_agents import SEVERITY_CLAUSES, agent
 from test_manifests import between, frontmatter
-from test_readme import README, section
+from test_readme import section
 
 
 @pytest.fixture

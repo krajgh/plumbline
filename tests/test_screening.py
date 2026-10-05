@@ -13,7 +13,7 @@ from samples import sample
 from test_agents import agent
 from test_manifests import between, frontmatter
 from test_pipeline import check, stage
-from test_readme import README, section
+from test_readme import section
 
 PANEL_FIX = "run the full panel for it in this round"
 
