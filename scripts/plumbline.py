@@ -2476,6 +2476,31 @@ def _measured_tests_problems(ctx: GateContext, revision: bool) -> list[str]:
     return problems
 
 
+def _stubs_named_problems(tests: dict, ctx: GateContext) -> list[str]:
+    """A file the test-writer wrote that names the run's stubs directory (`.plumbline/runs/<run-id>/stubs`, spelled with `/` or `\\`, relative or
+    absolute) imports from something no commit holds: the stubs stay in the run, so such a test passes in the run and fails in CI. Each file the
+    record names, the tests' own and `files_written`, is read for the path, apart from the stubs themselves."""
+    root = ctx.root.resolve()
+    stubs = f"{RUNS_DIR}/{ctx.run_id}/{STUBS_DIR}"
+    forms = (stubs, stubs.replace("/", "\\"))
+    problems = []
+    for name in dict.fromkeys([*tests["files_written"], *(test["file"] for test in tests["tests"])]):
+        path = Path(name) if os.path.isabs(name) else ctx.root / os.path.normpath(name)
+        try:
+            real = path.resolve()
+            if not real.is_relative_to(root) or not real.is_file() or real.stat().st_size > 8 << 20:
+                continue
+            inside = real.relative_to(root).as_posix()
+            if inside == stubs or inside.startswith(stubs + "/"):
+                continue  # a stub may say where it is
+            text = real.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if any(form in text for form in forms):
+            problems.append(f"{name} names the run's stubs directory; a test must import the real module")
+    return problems
+
+
 def _stub_problems(tests: dict, ctx: GateContext, on_stubs: bool) -> list[str]:
     """The tests stage's checks in one place: coverage, at least one test, what the test-writer says its run showed, and
     what the measured run showed. The tests run against today's code (a change to modules that exist imports its new names
@@ -2484,6 +2509,7 @@ def _stub_problems(tests: dict, ctx: GateContext, on_stubs: bool) -> list[str]:
     problems = _acs_covered_problems(tests, ctx)
     if not tests["tests"]:
         problems.append("there are no tests")
+    problems += _stubs_named_problems(tests, ctx)
     revision = tests_revision(ctx.run, ctx.stage["id"], ctx.ledger)
     stub = tests["stub_check"]
     if not revision:  # once the code exists, the test-writer's own stub check is about a run that is over

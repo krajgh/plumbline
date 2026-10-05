@@ -13,7 +13,7 @@ import pytest
 
 import plumbline as pl
 import pre_tool_use as pre
-from helpers import DEFAULT_TOML, commit_all, git, numbered, write
+from helpers import DEFAULT_TOML, REPO, commit_all, git, numbered, write
 from hookdata import activate_run, bash_payload, start_run, tool_payload
 from rundata import RUN, adopt, adopt_base, begin, ledger, put, run_path, spec_record, written_tests_record
 
@@ -352,3 +352,96 @@ def test_gate_fails_a_tests_stage_whose_imports_stop_the_collection_and_says_wha
     assert "import what a test needs from the change inside the test function" in result.stdout
     [entry] = [e for e in ledger(gated) if e["kind"] == "run"]
     assert entry["commands"][0]["exit_code"] == 2
+
+
+# ------------------------------------ a test that names the run's stubs directory passes in the run and fails in CI: the tests gate fails it
+
+GOOD = "def test_ac_1():\n    from newmod import add\n    assert add(1, 2) == 3\n\n\ndef test_ac_2():\n    from newmod import add\n    assert add(2, 2) == 4\n"
+PROBLEM = "the agent's record: tests/test_app.py names the run's stubs directory; a test must import the real module"
+
+
+@pytest.fixture
+def named(repo):
+    """A code.S run with its plan, and a test command that fails (as the tests stage wants): what the gate says is about the record and the files it names."""
+    adopt(repo, commands={"test": "sh -c 'exit 1'"})
+    begin(repo, "code.S")
+    put(repo, "plan", spec_record())
+    return repo
+
+
+def gate_tests(run_cli, repo, text, record=None, extra=()):
+    """The test file as `text`, the record as given (by default one test per criterion in tests/test_app.py), and `extra` more files as {path: text}."""
+    write(repo / "tests" / "test_app.py", text)
+    for path, content in dict(extra).items():
+        write(repo / path, content)
+    put(repo, "tests", record or written_tests_record())
+    return run_cli("gate", RUN, "tests", cwd=repo)
+
+
+def test_a_test_that_names_the_runs_stubs_directory_fails_the_tests_gate_with_the_sentence_the_readme_gives(run_cli, named):
+    result = gate_tests(run_cli, named, f"import sys\nsys.path.insert(0, '{STUBS}')\n" + GOOD)
+    assert result.returncode == 1 and f"  - {PROBLEM}" in result.stdout, result.stdout
+    assert [e for e in ledger(named) if e["kind"] == "gate"][-1]["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "# imports from {rel}/newmod.py\n",  # a comment says it too: the test is written against the stubs
+        "STUBS = '{abs}'\n",  # the absolute path holds the relative one
+        "STUBS = r'.plumbline\\runs\\r1\\stubs'\n",  # a backslash spelling
+        "import os\nos.environ['PYTHONPATH'] = '{rel}:.'\n",
+    ],
+)
+def test_a_test_that_names_it_in_any_spelling_of_the_path_is_refused(run_cli, named, spelling):
+    result = gate_tests(run_cli, named, spelling.format(rel=STUBS, abs=named / STUBS) + GOOD)
+    assert result.returncode == 1 and PROBLEM in result.stdout, spelling
+
+
+@pytest.mark.parametrize("prefix", ["", "# see .plumbline/runs/r2/stubs for nothing at all\n", "# the stubs are in the run, and a test does not name them\n"])
+def test_a_test_that_names_no_stubs_directory_passes_and_so_does_one_that_names_another_runs(run_cli, named, prefix):
+    assert gate_tests(run_cli, named, prefix + GOOD).returncode == 0  # the rule is about this run's directory
+
+
+def test_any_file_the_record_names_is_read_the_helpers_and_the_conftest_too(run_cli, named):
+    record = written_tests_record()
+    record["files_written"] = ["tests/test_app.py", "tests/conftest.py", "tests/helpers.py"]
+    result = gate_tests(run_cli, named, GOOD, record, {"tests/conftest.py": f"import sys\nsys.path.append('{STUBS}')\n", "tests/helpers.py": "VALUE = 1\n"})
+    assert result.returncode == 1
+    assert "the agent's record: tests/conftest.py names the run's stubs directory; a test must import the real module" in result.stdout
+    assert "tests/helpers.py names" not in result.stdout and "tests/test_app.py names" not in result.stdout  # only the file that does
+
+
+def test_a_stub_may_say_where_it_is_and_a_file_that_is_not_there_is_no_problem(run_cli, named):
+    record = written_tests_record()
+    record["files_written"] = ["tests/test_app.py", f"{STUBS}/newmod.py", "tests/ghost.py", "../outside.py", "/etc/hostname"]
+    result = gate_tests(run_cli, named, GOOD, record, {f"{STUBS}/newmod.py": f"# {STUBS}/newmod.py: a stub\ndef add(a, b):\n    return 0\n"})
+    assert result.returncode == 0, result.stdout
+
+
+def test_the_fixs_tests_gate_and_a_tests_stage_run_again_after_the_build_hold_the_same_rule(named):
+    project = pl.load_project(named)
+    run = pl.load_run(project, RUN)
+    stage = next(s for s in project.pipeline["stage"] if s["id"] == "tests")
+    write(named / "tests" / "test_app.py", f"import sys\nsys.path.insert(0, '{STUBS}')\n" + GOOD)
+    record = written_tests_record()
+    put(named, "tests", record)
+    ctx = pl.GateContext(project, RUN, stage, run, pl.read_ledger(named, RUN), False)
+    assert pl._stubs_named_problems(record, ctx) == ["tests/test_app.py names the run's stubs directory; a test must import the real module"]
+    for gate in ("tests_fail_on_stub", "reproduces_on_head"):  # the fix intent replaces the gate, and keeps the rule
+        outcome = pl.evaluate_stage(project, RUN, {**stage, "gate": gate}, run=run)
+        assert PROBLEM in outcome.problems and not outcome.passed, gate
+    ledger_rows = [{"kind": "gate", "stage": "tests", "gate": "tests_fail_on_stub", "passed": True}, {"kind": "agent", "stage": "build", "agent_type": "plumbline:builder"}]
+    assert pl.tests_revision(run, "tests", ledger_rows) is True  # once the code exists the tests are no longer expected to fail, and the rule is not part of that allowance
+    assert PROBLEM in pl._stub_problems(record, pl.GateContext(project, RUN, stage, run, ledger_rows, False), True)
+
+
+def test_the_readme_the_test_writers_prompt_and_the_gate_agree_on_the_sentence(named):
+    from test_readme import section
+
+    text = section("Runs, gates and the pass record")
+    assert "no file the test-writer wrote that names the run's stubs directory" in text
+    assert "the tests gate fails when any file the test-writer wrote (the tests' own files and `files_written`, the stubs apart) names the run's stubs directory, as a relative or an absolute path" in text
+    assert "`the agent's record: <file> names the run's stubs directory; a test must import the real module`" in text
+    prompt = (REPO / "agents" / "test-writer.md").read_text(encoding="utf-8")
+    assert "A test file imports the real module and names no path of the stubs directory, because the stubs are not committed and such a test would fail in CI." in prompt
