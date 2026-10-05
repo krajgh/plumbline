@@ -323,18 +323,18 @@ The hooks are guard rails. They stop an agent that overreaches when a rule block
 
 ## What a run costs
 
-This is one real run, so one data point and not an average: a feature of about 260 changed lines in a small Python CLI, size M, through all eight stages of the `code.M` row. Output is what a model wrote; a cache write is input stored in the prompt cache, and a cache read is input served from it, which costs less than fresh input.
+These are two real runs, so two data points and not an average: a feature of about 260 changed lines in a small Python CLI, size M, through all eight stages of the `code.M` row, and a fix of 43 changed lines in the same CLI, size S, through the `code.S` row under the `fix` intent. Output is what a model wrote; a cache write is input stored in the prompt cache, and a cache read is input served from it, which costs less than fresh input. Machine time leaves out the time spent waiting for answers.
 
-| | |
-| --- | --- |
-| Active machine time | about 18 minutes, without the time spent waiting for answers |
-| Rounds | plan 1, tests 2, test-review 1, verify 1, review 1 |
-| The agents (15 of them) | at least 42K output tokens, 415K cache writes, 2.7M cache reads |
-| The main session, which orchestrates | 26K output tokens, 114K cache writes, 5.3M cache reads |
+| | Feature, size M | Fix, size S |
+| --- | --- | --- |
+| Active machine time | about 18 minutes | about 7 minutes |
+| Rounds | plan 1, tests 2, test-review 1, verify 1, review 1 | tests 2, verify 1, review 1 |
+| The agents | 15 of them: at least 42K output tokens, 415K cache writes, 2.7M cache reads | 10 of them: at least 18K output tokens, 157K cache writes, 1.1M cache reads |
+| The main session, which orchestrates | 26K output tokens, 114K cache writes, 5.3M cache reads | 13K output tokens, 58K cache writes, 2.3M cache reads |
 
-- **The main session is the biggest spender.** It holds about two thirds of all the cache reads, because every agent report and every stop is a turn of its own that reads the whole of its context again, and the review alone brought nine of them.
-- **The agents' output is a lower bound.** Some messages of the reviewers never got their final usage entry, so they count as the snapshot taken when they began; `plumbline.py tokens` says how many (`output_lower_bound`). Input and cache counts are exact.
-- **Only the tests stage needed a second round.** Nothing looped, so the round caps stayed as they are.
+- **The main session is the biggest spender.** In both runs it holds about two thirds of all the cache reads, because every agent report and every stop is a turn of its own that reads the whole of its context again.
+- **The agents' output is a lower bound.** Some messages never got their final usage entry, so they count as the snapshot taken when they began; `plumbline.py tokens` says how many (`output_lower_bound`). Input and cache counts are exact.
+- **Only the tests stage needed a second round, in both runs.** Nothing looped, so the round caps stayed as they are.
 - **There is no token cap.** The round caps and each agent's `maxTurns` bound what the agents spend, and nothing bounds the main session.
 
 ## Developing plumbline
@@ -343,7 +343,7 @@ The tests run with `uv run --with pytest pytest -q`. A plugin installed from a l
 
 ## Status
 
-Version 0.4.2. Phase 2, agents and enforcement, is done: the seven agents, `/plumbline:run`, `/plumbline:override` and `/plumbline:status`, the intent axis, role policies as data with write partitions and command allow-lists, protected files, the user-only override, the provenance and measured gates, the reviewed-change-is-the-pushed-change checks, the hooks that hold, the ponytail matcher check, and the `sh` filter in front of the hooks. Version 0.4.1 carried what the first real session found: a stage's round counts agents, not stops, and a report handed back through SubagentHandback names its record. Version 0.4.2 carries what the first real run found: stubs go in the run and not in the change, a problem of the tests and verify gates says whether it comes from the agent's record or from the measured run, a size problem names the files that contribute most, a matrix row can say where a failed gate goes (so the default pipeline validates with no notes), the prompts write records with the Write tool and launch agents without `model`, and `tokens` flags an output count that is a lower bound. Phase 3, light testing in a real session, has begun: that run took one small change through the whole pipeline on a scratch repository, with tokens measured per stage (see What a run costs). Repository rules as data (phase 2c) follow it, graft and the CI templates are phase 4, and the release is phase 5. Not yet published.
+Version 0.4.2. Phase 2, agents and enforcement, is done: the seven agents, `/plumbline:run`, `/plumbline:override` and `/plumbline:status`, the intent axis, role policies as data with write partitions and command allow-lists, protected files, the user-only override, the provenance and measured gates, the reviewed-change-is-the-pushed-change checks, the hooks that hold, the ponytail matcher check, and the `sh` filter in front of the hooks. Version 0.4.1 carried what the first real session found: a stage's round counts agents, not stops, and a report handed back through SubagentHandback names its record. Version 0.4.2 carries what the first real run found: stubs go in the run and not in the change, a problem of the tests and verify gates says whether it comes from the agent's record or from the measured run, a size problem names the files that contribute most, a matrix row can say where a failed gate goes (so the default pipeline validates with no notes), the prompts write records with the Write tool and launch agents without `model`, and `tokens` flags an output count that is a lower bound. Phase 3, light testing in a real session, is done: a size-M feature and a size-S fix went through the whole pipeline on a scratch repository (see What a run costs). This is the first public release. Next comes an orchestrator agent that takes the pipeline's control flow out of the main session, its biggest cost; then repository rules as data, graft and the CI templates, and installs for every repository at once.
 
 ## Licence
 

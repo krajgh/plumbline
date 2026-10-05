@@ -149,23 +149,26 @@ def test_the_readmes_default_rounds_and_gates_are_the_default_pipelines():
     assert (stages["plan"]["on_fail"], stages["tests"]["on_fail"]) == ("plan", "tests")  # both run their own agent again
 
 
-def test_the_readme_gives_what_one_real_run_cost_in_generic_terms_and_the_rounds_fit_the_pipeline():
+def test_the_readme_gives_what_two_real_runs_cost_in_generic_terms_and_the_rounds_fit_the_pipeline():
     text = section("What a run costs")
-    assert "This is one real run, so one data point and not an average: a feature of about 260 changed lines in a small Python CLI, size M, through all eight stages of the `code.M` row" in text
+    assert "These are two real runs, so two data points and not an average: a feature of about 260 changed lines in a small Python CLI, size M, through all eight stages of the `code.M` row, and a fix of 43 changed lines in the same CLI, size S, through the `code.S` row under the `fix` intent" in text
     table = [[cell.strip() for cell in line.strip("| ").split("|")] for line in text.splitlines() if line.startswith("| ") and "---" not in line]
-    cells = {left: right for left, right in (row for row in table if len(row) == 2)}
-    assert cells["Active machine time"] == "about 18 minutes, without the time spent waiting for answers"
-    assert cells["Rounds"] == "plan 1, tests 2, test-review 1, verify 1, review 1"
-    assert cells["The agents (15 of them)"] == "at least 42K output tokens, 415K cache writes, 2.7M cache reads"
-    assert cells["The main session, which orchestrates"] == "26K output tokens, 114K cache writes, 5.3M cache reads"
+    rows = {row[0]: row[1:] for row in table if len(row) == 3}
+    assert "| | Feature, size M | Fix, size S |" in text
+    assert rows["Active machine time"] == ["about 18 minutes", "about 7 minutes"]
+    assert rows["Rounds"] == ["plan 1, tests 2, test-review 1, verify 1, review 1", "tests 2, verify 1, review 1"]
+    assert rows["The agents"] == ["15 of them: at least 42K output tokens, 415K cache writes, 2.7M cache reads", "10 of them: at least 18K output tokens, 157K cache writes, 1.1M cache reads"]
+    assert rows["The main session, which orchestrates"] == ["26K output tokens, 114K cache writes, 5.3M cache reads", "13K output tokens, 58K cache writes, 2.3M cache reads"]
     assert "**The main session is the biggest spender.**" in text and "**The agents' output is a lower bound.**" in text and "`output_lower_bound`" in text
     assert "**There is no token cap.**" in text and "nothing bounds the main session" in text
-    # what the numbers must agree with: the size is M, the row has eight stages, and no stage used more rounds than the pipeline allows it
+    # what the numbers must agree with: the sizes are M and S, the rows have eight and seven stages, and no stage used more rounds than the pipeline allows it
     assert pl.size_for(260, PIPELINE["sizes"]) == "M" and len(PIPELINE["matrix"]["code"]["M"]["stages"]) == 8
+    assert pl.size_for(43, PIPELINE["sizes"]) == "S" and len(PIPELINE["matrix"]["code"]["S"]["stages"]) == 7
     stages = {s["id"]: s for s in PIPELINE["stage"]}
-    for stage, count in re.findall(r"([a-z-]+) (\d+)", cells["Rounds"]):
-        assert 1 <= int(count) <= stages[stage]["max_rounds"], stage
-    assert "/ho" + "me/" not in text and not re.search(r"\b[\w-]+/[\w.-]+\.py\b", text)  # it names the change by what it was: no path, no project
+    for column in rows["Rounds"]:
+        for stage, count in re.findall(r"([a-z-]+) (\d+)", column):
+            assert 1 <= int(count) <= stages[stage]["max_rounds"], stage
+    assert "/ho" + "me/" not in text and not re.search(r"\b[\w-]+/[\w.-]+\.py\b", text)  # it names the changes by what they were: no path, no project
 
 
 def test_the_readme_has_the_tip_for_relaying_a_request_and_the_note_on_developing_in_place():
@@ -256,7 +259,8 @@ def test_the_status_line_gives_the_manifests_version_and_the_phase():
         "a matrix row can say where a failed gate goes", "launch agents without `model`", "`tokens` flags an output count that is a lower bound",
     ):
         assert fix in status, fix
-    assert "Phase 3, light testing in a real session, has begun" in status and "The next phase is phase 3" not in status
+    assert "Phase 3, light testing in a real session, is done" in status and "has begun" not in status and "The next phase is phase 3" not in status
+    assert "This is the first public release." in status and "Not yet published" not in status
     assert "Phase 2b of 5" not in README
 
 
