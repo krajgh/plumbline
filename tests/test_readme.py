@@ -277,7 +277,7 @@ def test_the_status_line_gives_the_manifests_version_and_the_phase():
     ):
         assert item in status, item
     assert "A run begun under 0.4.2 on a size-M or L row has no spec review, so its pass record no longer covers its commit under 0.5.0" in status
-    assert "it joins this same version" not in status and "Next come repository rules as data, graft and the CI templates, and installs for every repository at once." in status
+    assert "it joins this same version" not in status and "Next come repository rules as data, a code-graph switch (graft, CodeGraph or off) and the CI templates, and installs for every repository at once." in status
     assert "Phase 2b of 5" not in README
 
 
