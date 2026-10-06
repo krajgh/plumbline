@@ -3077,27 +3077,23 @@ def review_target(pipeline: dict, stage: dict) -> str | None:
 
 
 def target_changed(root: Path, run_id: str, stage: dict, review: dict) -> bool:
-    """Is the record that a review stage reviewed other than the one its merged record says it read (`target_sha256`)?"""
+    """Is the record that a review stage reviewed other than the one its merged record says it read (`target_sha256`)? A record that says nothing (merged
+    before 0.5.1, which stamps it on every review of the plan or of the tests) is not checked: for it the answer is no."""
     target, seen = stage.get("target"), review.get("target_sha256")
     return isinstance(target, str) and isinstance(seen, str) and seen != file_sha256(run_dir(root, run_id) / f"{target}.json")
 
 
 def stale_target_problems(pipeline: dict, root: Path, run_id: str, stage: dict, review: dict) -> list[str]:
-    """A review of the plan or of the tests must say which version of it its agents read (`target_sha256`, set by `merge-review`), and that must still be
-    the record as it is: a review of something that has changed since reviewed another thing, and its gate, and `pass`, fail until it runs again as
-    the next round. The review of the diff is covered by `diff_sha256`."""
+    """A review of the plan or of the tests that says which version of it its agents read (`target_sha256`, set by `merge-review`) must still be of the
+    record as it is: a review of something that has changed since reviewed another thing, and its gate, and `pass`, fail until it runs again as the next
+    round. A review record without the hash is not checked for staleness: it was merged before 0.5.1, and its run was gated under the rules of its time,
+    so a pass record written under 0.5.0 still covers its commit (a record that lost the hash after its merge fails the ledger's check of the merge instead).
+    The review of the diff is covered by `diff_sha256`."""
     target = review_target(pipeline, stage)
-    if target is None:
+    if target is None or not target_changed(root, run_id, stage, review):
         return []
     noun, them = TARGET_NAMES.get(target, (f"the {target} record", "it"))
-    if "target_sha256" not in review:
-        return [
-            f"the record does not say which version of {noun} {stage['id']} read (it was merged before plumbline 0.5.1): "
-            f"run `plumbline.py merge-review {run_id} {stage['id']} --round {review['round']}` again"
-        ]
-    if target_changed(root, run_id, stage, review):
-        return [f"{noun} changed after {stage['id']} read {them}; run it again as round {review['round'] + 1}"]
-    return []
+    return [f"{noun} changed after {stage['id']} read {them}; run it again as round {review['round'] + 1}"]
 
 
 def review_round(root: Path, run_id: str, stage: dict, ledger: list[dict] | None = None) -> int:

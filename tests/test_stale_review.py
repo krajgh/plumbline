@@ -6,10 +6,12 @@ import json
 import pytest
 
 import plumbline as pl
+import pre_tool_use as pre
 from helpers import commit_all, write
+from hookdata import bash_payload
 from rundata import (
-    RUN, adopt, adopt_base, agent_stopped, begin, build_note_record, change_of, intake_record, put, put_part, review_record, run_entry, run_path, spec_record,
-    store_request, verify_record, write_test_file, written_tests_record,
+    RUN, adopt, adopt_base, agent_stopped, begin, build_note_record, change_of, intake_record, merged, put, put_part, review_record, run_entry, run_path,
+    spec_record, store_request, verify_record, write_test_file, written_tests_record,
 )
 from test_readme import section
 from test_spec_review import REQUEST
@@ -51,6 +53,14 @@ def revised_tests(repo, detail="run again after the build"):
 
 def gate(run_cli, repo, stage):
     return run_cli("gate", RUN, stage, cwd=repo)
+
+
+def without_the_hash(repo, stage):
+    """Make a review's record what `merge-review` wrote before 0.5.1: no `target_sha256`. `put` stamps the hash on a review as `merge-review` does, so the
+    file is written alone, and its merge is entered as the ledger would hold it."""
+    old = record(repo, stage)
+    del old["target_sha256"]
+    merged(repo, stage, put(repo, stage, old, agent=False), old["round"])
 
 
 # --- merge-review stamps the hash of what the parts read
@@ -139,21 +149,48 @@ def test_status_shows_the_stale_review_as_failed_with_the_problem(run_cli, store
     assert "FAIL" in out.splitlines()[line] and "the tests changed after test-review read them; run it again as round 2" in out.splitlines()[line + 1]
 
 
-def test_a_review_merged_before_the_hash_existed_fails_until_merge_review_is_run_again_for_its_round(run_cli, stored):
+def test_a_review_merged_before_the_hash_existed_is_not_checked_for_staleness_and_passes_its_gate(run_cli, stored):
+    clean_round(run_cli, stored)
     review_the_tests(run_cli, stored)
-    old = record(stored, "test-review")
-    del old["target_sha256"]
-    put(stored, "test-review", old)  # as a record of 0.5.0 is: `put` stamps the hash, so write it without
-    path = run_path(stored, RUN, "test-review.json")
-    path.write_text(json.dumps(old, indent=2), encoding="utf-8")
-    from rundata import merged
+    for stage in ("spec-review", "test-review"):
+        without_the_hash(stored, stage)
+        assert "target_sha256" not in record(stored, stage) and gate(run_cli, stored, stage).returncode == 0
+    # what the reviews read changes after them: with their hashes that fails (see above), and without them there is nothing to compare
+    put(stored, "plan", {**spec_record(), "goal": "A goal the planner wrote after the review"})
+    revised_tests(stored)
+    for stage in ("spec-review", "test-review"):
+        result = gate(run_cli, stored, stage)
+        assert result.returncode == 0 and "changed after" not in result.stdout and "merge-review" not in result.stdout, result.stdout
+        assert not run_path(stored, RUN, stage, "round-2").exists()  # nothing is stale: no round is opened for it
+    out = run_cli("status", "--run", RUN, cwd=stored).stdout
+    states = {line.split()[0]: line.split()[2] for line in out.splitlines() if line.startswith("  ") and not line.startswith("      ")}
+    assert states["spec-review"] == "pass" and states["test-review"] == "pass"
 
-    merged(stored, "test-review", path, 1)
-    result = gate(run_cli, stored, "test-review")
-    assert result.returncode == 1 and "the record does not say which version of the tests test-review read (it was merged before plumbline 0.5.1): run `plumbline.py merge-review r1 test-review --round 1` again" in result.stdout
-    assert not run_path(stored, RUN, "test-review", "round-2").exists()  # nothing changed: no round is opened for it
+
+def test_a_record_without_the_hash_is_never_stale_and_a_record_with_it_is_once_its_target_changed(run_cli, stored):
+    clean_round(run_cli, stored)
+    project = pl.load_project(stored)
+    stage = next(s for s in project.pipeline["stage"] if s["id"] == "spec-review")
+    stamped = record(stored, "spec-review")
+    old = {key: value for key, value in stamped.items() if key != "target_sha256"}
+
+    def stale(review):
+        return pl.stale_target_problems(project.pipeline, stored, RUN, stage, review)
+
+    assert stale(stamped) == [] and stale(old) == []
+    put(stored, "plan", {**spec_record(), "goal": "A goal the planner wrote after the review"})
+    assert pl.target_changed(stored, RUN, stage, stamped) and stale(stamped) == ["the plan changed after spec-review read it; run it again as round 2"]
+    assert not pl.target_changed(stored, RUN, stage, old) and stale(old) == []  # a missing hash means not checked, not stale
+
+
+def test_merge_review_run_again_over_a_record_without_the_hash_stamps_it_and_the_record_is_checked_from_then_on(run_cli, stored):
+    review_the_tests(run_cli, stored)
+    without_the_hash(stored, "test-review")
     assert run_cli("merge-review", RUN, "test-review", "--round", "1", cwd=stored).returncode == 0
-    assert gate(run_cli, stored, "test-review").returncode == 0
+    assert record(stored, "test-review")["target_sha256"] == sha(stored, "tests") and gate(run_cli, stored, "test-review").returncode == 0
+    revised_tests(stored)
+    result = gate(run_cli, stored, "test-review")
+    assert result.returncode == 1 and "the tests changed after test-review read them; run it again as round 2" in result.stdout
 
 
 # --- pass, and all_gates_passed
@@ -227,6 +264,55 @@ def test_the_pass_of_a_run_whose_stale_review_was_run_again_is_accepted(run_cli,
     assert [e["rounds"] for e in record_["stages"] if e["id"] == "test-review"] == [2]  # the pass record says the review took two rounds
 
 
+# --- a pass of 0.5.0: its reviews carry no hash, and its commit stays covered
+
+
+def test_pass_accepts_a_run_whose_reviews_were_merged_before_the_hash_existed(finished):
+    for stage in ("spec-review", "test-review"):
+        without_the_hash(finished, stage)
+    record_, problems, _copy = pl.make_pass_record(pl.load_project(finished), RUN)
+    assert record_ is not None, problems
+
+
+@pytest.fixture
+def passed_under_0_5_0(finished, monkeypatch):
+    """`finished` with its spec review and test review as 0.5.0 left them (no `target_sha256`), and the pass recorded for HEAD by a plumbline that had no
+    check of a stale review: a sandbox that upgrades to 0.5.1 with a commit passed."""
+    for stage in ("spec-review", "test-review"):
+        without_the_hash(finished, stage)
+    with monkeypatch.context() as old:
+        old.setattr(pl, "stale_target_problems", lambda *args: [])
+        record_, problems, run_copy = pl.make_pass_record(pl.load_project(finished), RUN)
+        assert record_ is not None, problems
+        pass_file = finished / ".plumbline" / "pass" / f"{record_['commit']}.json"
+        pl.write_json_atomic(run_copy, record_)
+        pl.write_json_atomic(pass_file, record_)
+        pl.note_pass(finished, RUN, record_, pass_file)
+    return finished
+
+
+def test_a_pass_record_of_0_5_0_still_covers_its_commit_and_status_says_so(run_cli, passed_under_0_5_0):
+    head = pl.head_sha(passed_under_0_5_0)
+    assert pl.coverage(passed_under_0_5_0, head, pl.load_project(passed_under_0_5_0)) == ("pass", f"run {RUN}")
+    out = run_cli("status", cwd=passed_under_0_5_0).stdout
+    assert f"HEAD {head[:7]}: covered by a pass record (run {RUN})" in out and "NOT covered" not in out
+    states = {line.split()[0]: line.split()[2] for line in out.splitlines() if line.startswith("  ") and not line.startswith("      ")}
+    assert states["spec-review"] == "pass" and states["test-review"] == "pass"
+
+
+def test_the_push_gate_lets_the_commit_of_a_pass_record_of_0_5_0_through(passed_under_0_5_0, monkeypatch):
+    monkeypatch.setenv("PLUMBLINE_HOOK_DEBUG", "1")
+    assert pre.decide(bash_payload(passed_under_0_5_0, "git push origin feature")) is None
+
+
+def test_a_pass_record_of_0_5_0_is_still_held_by_the_hashes_of_its_own_records(passed_under_0_5_0):
+    """The missing hash opens nothing: a plan or tests record that changes after the pass is a record altered after it, and the commit is uncovered."""
+    head = pl.head_sha(passed_under_0_5_0)
+    put(passed_under_0_5_0, "tests", {**written_tests_record(), "stub_check": {"ran": True, "all_failed_on_assertions": True, "detail": "run again"}})
+    how, why = pl.coverage(passed_under_0_5_0, head, pl.load_project(passed_under_0_5_0))
+    assert how is None and "records altered after the pass: .plumbline/runs/r1/tests.json" in why
+
+
 # --- the README says it
 
 
@@ -238,13 +324,15 @@ def test_the_readme_the_prompt_and_the_gate_agree_on_what_a_stale_review_is():
     assert "A review of the spec or of the tests must have read the record as it is now (`target_sha256`, the hash of the plan or of the tests record that `merge-review` read" in gates
     assert "the tests changed after test-review read them; run it again as round N+1" in gates and "with rounds left, `gate` opens that round's directory" in gates
     assert "It evaluates every gate afresh" in gates and "no review of the plan or of the tests has gone stale" in gates  # what `pass` does, and what the push gate re-evaluates
-    assert "A review record merged before 0.5.1 has no such hash, and its gate fails until `merge-review` is run again for its round." in gates
+    assert "A review record merged before 0.5.1 has no such hash and is not checked for staleness, so a pass record written under 0.5.0 still covers its commit." in gates
     records = {r[0].strip("`"): r for r in rows(section("Records"))}
     assert "`target_sha256`" in records["review_record"][2]
     failing = between(orchestrator_body(), "## When a gate fails", "## A decision comes back")
     assert "A review that fails with \"the tests changed after test-review read them\" (or the plan, after spec-review) goes back to no agent stage" in failing
     assert "run its review again as the round `gate` opened (`next_round`)" in failing
-    assert "merged before 0.5.1" in README
+    status = section("Status")
+    assert "A review merged before 0.5.1 carries no `target_sha256` and is not checked for staleness, so pass records written under 0.5.0 still cover their commits." in status
+    assert "until `merge-review` is run again" not in README and "fails until" not in status  # the old sentences, which uncovered every commit passed under 0.5.0
 
 
 # --- the limit the README lists for it is real today
