@@ -532,6 +532,6 @@ def test_the_orchestrator_prompt_says_a_foreground_agent_call_needs_no_wait_in_t
         "SendMessage returns at once and the agent keeps working, and `wait` returns when the ledger shows its stop.",
         "A foreground Agent call returns when its agent has stopped, so it needs no `wait`.",
         "A gate run earlier measures files the agent is still changing, so learn from `wait` that an agent has finished, and run `gate` once it has.",
-        "When `wait` exits 1 the agent is still working: run it again once, and hand back as an error when it times out a second time.",
+        "When `wait` exits 1 after its timeout, the agent is still working: run it again once, and hand back as an error when it times out a second time. When it says the agent is not in the run's ledger, check the id.",
     ]
     assert [rule.index(sentence) for sentence in ordered] == sorted(rule.index(sentence) for sentence in ordered)  # the rest of the line is kept, in its order

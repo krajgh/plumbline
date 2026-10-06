@@ -86,7 +86,7 @@ def test_after_every_send_message_the_prompt_waits_for_the_agent_before_any_gate
     assert "After every SendMessage, run `PLUMBLINE wait <run id> <agent id>` for that agent before any gate, with the Bash tool's `timeout` set to 600000." in discipline
     assert "SendMessage returns at once and the agent keeps working, and `wait` returns when the ledger shows its stop." in discipline
     assert "so learn from `wait` that an agent has finished, and run `gate` once it has." in discipline  # a gate is not a way to ask whether an agent has finished
-    assert "When `wait` exits 1 the agent is still working: run it again once, and hand back as an error when it times out a second time." in discipline
+    assert "When `wait` exits 1 after its timeout, the agent is still working: run it again once, and hand back as an error when it times out a second time. When it says the agent is not in the run's ledger, check the id." in discipline
     assert "Write every command literally, with the run id, the agent id and the paths spelled out: the hook refuses a shell variable, a function and `sleep`, and each refusal costs a turn." in discipline
     tools = between(body, "## Your tools", "## Turn discipline")
     assert "by the id its launch gave, and returns at once while the agent works on in the background" in tools and "`merge-review`, `wait`, `tokens`" in tools
