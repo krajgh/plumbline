@@ -3049,7 +3049,7 @@ def send_message_reason(data: dict) -> str | None:
     agent its run knows: one whose id an `agent` entry of the active run's ledger holds. Such a message is entered in that ledger as a
     `resume`, {kind, agent_id, at}: the message returns at once and the agent works on in the background, so the entry is how `wait` knows the
     agent's next stop is the answer, and how a gate knows its record may still change. The main session's SendMessage is its own: let through,
-    and not entered (`wait` then counts the stops after it began)."""
+    and not entered (`wait` then finds the agent idle, its earlier stop with no resume after it, and returns at once)."""
     if data.get("agent_type") != f"plumbline:{ORCHESTRATOR}":
         return None
     tool_input, cwd = data.get("tool_input"), data.get("cwd")

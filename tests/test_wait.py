@@ -1,6 +1,7 @@
 """An agent that was resumed is working again. SendMessage wakes it in the background and returns at once, so the orchestrator's hook enters a
 `resume` in the run's ledger, `wait` blocks until the ledger shows the agent's next stop, and a gate that meets the agent in between runs nothing
-(the trace of a record is checked before any measured command: tests/test_measured_gates.py)."""
+(the trace of a record is checked before any measured command: tests/test_measured_gates.py). An agent that is idle, with a stop in the ledger and
+no resume after it, is one `wait` returns for at once: an agent launched in the foreground has stopped when its Agent call returns."""
 import json
 import subprocess
 import threading
@@ -13,7 +14,8 @@ import pre_tool_use as pre
 from helpers import CLI, REPO, clean_env
 from hookdata import activate_run, bash_payload, denial, start_run, stop_payload, tool_payload
 from rundata import RUN, adopt, begin, exits, ledger, put, put_part, run_path, spec_record, verify_now, verify_record, write_ledger
-from test_manifests import HOOKS, hook_of, load
+from test_agents import agent
+from test_manifests import HOOKS, between, hook_of, load
 from test_measured_gates import CommandRunner
 
 ORCHESTRATOR = "plumbline:orchestrator"
@@ -46,7 +48,7 @@ def started(repo):
     return repo
 
 
-# --- wait: it returns when the ledger shows a stop of the agent after its latest resume
+# --- wait: it returns when the agent is idle, a stop of it in the ledger and no resume after its latest stop, and waits only while it is working
 
 
 def test_wait_returns_at_once_when_the_agent_stopped_after_its_resume_even_before_wait_began(run_cli, started):
@@ -92,30 +94,87 @@ def test_wait_returns_when_the_stop_is_entered_while_it_waits(started, monkeypat
     assert capsys.readouterr().out.startswith("agent a1 (plumbline:verifier) has stopped")
 
 
-def test_without_a_resume_entry_wait_counts_the_stops_after_it_began(started, monkeypatch, capsys):
+# the bug of the first 0.5.1 run: an agent launched in the foreground has stopped when its Agent call returns, so its stop is in the ledger before `wait`
+# begins and no new stop ever comes. That agent is idle, and `wait` returns for it at once.
+
+
+def test_an_agent_that_stopped_before_wait_began_and_was_never_resumed_is_idle_and_wait_returns_at_once(run_cli, started):
+    write_ledger(started, [agent_row("a1")])
+    began = time.monotonic()
+    result = waits(run_cli, started, "a1", "--timeout", "30")  # the old `wait` waited these 30 s out for a stop that never came, and exited 1
+    assert result.returncode == 0 and result.stderr == ""
+    assert result.stdout == "agent a1 (plumbline:verifier) has stopped; its record is .plumbline/runs/r1/verify.json, valid\n"
+    assert time.monotonic() - began < 20
+
+
+def test_wait_returns_for_an_idle_agent_even_with_no_time_to_wait_and_names_its_latest_stop(started, capsys):
+    write_ledger(started, [agent_row("a1", valid=False), agent_row("a2", stage="tests"), resume_row("a2"), agent_row("a1", record=None)])  # a1 stopped twice and was never resumed
+    assert pl.main(["wait", RUN, "a1", "--timeout", "0", "--project", str(started)]) == 0  # a timeout of 0 leaves it nothing to wait with: it returns because a1 is idle
+    assert capsys.readouterr().out == "agent a1 (plumbline:verifier) has stopped\n"  # a1's latest stop is the one it names, and a resume of a2 is none of a1's
+
+
+def test_an_agent_resumed_after_its_latest_stop_is_working_so_a_stop_before_wait_began_does_not_answer_for_it(started, monkeypatch, capsys):
     monkeypatch.setattr(pl, "WAIT_POLL_SECONDS", 0.05)
-    write_ledger(started, [agent_row("a1")])  # a stop from before, and no resume entry says it was resumed since
+    write_ledger(started, [agent_row("a1"), resume_row("a1")])
     assert pl.main(["wait", RUN, "a1", "--timeout", "0", "--project", str(started)]) == 1
+    assert capsys.readouterr().out == "agent a1 has not stopped after 0 s; run `wait` again or hand back\n"
     timer = threading.Timer(0.3, lambda: write_ledger(started, [agent_row("a1")]))
     timer.start()
+    began = time.monotonic()
     code = pl.main(["wait", RUN, "a1", "--timeout", "30", "--project", str(started)])
     timer.join()
-    assert code == 0 and capsys.readouterr().out.count("has stopped") == 1
+    assert code == 0 and 0.25 <= time.monotonic() - began < 10  # it waited for the stop that follows the resume
+    assert capsys.readouterr().out.count("has stopped") == 1
 
 
-def test_a_resume_entered_after_the_wait_began_counts_from_that_entry(started, monkeypatch):
+def test_an_agent_with_no_stop_yet_is_working_and_wait_waits_for_its_first_stop(started, monkeypatch, capsys):
     monkeypatch.setattr(pl, "WAIT_POLL_SECONDS", 0.05)
-    write_ledger(started, [agent_row("a1")])
-
-    def later():
-        write_ledger(started, [resume_row("a1")])
-        time.sleep(0.2)
-        write_ledger(started, [agent_row("a1")])
-
-    timer = threading.Timer(0.2, later)
+    write_ledger(started, [resume_row("a1")])  # the ledger knows the agent (a resume names it) and holds no stop of it
+    assert pl.main(["wait", RUN, "a1", "--timeout", "0", "--project", str(started)]) == 1
+    assert capsys.readouterr().out == "agent a1 has not stopped after 0 s; run `wait` again or hand back\n"
+    timer = threading.Timer(0.3, lambda: write_ledger(started, [agent_row("a1")]))
     timer.start()
-    assert pl.main(["wait", RUN, "a1", "--timeout", "30", "--project", str(started)]) == 0
+    began = time.monotonic()
+    code = pl.main(["wait", RUN, "a1", "--timeout", "30", "--project", str(started)])
     timer.join()
+    assert code == 0 and 0.25 <= time.monotonic() - began < 10
+    assert capsys.readouterr().out.count("has stopped") == 1
+
+
+# an id the ledger does not know: no stop and no resume of an agent carries it
+
+
+NOT_IN_LEDGER = "agent a1 is not in the run's ledger; check the id\n"
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],  # nothing in the ledger but the intake
+        [agent_row("a2", stage="tests"), resume_row("a2")],  # other agents only
+        [{"kind": "leg", "agent_id": "a1"}, {"kind": "gate", "stage": "verify", "gate": "verify_green", "passed": True, "agent_id": "a1"}],  # a leg and a gate carry the id: neither is a stop or a resume of an agent
+    ],
+)
+def test_an_id_that_no_stop_or_resume_of_the_ledger_carries_exits_1_at_once_and_says_to_check_it(run_cli, started, rows):
+    write_ledger(started, rows)
+    began = time.monotonic()
+    result = waits(run_cli, started, "a1", "--timeout", "30")  # a wrong id would otherwise wait these 30 s out
+    assert result.returncode == 1 and result.stderr == ""
+    assert result.stdout == NOT_IN_LEDGER
+    assert time.monotonic() - began < 20
+
+
+def test_an_agent_of_another_run_is_not_in_this_runs_ledger(run_cli, started):
+    start_run(started, "r2", activate=False)
+    write_ledger(started, [agent_row("a1")], "r2")
+    result = waits(run_cli, started, "a1", "--timeout", "30")
+    assert result.returncode == 1 and result.stdout == NOT_IN_LEDGER
+    assert run_cli("wait", "r2", "a1", "--timeout", "30", cwd=started).returncode == 0  # in r2's ledger it is idle
+
+
+def test_an_unknown_id_gets_the_not_in_ledger_message_and_not_the_timeout_message_even_with_a_timeout_of_0(started, capsys):
+    assert pl.main(["wait", RUN, "zz-9", "--timeout", "0", "--project", str(started)]) == 1
+    assert capsys.readouterr().out == "agent zz-9 is not in the run's ledger; check the id\n"  # the timeout message is for an agent the ledger knows
 
 
 def test_wait_writes_nothing(run_cli, started):
@@ -330,14 +389,23 @@ def test_wait_sees_the_stop_of_a_resumed_agent_that_changed_nothing(run_cli, run
     assert waits(run_cli, planned, "p-1", "--timeout", "1").returncode == 0
 
 
-def test_resumed_since_and_stop_after_resume_read_the_order_of_the_ledger():
+def test_wait_through_the_stop_hook_returns_at_once_for_an_agent_that_has_stopped_and_was_never_resumed(run_cli, run_stop, planned):
+    assert len(stop(run_stop, planned)) == 1  # the foreground launch is over: the hook has entered the stop, and nothing resumed the agent
+    result = waits(run_cli, planned, "p-1", "--timeout", "0")
+    assert result.returncode == 0 and result.stdout.startswith("agent p-1 (plumbline:planner) has stopped; its record is .plumbline/runs/r1/plan.json")
+
+
+def test_resumed_since_idle_stop_and_agent_in_ledger_read_the_order_of_the_ledger():
     rows = [agent_row("a1"), resume_row("a1"), agent_row("a2"), agent_row("a1"), resume_row("a2")]
     assert pl.resumed_since(rows, rows[0]) is True  # a1 was resumed after its first stop
     assert pl.resumed_since(rows, rows[3]) is False  # and it stopped again after that
     assert pl.resumed_since(rows, rows[2]) is True
     assert pl.resumed_since(rows, None) is False and pl.resumed_since(rows, {"kind": "agent"}) is False and pl.resumed_since(rows, dict(rows[0])) is False  # an entry of this ledger
-    assert pl.stop_after_resume(rows, "a1", 99) is rows[3] and pl.stop_after_resume(rows, "a2", 99) is None
-    assert pl.stop_after_resume([agent_row("a3")], "a3", 0) is not None and pl.stop_after_resume([agent_row("a3")], "a3", 1) is None
+    assert pl.idle_stop(rows, "a1") is rows[3] and pl.idle_stop(rows, "a2") is None  # a1 stopped after its resume, and a2 was resumed after its stop
+    assert pl.idle_stop(rows[:1], "a1") is rows[0] and pl.idle_stop(rows[:2], "a1") is None  # a stop and no resume after it: idle; a resume after the stop: working
+    assert pl.idle_stop([resume_row("a3")], "a3") is None and pl.idle_stop(rows, "a9") is None  # no stop yet: working, and an id the ledger lacks is not idle either
+    assert pl.agent_in_ledger(rows, "a1") and pl.agent_in_ledger(rows, "a2") and pl.agent_in_ledger([resume_row("a3")], "a3") and not pl.agent_in_ledger(rows, "a9")
+    assert not pl.agent_in_ledger([{"kind": "leg", "agent_id": "o1"}, {"kind": "gate", "agent_id": "g1"}, {"kind": "merge"}], "o1")  # a stop or a resume of an agent knows it: a leg does not
 
 
 # --- gate: an agent that is working again
@@ -412,28 +480,58 @@ def test_the_readme_documents_wait_the_resume_entry_and_the_send_message_rule():
     assert wait[0] == "`wait RUN AGENT_ID [--timeout SECONDS]`"
     assert "540 by default, under the 10 minutes the Bash tool allows a command" in wait[1] and "agent X has not stopped after N s; run `wait` again or hand back" in wait[1]
     assert "reads the ledger file every 2 seconds and calls no model" in wait[1] and "an agent that stopped before `wait` began is seen" in wait[1]
-    assert "counts the stops after it began" in wait[1] and str(pl.DEFAULT_WAIT_TIMEOUT) in wait[1] and str(pl.WAIT_POLL_SECONDS) in wait[1]
+    assert str(pl.DEFAULT_WAIT_TIMEOUT) in wait[1] and str(pl.WAIT_POLL_SECONDS) in wait[1]
     assert "exits 0; exit 1 when `--timeout` seconds pass first" in wait[1]
+    assert wait[1].startswith("returns at once for an idle agent, and blocks while the agent is working.")
+    assert "idle when the run's ledger shows a stop of it and no `resume` entry after its latest stop" in wait[1]
+    assert "and working when a `resume` entry follows its latest stop. `wait` then prints" in wait[1]
+    assert 'exit 1 at once, with "agent X is not in the run\'s ledger; check the id", when no `agent` or `resume` entry of the ledger names that id' in wait[1]
+    assert "A foreground `Agent` call returns when its agent has stopped, so it needs no `wait`" in wait[1]
+    assert "a message from the main session makes no `resume` entry, so `wait` takes the agent it woke for idle" in wait[1]
+    assert "counts the stops after it began" not in wait[1]  # the fallback is gone
     gate = commands["gate"][1]
     assert "once the record is traced to its agent" in gate and "fails the gate at once, and nothing is run" in gate
     ledger_rows = {r[0].strip("`"): r for r in rows(section("Runs, gates and the pass record").split("**The ledger**", 1)[1].split("**Provenance.**", 1)[0])}
     assert ledger_rows["resume"][1] == "the PreToolUse hook, on the orchestrator's SendMessage" and "`agent_id`" in ledger_rows["resume"][2]
+    assert "an agent with a stop and no later resume entry is idle, and wait returns for it at once" in ledger_rows["resume"][2]
     text = section("Runs, gates and the pass record")
     assert "(a `resume` entry follows it) has not delivered its record yet" in text and "was resumed after it stopped and has not stopped since" in text
     assert "fails the gate at once, and nothing is run; so does an agent that was resumed and has not stopped since" in gate
     hooks = section("Hooks")
     assert "**On SendMessage, for `plumbline:orchestrator`:**" in hooks and "that is to a stage agent that has stopped in the run" in hooks
     assert "`{kind: \"resume\", agent_id, at}`" in hooks and "The main session's SendMessage is its own" in hooks and "makes no entry" in hooks
+    assert "so `wait` takes the agent it woke for idle and returns at once" in hooks and "counts the stops after it began" not in hooks
     assert "`check-record`, `open` and `wait`" in section("The pipeline file")
     flow = text.split("**The run flow: the main session, the orchestrator's legs, the stage agents.**", 1)[1].split("\n\n", 1)[0]
     assert "after a SendMessage it runs `wait` for that agent before any gate" in flow and "no shell variable, function or `sleep`, which the hook refuses" in flow
+    assert "(a foreground Agent call needs no `wait`: it returns when its agent has stopped, and `wait` returns at once for an idle agent)" in flow
     assert "states item by item whether that decision is fully met, and recommends shipping only when every item is" in flow
+    assert "(`plumbline.py wait`, which returns at once for an idle agent, with a `resume` entry that the hook writes for its message" in section("Status")
 
 
-def test_the_limit_the_readme_lists_for_wait_is_real_today(started, monkeypatch):
+def test_the_limit_the_readme_lists_for_wait_is_real_today(started):
     from test_readme import section
 
     limits = section("Limits")
-    assert "- **`wait` depends on the hook's `resume` entry.**" in limits and "so `wait` counts only the stops after it began: an agent that stopped before `wait` started is not seen, and `wait` times out." in limits
+    assert "- **`wait` depends on the hook's `resume` entry.**" in limits
+    assert "so `wait` returns at once for the agent it woke, taking it for idle (it has a stop and no `resume` after it) while it is still working on the message" in limits
+    assert "counts only the stops after it began" not in limits and "`wait` times out" not in limits  # the old limit is closed: an agent that stopped before `wait` began is seen
     write_ledger(started, [agent_row("a1")])  # it stopped, and the message that woke it left no resume entry
-    assert pl.main(["wait", RUN, "a1", "--timeout", "0", "--project", str(started)]) == 1
+    assert pl.main(["wait", RUN, "a1", "--timeout", "0", "--project", str(started)]) == 0  # so `wait` takes it for idle, as the limit says, whatever a message of the main session has woken it to do
+
+
+# --- the orchestrator's prompt: an agent resumed by a message is waited for, and an agent launched in the foreground needs no wait
+
+
+def test_the_orchestrator_prompt_says_a_foreground_agent_call_needs_no_wait_in_the_line_of_the_wait_rule():
+    discipline = between(agent("orchestrator")[1], "## Turn discipline", "## Where the run stands")
+    [rule] = [line for line in discipline.splitlines() if line.startswith("- After every SendMessage, run `PLUMBLINE wait <run id> <agent id>`")]
+    assert "A foreground Agent call returns when its agent has stopped, so it needs no `wait`." in rule
+    ordered = [
+        "After every SendMessage, run `PLUMBLINE wait <run id> <agent id>` for that agent before any gate, with the Bash tool's `timeout` set to 600000.",
+        "SendMessage returns at once and the agent keeps working, and `wait` returns when the ledger shows its stop.",
+        "A foreground Agent call returns when its agent has stopped, so it needs no `wait`.",
+        "A gate run earlier measures files the agent is still changing, so learn from `wait` that an agent has finished, and run `gate` once it has.",
+        "When `wait` exits 1 the agent is still working: run it again once, and hand back as an error when it times out a second time.",
+    ]
+    assert [rule.index(sentence) for sentence in ordered] == sorted(rule.index(sentence) for sentence in ordered)  # the rest of the line is kept, in its order

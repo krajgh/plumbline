@@ -37,8 +37,9 @@ selects stages the run lacks. A review that fails with blockers standing and rou
 left gets its next round's directory from `gate`: the review agents write only in
 the highest round-<n> directory of their stage. An agent that was resumed (the PreToolUse
 hook enters a `resume` for the orchestrator's message to it) is working again until
-its next stop: `wait` blocks until the ledger shows that stop, and a gate that meets
-the agent in between fails at once and runs nothing.
+its next stop: `wait` blocks while an agent is working and returns at once for one
+that is idle (the ledger holds a stop of it and no `resume` after that stop), and a
+gate that meets the agent in between fails at once and runs nothing.
 
 Exit status: 0 on success; 1 when what was checked is invalid, a gate fails, or
 a command refuses (init over an existing plumbline.toml, pass on a dirty tree);
@@ -2147,13 +2148,17 @@ def changed_at(ledger: list[dict], stage_id: str) -> int | None:
     return found
 
 
-def stop_after_resume(ledger: list[dict], agent_id: str, floor: int) -> dict | None:
-    """The first stop of this agent that the ledger shows after its latest `resume` entry (by the order of the entries: a stop entered
-    before `wait` began counts, so a fast agent leaves no race), or None while the agent is working. An agent with no `resume` entry has
-    only the stops after the first `floor` entries, which is what the ledger held when the wait began."""
-    resumes = [i for i, entry in enumerate(ledger) if entry.get("kind") == "resume" and entry.get("agent_id") == agent_id]
-    start = resumes[-1] + 1 if resumes else floor
-    return next((entry for entry in ledger[start:] if entry.get("kind") == "agent" and entry.get("agent_id") == agent_id), None)
+def idle_stop(ledger: list[dict], agent_id: str) -> dict | None:
+    """The latest stop (`agent` entry) of this agent when the agent is idle, else None: idle is a stop of it in the ledger and no `resume`
+    entry after that stop, by the order of the entries (see resumed_since), so an agent that stopped before `wait` began is idle, a fast one
+    leaves no race, and the stop of a foreground launch counts. It is working while a `resume` follows its latest stop, or while it has no stop yet."""
+    stop = latest_entry(ledger, "agent", agent_id=agent_id)
+    return None if stop is None or resumed_since(ledger, stop) else stop
+
+
+def agent_in_ledger(ledger: list[dict], agent_id: str) -> bool:
+    """Does the ledger know this agent: does an `agent` entry (a stop) or a `resume` entry carry its id?"""
+    return any(entry.get("kind") in ("agent", "resume") and entry.get("agent_id") == agent_id for entry in ledger)
 
 
 def latest_run_id(root: Path) -> str | None:
@@ -4481,20 +4486,24 @@ def check_agent_id(agent_id: str) -> str:
 
 
 def cmd_wait(args) -> int:
-    """Block until the run's ledger shows a stop of this agent after its latest `resume` entry: exit 0 then, 1 when `--timeout` seconds pass first.
-    SendMessage wakes a stage agent in the background and returns at once, and the orchestrator has no tool that waits, so this is the tool: it
-    reads the ledger file every WAIT_POLL_SECONDS and calls no model. The comparison is with the resume entry the PreToolUse hook made, so an agent
-    that stopped before `wait` began is seen; with no resume entry it is with the entries the ledger held when the wait began."""
+    """Return once the agent is idle (see idle_stop): the run's ledger holds a stop of it and no `resume` entry after its latest stop. Exit 0 at
+    once when that holds as `wait` starts, and when it comes to hold; exit 1 when `--timeout` seconds pass first, and at once, without waiting,
+    when no `agent` or `resume` entry of the ledger carries the id. The agent is working, and `wait` waits, while a `resume` entry follows its
+    latest stop or it has no stop yet. SendMessage wakes a stage agent in the background and returns at once, and the orchestrator has no tool
+    that waits, so this is the tool: it reads the ledger file every WAIT_POLL_SECONDS and calls no model. The PreToolUse hook enters the resume
+    before the agent can stop, so the order of the entries tells a stop that answers a message from one that came before it, however fast."""
     root = resolve_root(args.project, require_git=True)
     run_id = check_run_id(args.run_id)
     existing_run_dir(root, run_id)
     agent_id = check_agent_id(args.agent_id)
     if args.timeout < 0:
         raise PlumblineError("--timeout is a number of seconds, 0 or more")
-    floor = len(read_ledger(root, run_id))
+    if not agent_in_ledger(read_ledger(root, run_id), agent_id):  # no stop or resume names it: a wrong id would wait out the timeout for nothing
+        print(f"agent {agent_id} is not in the run's ledger; check the id")
+        return 1
     deadline = time.monotonic() + args.timeout
     while True:
-        stop = stop_after_resume(read_ledger(root, run_id), agent_id, floor)
+        stop = idle_stop(read_ledger(root, run_id), agent_id)
         if stop is not None:
             kind = f" ({stop['agent_type']})" if isinstance(stop.get("agent_type"), str) else ""
             record = f"; its record is {stop['record']}, {'valid' if stop.get('valid') is True else 'not valid'}" if isinstance(stop.get("record"), str) else ""
@@ -4882,7 +4891,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project", metavar="PATH")
     p.set_defaults(run=cmd_gate)
 
-    p = sub.add_parser("wait", allow_abbrev=False, help="block until an agent that was resumed has stopped again, as the run's ledger shows: exit 0 then, 1 when --timeout seconds pass first (it polls the ledger, and calls no model)")
+    p = sub.add_parser("wait", allow_abbrev=False, help="return at once for an idle agent (the run's ledger holds a stop of it and no resume after that stop) and block while it is working: exit 0 when it is idle, 1 when --timeout seconds pass first, or at once when the ledger does not know the id (it polls the ledger, and calls no model)")
     p.add_argument("run_id", metavar="RUN")
     p.add_argument("agent_id", metavar="AGENT_ID", help="the id of the agent, as its launch gave it (and as SendMessage names it)")
     p.add_argument("--timeout", type=int, default=DEFAULT_WAIT_TIMEOUT, metavar="SECONDS", help=f"how long to wait (default {DEFAULT_WAIT_TIMEOUT}, under the 10 minutes the Bash tool allows)")
